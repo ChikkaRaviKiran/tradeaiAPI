@@ -90,7 +90,6 @@ services:
     networks:
       - tradeai-net
     depends_on:
-      - frontend
       - backend
     restart: unless-stopped
 
