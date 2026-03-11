@@ -107,8 +107,10 @@ jobs:
             export BACKEND_IMAGE="${DEPLOY_IMAGE}"
             export BACKEND_TAG="${DEPLOY_TAG}"
 
-            # Log in to GHCR
-            echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u ChikkaRaviKiran --password-stdin
+            # Write Docker credentials directly (bypasses credential helper issues)
+            DOCKER_AUTH=$(echo -n "ChikkaRaviKiran:${GHCR_TOKEN}" | base64)
+            sudo mkdir -p /root/.docker
+            echo "{\"auths\":{\"ghcr.io\":{\"auth\":\"${DOCKER_AUTH}\"}}}" | sudo tee /root/.docker/config.json > /dev/null
 
             # Pull images directly (more reliable than compose pull)
             echo "Pulling ${BACKEND_IMAGE}:${BACKEND_TAG}"
