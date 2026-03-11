@@ -112,7 +112,8 @@ jobs:
             sudo mkdir -p /root/.docker
             echo "{\"auths\":{\"ghcr.io\":{\"auth\":\"${DOCKER_AUTH}\"}}}" | sudo tee /root/.docker/config.json > /dev/null
 
-            # Pull backend image
+            # Pull backend image (clean stale state from interrupted pulls)
+            sudo docker system prune -f 2>/dev/null || true
             echo "Pulling ${BACKEND_IMAGE}:${BACKEND_TAG}"
             sudo docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}"
 
