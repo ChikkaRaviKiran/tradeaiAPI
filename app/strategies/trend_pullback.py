@@ -1,0 +1,107 @@
+"""Strategy 3 — Trend Pullback.
+
+CALL:
+  - EMA20 > EMA50 AND price > VWAP (uptrend)
+  - Price pullback to EMA20
+  - RSI 45–50
+  - Bullish candle confirmation
+  - Volume > 1.2× avg
+
+PUT:
+  - EMA20 < EMA50 (downtrend)
+  - Price pullback to EMA20
+  - RSI 50–55
+  - Bearish candle confirmation
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+import pandas as pd
+
+from app.core.models import OptionType, OptionsMetrics, StrategyName, StrategySignal
+from app.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
+
+
+class TrendPullbackStrategy(BaseStrategy):
+    """Trend Pullback strategy."""
+
+    PULLBACK_TOLERANCE_PCT = 0.15  # price within 0.15% of EMA20
+
+    def evaluate(
+        self,
+        df: pd.DataFrame,
+        options_metrics: OptionsMetrics,
+        spot_price: float,
+    ) -> Optional[StrategySignal]:
+        if df.empty or len(df) < 50:
+            return None
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        close = last["close"]
+        open_ = last["open"]
+        vwap = last.get("vwap")
+        ema20 = last.get("ema20")
+        ema50 = last.get("ema50")
+        rsi = last.get("rsi")
+        volume = last["volume"]
+        avg_vol = last.get("avg_volume_10", volume)
+
+        # Require real indicators
+        if any(v is None or (isinstance(v, float) and v != v) for v in [rsi, ema20, ema50]):
+            return None
+        if vwap is None or (isinstance(vwap, float) and vwap != vwap):
+            vwap = close
+
+        if avg_vol is None or avg_vol == 0:
+            avg_vol = volume
+
+        # For index data (volume=0), skip volume filter
+        is_index = volume == 0 and avg_vol == 0
+
+        # Check pullback to EMA20 (price within tolerance)
+        if ema20 == 0:
+            return None
+        pullback_distance_pct = abs(close - ema20) / ema20 * 100
+
+        # CALL: uptrend pullback
+        if (
+            ema20 > ema50
+            and close > vwap
+            and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
+            and 45 <= rsi <= 50
+            and close > open_  # bullish candle
+            and (is_index or volume > 1.2 * avg_vol)
+        ):
+            return StrategySignal(
+                strategy=StrategyName.TREND_PULLBACK,
+                option_type=OptionType.CALL,
+                strike_price=_nearest_strike(spot_price),
+                details={"rsi": rsi, "ema20": ema20, "pullback_pct": round(pullback_distance_pct, 2)},
+            )
+
+        # PUT: downtrend pullback
+        if (
+            ema20 < ema50
+            and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
+            and 50 <= rsi <= 55
+            and close < open_  # bearish candle
+            and (is_index or volume > 1.2 * avg_vol)
+        ):
+            return StrategySignal(
+                strategy=StrategyName.TREND_PULLBACK,
+                option_type=OptionType.PUT,
+                strike_price=_nearest_strike(spot_price),
+                details={"rsi": rsi, "ema20": ema20, "pullback_pct": round(pullback_distance_pct, 2)},
+            )
+
+        return None
+
+
+def _nearest_strike(price: float) -> float:
+    return round(price / 50) * 50

@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.log
+.vscode/
+.idea/
+
+# Python venv
+.venv/
+
+# Logs
+logs/
+
+# Holiday cache (auto-fetched from NSE)
+data/nse_holidays.json
+
+# Docker volumes
+pgdata/
+
+# Production secrets & SSL certs
+nginx/certbot/
+backups/
+*.pem
+.env
+!.env.example
