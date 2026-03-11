@@ -80,11 +80,12 @@ jobs:
         env:
           BACKEND_IMAGE: ${{ needs.build.outputs.image_name }}
           IMAGE_TAG: ${{ github.sha }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         with:
           host: ${{ secrets.AWS_HOST }}
           username: ${{ secrets.AWS_USER }}
           key: ${{ secrets.AWS_SSH_KEY }}
-          envs: BACKEND_IMAGE,IMAGE_TAG
+          envs: BACKEND_IMAGE,IMAGE_TAG,GHCR_TOKEN
           script: |
             set -e
 
@@ -106,11 +107,18 @@ jobs:
             export BACKEND_IMAGE="${DEPLOY_IMAGE}"
             export BACKEND_TAG="${DEPLOY_TAG}"
 
-            # Clear any stale Docker credentials (public images need no auth)
-            sudo docker logout ghcr.io 2>/dev/null || true
+            # Log in to GHCR
+            echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u ChikkaRaviKiran --password-stdin
 
-            # Pull and restart backend + infra services
-            sudo -E docker compose -f docker-compose.prod.yml pull backend
+            # Pull images directly (more reliable than compose pull)
+            echo "Pulling ${BACKEND_IMAGE}:${BACKEND_TAG}"
+            sudo docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}" || {
+              echo "SHA tag pull failed, trying latest..."
+              sudo docker pull "${BACKEND_IMAGE}:latest"
+              sudo docker tag "${BACKEND_IMAGE}:latest" "${BACKEND_IMAGE}:${BACKEND_TAG}"
+            }
+
+            # Start all services
             sudo -E docker compose -f docker-compose.prod.yml up -d --remove-orphans
 
             # Clean up old images
