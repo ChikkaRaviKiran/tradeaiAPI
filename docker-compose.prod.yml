@@ -46,7 +46,6 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tradeai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tradeai}
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8001:8000"
