@@ -73,7 +73,7 @@ jobs:
           username: ${{ secrets.AWS_USER }}
           key: ${{ secrets.AWS_SSH_KEY }}
           source: "docker-compose.prod.yml,nginx/,scripts/"
-          target: /opt/tradeai
+          target: /tmp/tradeai-deploy
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -87,6 +87,12 @@ jobs:
           envs: BACKEND_IMAGE,IMAGE_TAG
           script: |
             set -e
+
+            # Move infra files to /opt/tradeai
+            sudo cp -r /tmp/tradeai-deploy/* /opt/tradeai/
+            sudo chown -R tradeai:tradeai /opt/tradeai
+            rm -rf /tmp/tradeai-deploy
+
             cd /opt/tradeai
 
             # Load env vars
@@ -100,8 +106,8 @@ jobs:
             export BACKEND_TAG="${IMAGE_TAG}"
 
             # Pull and restart backend + infra services
-            docker compose -f docker-compose.prod.yml pull backend
-            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            sudo docker compose -f docker-compose.prod.yml pull backend
+            sudo docker compose -f docker-compose.prod.yml up -d --remove-orphans
 
             # Clean up old images
-            docker image prune -f
+            sudo docker image prune -f
