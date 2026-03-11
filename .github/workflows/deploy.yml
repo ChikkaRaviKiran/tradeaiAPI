@@ -118,7 +118,12 @@ jobs:
             sudo docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}"
 
             # Start backend + infrastructure only (frontend is deployed separately)
-            sudo -E docker compose -f docker-compose.prod.yml up -d --no-deps postgres redis backend nginx
+            sudo -E docker compose -f docker-compose.prod.yml up -d --no-deps postgres redis backend
+
+            # Install/update system nginx site config for tradeai
+            sudo cp /opt/tradeai/nginx/tradeai.tavabharat.com /etc/nginx/sites-available/tradeai.tavabharat.com
+            sudo ln -sf /etc/nginx/sites-available/tradeai.tavabharat.com /etc/nginx/sites-enabled/tradeai.tavabharat.com
+            sudo nginx -t && sudo systemctl reload nginx
 
             # Clean up old images
             sudo docker image prune -f
