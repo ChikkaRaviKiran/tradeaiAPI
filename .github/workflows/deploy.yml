@@ -112,16 +112,12 @@ jobs:
             sudo mkdir -p /root/.docker
             echo "{\"auths\":{\"ghcr.io\":{\"auth\":\"${DOCKER_AUTH}\"}}}" | sudo tee /root/.docker/config.json > /dev/null
 
-            # Pull images directly (more reliable than compose pull)
+            # Pull backend image
             echo "Pulling ${BACKEND_IMAGE}:${BACKEND_TAG}"
-            sudo docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}" || {
-              echo "SHA tag pull failed, trying latest..."
-              sudo docker pull "${BACKEND_IMAGE}:latest"
-              sudo docker tag "${BACKEND_IMAGE}:latest" "${BACKEND_IMAGE}:${BACKEND_TAG}"
-            }
+            sudo docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}"
 
-            # Start all services
-            sudo -E docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            # Start backend + infrastructure only (frontend is deployed separately)
+            sudo -E docker compose -f docker-compose.prod.yml up -d postgres redis backend nginx
 
             # Clean up old images
             sudo docker image prune -f
