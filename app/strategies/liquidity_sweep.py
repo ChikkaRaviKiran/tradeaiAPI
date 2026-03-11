@@ -1,0 +1,112 @@
+"""Strategy 4 — Liquidity Sweep.
+
+CALL:
+  - Price breaks previous swing low by ≥0.03%
+  - Reversal candle closes bullish
+  - Volume spike ≥1.4× avg
+
+PUT:
+  - Price breaks swing high
+  - Bearish rejection candle (upper wick ≥50%)
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+import pandas as pd
+
+from app.core.models import OptionType, OptionsMetrics, StrategyName, StrategySignal
+from app.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
+
+SWING_LOOKBACK = 20
+
+
+class LiquiditySweepStrategy(BaseStrategy):
+    """Liquidity Sweep strategy."""
+
+    def evaluate(
+        self,
+        df: pd.DataFrame,
+        options_metrics: OptionsMetrics,
+        spot_price: float,
+    ) -> Optional[StrategySignal]:
+        if df.empty or len(df) < SWING_LOOKBACK + 2:
+            return None
+
+        last = df.iloc[-1]
+        close = last["close"]
+        open_ = last["open"]
+        high = last["high"]
+        low = last["low"]
+        volume = last["volume"]
+        avg_vol = last.get("avg_volume_10", volume)
+
+        if avg_vol is None or avg_vol == 0:
+            avg_vol = volume
+
+        # Compute swing high/low from lookback window (excluding last 2 candles)
+        lookback = df.iloc[-(SWING_LOOKBACK + 2) : -2]
+        swing_low = lookback["low"].min()
+        swing_high = lookback["high"].max()
+
+        candle_range = high - low
+
+        # CALL: sweep of swing low + bullish reversal
+        sweep_threshold_low = swing_low * (1 - 0.0003)  # 0.03%
+        if (
+            low <= sweep_threshold_low
+            and close > open_  # bullish close
+            and close > swing_low  # reclaim above swing low
+            and volume >= 1.4 * avg_vol
+        ):
+            return StrategySignal(
+                strategy=StrategyName.LIQUIDITY_SWEEP,
+                option_type=OptionType.CALL,
+                entry_price=close,
+                strike_price=_nearest_strike(spot_price),
+                stoploss=close * 0.72,
+                target1=close * 1.5,
+                target2=close * 2.0,
+                details={
+                    "swing_low": swing_low,
+                    "sweep_depth_pct": round((swing_low - low) / swing_low * 100, 3),
+                    "volume_ratio": round(volume / avg_vol, 2),
+                },
+            )
+
+        # PUT: sweep of swing high + bearish rejection
+        sweep_threshold_high = swing_high * (1 + 0.0003)
+        upper_wick = high - max(close, open_)
+        upper_wick_pct = (upper_wick / candle_range * 100) if candle_range > 0 else 0
+
+        if (
+            high >= sweep_threshold_high
+            and close < open_  # bearish close
+            and close < swing_high  # rejected back below
+            and upper_wick_pct >= 50
+            and volume >= 1.4 * avg_vol
+        ):
+            return StrategySignal(
+                strategy=StrategyName.LIQUIDITY_SWEEP,
+                option_type=OptionType.PUT,
+                entry_price=close,
+                strike_price=_nearest_strike(spot_price),
+                stoploss=close * 0.72,
+                target1=close * 1.5,
+                target2=close * 2.0,
+                details={
+                    "swing_high": swing_high,
+                    "upper_wick_pct": round(upper_wick_pct, 1),
+                    "volume_ratio": round(volume / avg_vol, 2),
+                },
+            )
+
+        return None
+
+
+def _nearest_strike(price: float) -> float:
+    return round(price / 50) * 50
