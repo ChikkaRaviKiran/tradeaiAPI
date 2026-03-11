@@ -7,16 +7,24 @@
 set -euo pipefail
 
 DOMAIN="tradeai.tavabharat.com"
-EMAIL="${1:?Usage: ssl-setup.sh <email>}"
+EMAIL="${1:-}"
 
 echo "Setting up SSL for $DOMAIN..."
 
-# 1. Get certificate using system certbot (webroot mode — nginx stays running)
-sudo certbot --nginx \
-    --non-interactive \
-    --agree-tos \
-    --email "$EMAIL" \
-    -d "$DOMAIN"
+# Get certificate using system certbot
+if [ -n "$EMAIL" ]; then
+    sudo certbot --nginx \
+        --non-interactive \
+        --agree-tos \
+        --email "$EMAIL" \
+        -d "$DOMAIN"
+else
+    sudo certbot --nginx \
+        --non-interactive \
+        --agree-tos \
+        --register-unsafely-without-email \
+        -d "$DOMAIN"
+fi
 
 echo ""
 echo "══════════════════════════════════════════════════════════"
