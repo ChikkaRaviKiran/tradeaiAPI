@@ -40,14 +40,24 @@ class PaperTradingEngine:
         self,
         signal: StrategySignal,
         decision: AIDecision,
+        nfo_symbol: str = "",
     ) -> Trade:
-        """Open a new paper trade."""
+        """Open a new paper trade.
+
+        Args:
+            signal: The strategy signal that triggered the trade.
+            decision: AI validation result with entry/SL/targets.
+            nfo_symbol: NFO trading symbol (e.g. NIFTY17MAR202622500CE)
+                        used for consistent price lookups during exit monitoring.
+        """
         now = datetime.now()
+        # Use NFO symbol for price tracking; display-friendly name in reason
+        display_name = f"NIFTY {int(signal.strike_price)} {signal.option_type.value}"
         trade = Trade(
             trade_id=str(uuid.uuid4())[:8],
             date=now.strftime("%Y-%m-%d"),
             time=now.strftime("%H:%M:%S"),
-            symbol=f"NIFTY {int(signal.strike_price)} {signal.option_type.value}",
+            symbol=nfo_symbol or display_name,
             strike=signal.strike_price,
             option_type=signal.option_type,
             strategy=signal.strategy,

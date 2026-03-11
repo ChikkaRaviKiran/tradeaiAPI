@@ -27,12 +27,14 @@ class MarketRegime(str, enum.Enum):
     RANGE_BOUND = "range_bound"
     HIGH_VOLATILITY = "high_volatility"
     LOW_VOLATILITY = "low_volatility"
+    INSUFFICIENT_DATA = "insufficient_data"
 
 
 class GlobalBias(str, enum.Enum):
     BULLISH = "bullish"
     BEARISH = "bearish"
     NEUTRAL = "neutral"
+    UNAVAILABLE = "unavailable"
 
 
 class StrategyName(str, enum.Enum):
@@ -57,14 +59,14 @@ class Candle(BaseModel):
 
 class OptionsChainRow(BaseModel):
     strike_price: float
-    call_ltp: float = 0.0
-    put_ltp: float = 0.0
+    call_ltp: Optional[float] = None
+    put_ltp: Optional[float] = None
     call_oi: int = 0
     put_oi: int = 0
     call_volume: int = 0
     put_volume: int = 0
     change_in_oi: int = 0
-    implied_volatility: float = 0.0
+    implied_volatility: Optional[float] = None
 
 
 class GlobalIndex(BaseModel):
@@ -76,27 +78,31 @@ class GlobalIndex(BaseModel):
 # ── Technical Indicators ───────────────────────────────────────────────────────
 
 class TechnicalIndicators(BaseModel):
-    ema9: float = 0.0
-    ema20: float = 0.0
-    ema50: float = 0.0
-    vwap: float = 0.0
-    rsi: float = 50.0
-    macd: float = 0.0
-    macd_signal: float = 0.0
-    macd_hist: float = 0.0
-    atr: float = 0.0
-    bollinger_upper: float = 0.0
-    bollinger_middle: float = 0.0
-    bollinger_lower: float = 0.0
-    adx: float = 0.0
+    ema9: Optional[float] = None
+    ema20: Optional[float] = None
+    ema50: Optional[float] = None
+    vwap: Optional[float] = None
+    rsi: Optional[float] = None
+    macd: Optional[float] = None
+    macd_signal: Optional[float] = None
+    macd_hist: Optional[float] = None
+    atr: Optional[float] = None
+    bollinger_upper: Optional[float] = None
+    bollinger_middle: Optional[float] = None
+    bollinger_lower: Optional[float] = None
+    adx: Optional[float] = None
+    vwap_is_volume_weighted: bool = False  # True only when real volume data was used
 
 
 class OptionsMetrics(BaseModel):
-    pcr: float = 1.0
-    max_pain: float = 0.0
-    call_oi_cluster: float = 0.0
-    put_oi_cluster: float = 0.0
+    pcr: Optional[float] = None  # None = not fetched yet, 1.0+ = real data
+    max_pain: Optional[float] = None  # None = no chain data, 0.0 impossible
+    call_oi_cluster: Optional[float] = None
+    put_oi_cluster: Optional[float] = None
     oi_change: int = 0
+    total_call_volume: int = 0  # Summed option volume from chain
+    total_put_volume: int = 0
+    atm_option_volume: int = 0  # ATM strikes volume (participation proxy)
 
 
 # ── Strategy Signal ───────────────────────────────────────────────────────────
@@ -162,9 +168,9 @@ class Trade(BaseModel):
 
 class MarketSnapshot(BaseModel):
     nifty_price: float = 0.0
-    vwap: float = 0.0
-    regime: MarketRegime = MarketRegime.RANGE_BOUND
-    global_bias: GlobalBias = GlobalBias.NEUTRAL
+    vwap: Optional[float] = None
+    regime: MarketRegime = MarketRegime.INSUFFICIENT_DATA
+    global_bias: GlobalBias = GlobalBias.UNAVAILABLE
     indicators: TechnicalIndicators = Field(default_factory=TechnicalIndicators)
     options_metrics: OptionsMetrics = Field(default_factory=OptionsMetrics)
     timestamp: datetime = Field(default_factory=datetime.now)

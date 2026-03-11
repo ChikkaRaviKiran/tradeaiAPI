@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 class FeatureEngine:
     """Compute technical indicators and options metrics from raw data."""
+
+    def __init__(self) -> None:
+        self._prev_total_oi: int = 0  # Track OI change between fetches
 
     # ── Technical Indicators ──────────────────────────────────────────────
 
@@ -71,6 +75,7 @@ class FeatureEngine:
             return TechnicalIndicators()
 
         last = df.iloc[-1]
+        vol_sum = df["volume"].sum() if "volume" in df.columns else 0
         return TechnicalIndicators(
             ema9=_safe(last, "ema9"),
             ema20=_safe(last, "ema20"),
@@ -85,57 +90,110 @@ class FeatureEngine:
             bollinger_middle=_safe(last, "bollinger_middle"),
             bollinger_lower=_safe(last, "bollinger_lower"),
             adx=_safe(last, "adx"),
+            vwap_is_volume_weighted=(vol_sum > 0),
         )
 
     @staticmethod
     def _compute_vwap(df: pd.DataFrame) -> pd.Series:
-        """Compute intraday VWAP."""
+        """Compute intraday VWAP.
+
+        Uses real volume if available (futures data merged in).
+        Falls back to tick-weighted typical price for pure index data,
+        but marks it as non-volume-weighted so scoring can distinguish.
+        """
         typical = (df["high"] + df["low"] + df["close"]) / 3
-        cum_vol = df["volume"].cumsum()
-        cum_tp_vol = (typical * df["volume"]).cumsum()
-        vwap = cum_tp_vol / cum_vol
+        vol = df["volume"]
+
+        if vol.sum() == 0:
+            # No volume data — simple cumulative average (NOT real VWAP)
+            cum_count = pd.Series(range(1, len(df) + 1), index=df.index, dtype=float)
+            vwap = typical.cumsum() / cum_count
+        else:
+            cum_vol = vol.cumsum()
+            cum_tp_vol = (typical * vol).cumsum()
+            vwap = cum_tp_vol / cum_vol
+
         return vwap
+
+    def merge_futures_volume(self, spot_df: pd.DataFrame, futures_df: pd.DataFrame) -> pd.DataFrame:
+        """Replace spot NIFTY volume (always 0) with NIFTY Futures volume.
+
+        This enables real volume-weighted VWAP and meaningful volume analysis.
+        Both DataFrames must be timestamp-indexed 1-min candles.
+        """
+        if futures_df.empty:
+            return spot_df
+
+        # Align futures volume to spot timestamps
+        fut_vol = futures_df[["volume"]].rename(columns={"volume": "fut_volume"})
+        merged = spot_df.join(fut_vol, how="left")
+        merged["fut_volume"] = merged["fut_volume"].fillna(0).astype(int)
+
+        # Replace zero spot volume with futures volume
+        merged["volume"] = merged["fut_volume"]
+        merged.drop(columns=["fut_volume"], inplace=True)
+
+        logger.info(
+            "Merged futures volume: %d candles, total vol=%d",
+            len(merged), merged["volume"].sum(),
+        )
+        return merged
 
     # ── Options Metrics ──────────────────────────────────────────────────
 
     def compute_options_metrics(
         self, chain: list[OptionsChainRow], spot_price: float
     ) -> OptionsMetrics:
-        """Compute PCR, max pain, OI clusters from options chain data."""
+        """Compute PCR, max pain, OI clusters, and volume from options chain."""
         if not chain:
             return OptionsMetrics()
 
         total_call_oi = sum(r.call_oi for r in chain)
         total_put_oi = sum(r.put_oi for r in chain)
+        total_call_volume = sum(r.call_volume for r in chain)
+        total_put_volume = sum(r.put_volume for r in chain)
 
-        pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1.0
+        pcr = total_put_oi / total_call_oi if total_call_oi > 0 else None
 
-        # Max Pain: strike where total losses (for option writers) are minimized
+        # Max Pain
         max_pain = self._compute_max_pain(chain)
 
         # OI clusters: strike with highest CE OI and PE OI
-        call_oi_cluster = max(chain, key=lambda r: r.call_oi).strike_price if chain else 0
-        put_oi_cluster = max(chain, key=lambda r: r.put_oi).strike_price if chain else 0
+        call_oi_cluster = max(chain, key=lambda r: r.call_oi).strike_price if chain else None
+        put_oi_cluster = max(chain, key=lambda r: r.put_oi).strike_price if chain else None
 
-        total_oi_change = sum(r.change_in_oi for r in chain)
+        # ATM option volume (±100 points around spot)
+        atm_volume = sum(
+            r.call_volume + r.put_volume
+            for r in chain
+            if abs(r.strike_price - spot_price) <= 100
+        )
+
+        # OI change: compare total OI against previous fetch
+        current_total_oi = total_call_oi + total_put_oi
+        oi_change = current_total_oi - self._prev_total_oi if self._prev_total_oi > 0 else 0
+        self._prev_total_oi = current_total_oi
 
         return OptionsMetrics(
-            pcr=round(pcr, 2),
+            pcr=round(pcr, 2) if pcr is not None else None,
             max_pain=max_pain,
             call_oi_cluster=call_oi_cluster,
             put_oi_cluster=put_oi_cluster,
-            oi_change=total_oi_change,
+            oi_change=oi_change,
+            total_call_volume=total_call_volume,
+            total_put_volume=total_put_volume,
+            atm_option_volume=atm_volume,
         )
 
     @staticmethod
-    def _compute_max_pain(chain: list[OptionsChainRow]) -> float:
+    def _compute_max_pain(chain: list[OptionsChainRow]) -> Optional[float]:
         """Compute max pain strike price.
 
         Max pain is the strike at which the total value of all outstanding
         options (calls + puts) that expire in-the-money is minimized.
         """
         if not chain:
-            return 0.0
+            return None
 
         strikes = [r.strike_price for r in chain]
         min_pain_value = float("inf")
@@ -158,9 +216,9 @@ class FeatureEngine:
         return max_pain_strike
 
 
-def _safe(row: pd.Series, col: str, default: float = 0.0) -> float:
-    """Safely retrieve a float value from a DataFrame row."""
-    val = row.get(col, default)
+def _safe(row: pd.Series, col: str) -> Optional[float]:
+    """Safely retrieve a float value from a DataFrame row. Returns None if missing/NaN."""
+    val = row.get(col)
     if val is None or (isinstance(val, float) and np.isnan(val)):
-        return default
+        return None
     return float(val)

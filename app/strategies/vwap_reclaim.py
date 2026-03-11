@@ -43,15 +43,22 @@ class VWAPReclaimStrategy(BaseStrategy):
 
         last = window.iloc[-1]
         close = last["close"]
-        vwap = last.get("vwap", close)
+        vwap = last.get("vwap")
         volume = last["volume"]
-        rsi = last.get("rsi", 50)
-        ema9 = last.get("ema9", 0)
-        ema20 = last.get("ema20", 0)
+        rsi = last.get("rsi")
+        ema9 = last.get("ema9")
+        ema20 = last.get("ema20")
         avg_vol = last.get("avg_volume_10", volume)
+
+        # Require VWAP and RSI — this strategy fundamentally depends on them
+        if any(v is None or (isinstance(v, float) and v != v) for v in [vwap, rsi, ema9, ema20]):
+            return None
 
         if avg_vol is None or avg_vol == 0:
             avg_vol = volume
+
+        # For index data (volume=0), skip volume filter
+        is_index = volume == 0 and avg_vol == 0
 
         # Look back at last MIN_BELOW_CANDLES candles
         recent = window.iloc[-(MIN_BELOW_CANDLES + 1) :]
@@ -61,19 +68,15 @@ class VWAPReclaimStrategy(BaseStrategy):
         if (
             below_vwap.sum() >= MIN_BELOW_CANDLES
             and close > vwap
-            and volume > 1.3 * avg_vol
+            and (is_index or volume > 1.3 * avg_vol)
             and rsi > 55
             and _ema_cross_up(window, "ema9", "ema20")
         ):
             return StrategySignal(
                 strategy=StrategyName.VWAP_RECLAIM,
                 option_type=OptionType.CALL,
-                entry_price=close,
                 strike_price=_nearest_strike(spot_price),
-                stoploss=close * 0.72,
-                target1=close * 1.5,
-                target2=close * 2.0,
-                details={"rsi": rsi, "vwap": vwap, "volume_ratio": round(volume / avg_vol, 2)},
+                details={"rsi": rsi, "vwap": vwap, "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0},
             )
 
         # PUT: price was above VWAP for ≥10 candles, now closes below
@@ -81,19 +84,15 @@ class VWAPReclaimStrategy(BaseStrategy):
         if (
             above_vwap.sum() >= MIN_BELOW_CANDLES
             and close < vwap
-            and volume > 1.3 * avg_vol
+            and (is_index or volume > 1.3 * avg_vol)
             and rsi < 45
             and _ema_cross_down(window, "ema9", "ema20")
         ):
             return StrategySignal(
                 strategy=StrategyName.VWAP_RECLAIM,
                 option_type=OptionType.PUT,
-                entry_price=close,
                 strike_price=_nearest_strike(spot_price),
-                stoploss=close * 0.72,
-                target1=close * 1.5,
-                target2=close * 2.0,
-                details={"rsi": rsi, "vwap": vwap, "volume_ratio": round(volume / avg_vol, 2)},
+                details={"rsi": rsi, "vwap": vwap, "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0},
             )
 
         return None

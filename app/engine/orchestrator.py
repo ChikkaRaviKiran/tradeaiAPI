@@ -91,7 +91,7 @@ class Orchestrator:
         self.running = False
         self._cycle_count = 0
         self._global_last_fetched: Optional[datetime] = None
-        self.global_bias = GlobalBias.NEUTRAL
+        self.global_bias = GlobalBias.UNAVAILABLE
         self.global_indices: list = []  # Store individual index data
         self.snapshot: Optional[MarketSnapshot] = None
         self.options_metrics = OptionsMetrics()
@@ -121,7 +121,7 @@ class Orchestrator:
         """Reset daily state for a fresh trading day."""
         self._cycle_count = 0
         self._global_last_fetched = None
-        self.global_bias = GlobalBias.NEUTRAL
+        self.global_bias = GlobalBias.UNAVAILABLE
         self.global_indices = []
         self.snapshot = None
         self.options_metrics = OptionsMetrics()
@@ -242,15 +242,31 @@ class Orchestrator:
                 logger.warning("[Cycle %d] Data validation failed — skipping cycle", cycle)
                 return
 
+            # 2b. Fetch NIFTY Futures candles and merge volume into spot data
+            #     This gives us real volume for VWAP and volume analysis
+            fut_candles = self.client.get_nifty_futures_candles(
+                interval="ONE_MINUTE", from_date=from_date, to_date=to_date
+            )
+            if fut_candles:
+                fut_df = self.client.candles_to_dataframe(fut_candles)
+                df = self.feature_engine.merge_futures_volume(df, fut_df)
+            else:
+                logger.warning("[Cycle %d] No NIFTY Futures data — no volume/VWAP", cycle)
+
             # 3. Feature engineering
             df = self.feature_engine.compute_indicators(df)
             indicators = self.feature_engine.get_latest_indicators(df)
             spot_price = df.iloc[-1]["close"] if not df.empty else 0
 
             logger.info(
-                "[Cycle %d] NIFTY=%.2f | RSI=%.1f | ADX=%.1f | MACD=%.2f | EMA9=%.1f | EMA20=%.1f",
-                cycle, spot_price, indicators.rsi, indicators.adx,
-                indicators.macd, indicators.ema9, indicators.ema20,
+                "[Cycle %d] NIFTY=%.2f | RSI=%s | ADX=%s | MACD=%s | EMA9=%s | EMA20=%s | Vol=%d",
+                cycle, spot_price,
+                f"{indicators.rsi:.1f}" if indicators.rsi is not None else "N/A",
+                f"{indicators.adx:.1f}" if indicators.adx is not None else "N/A",
+                f"{indicators.macd:.2f}" if indicators.macd is not None else "N/A",
+                f"{indicators.ema9:.1f}" if indicators.ema9 is not None else "N/A",
+                f"{indicators.ema20:.1f}" if indicators.ema20 is not None else "N/A",
+                df.iloc[-1].get("volume", 0) if not df.empty else 0,
             )
 
             # 4. Fetch options chain (less frequently — every 5 minutes)
@@ -338,7 +354,44 @@ class Orchestrator:
                 best_score,
             )
 
-            # 11. AI validation
+            # 11. Fetch real option premium from AngelOne
+            option_ltp = self._fetch_option_ltp(best_signal)
+            if option_ltp is None or option_ltp <= 0:
+                logger.warning(
+                    "Could not fetch option LTP for %s %s — skipping trade",
+                    int(best_signal.strike_price),
+                    best_signal.option_type.value,
+                )
+                return
+
+            # Set real option premium on the signal
+            # SL and targets are ATR-based, not fixed percentages
+            atr = indicators.atr
+            if atr is None or atr <= 0:
+                logger.warning(
+                    "ATR unavailable — cannot compute market-based SL/targets. Skipping trade."
+                )
+                await self.alert_manager.send_info(
+                    f"TRADE SKIPPED — {best_signal.strategy.value}",
+                    f"ATR data unavailable — cannot set SL/targets from real market data.\n"
+                    f"Signal: NIFTY {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
+                    f"Score: {best_score:.0f} | Premium: ₹{option_ltp:.2f}",
+                )
+                return
+
+            # ATR represents the expected NIFTY move per candle
+            # Option premium moves ~50-70% of NIFTY's ATR for ATM options (delta ~0.5)
+            option_atr = atr * 0.5
+            best_signal.entry_price = option_ltp
+            best_signal.stoploss = round(max(option_ltp - (1.5 * option_atr), option_ltp * 0.70), 2)
+            best_signal.target1 = round(option_ltp + (2.0 * option_atr), 2)
+            best_signal.target2 = round(option_ltp + (3.5 * option_atr), 2)
+            logger.info(
+                "Option premium: %.2f | SL=%.2f | T1=%.2f | T2=%.2f",
+                option_ltp, best_signal.stoploss, best_signal.target1, best_signal.target2,
+            )
+
+            # 12. AI validation
             decision = await self.ai_engine.evaluate(
                 best_signal, self.snapshot, best_score
             )
@@ -352,13 +405,16 @@ class Orchestrator:
                 await self.alert_manager.send_info(
                     f"SIGNAL REJECTED — {best_signal.strategy.value}",
                     f"NIFTY {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
-                    f"Score: {best_score:.0f} | AI Confidence: {decision.confidence_score:.0f}%\n"
+                    f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI Confidence: {decision.confidence_score:.0f}%\n"
                     f"Reason: {decision.reason}",
                 )
                 return
 
-            # 12. Enter trade
-            trade = self.paper_trader.enter_trade(best_signal, decision)
+            # 13. Build NFO trading symbol for consistent price tracking
+            nfo_symbol = self._build_nfo_symbol(best_signal)
+
+            # 14. Enter trade
+            trade = self.paper_trader.enter_trade(best_signal, decision, nfo_symbol)
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_signal_alert(best_signal, decision)
 
@@ -366,6 +422,34 @@ class Orchestrator:
             logger.exception("Error in analysis cycle")
 
     # ── Support Methods ──────────────────────────────────────────────────
+
+    def _fetch_option_ltp(self, signal: StrategySignal) -> Optional[float]:
+        """Fetch the real LTP for a specific option contract from AngelOne."""
+        token_info = self.client.get_nifty_option_tokens(
+            self._expiry or "",
+            signal.strike_price,
+            signal.option_type.value,
+        )
+        if not token_info:
+            logger.warning(
+                "Token not found for NIFTY %s %s",
+                int(signal.strike_price), signal.option_type.value,
+            )
+            return None
+
+        ltp = self.client.get_ltp(
+            "NFO",
+            token_info.get("tradingsymbol", ""),
+            token_info.get("symboltoken", ""),
+        )
+        return ltp
+
+    def _build_nfo_symbol(self, signal: StrategySignal) -> str:
+        """Build the NFO trading symbol for an option contract.
+
+        e.g. NIFTY17MAR202622500CE
+        """
+        return f"NIFTY{self._expiry or ''}{int(signal.strike_price)}{signal.option_type.value}"
 
     async def _fetch_global_data(self) -> None:
         """Fetch and analyze global market indices."""
@@ -394,9 +478,10 @@ class Orchestrator:
                     chain, spot_price
                 )
                 logger.info(
-                    "Options: PCR=%.2f MaxPain=%.0f",
-                    self.options_metrics.pcr,
-                    self.options_metrics.max_pain,
+                    "Options: PCR=%s MaxPain=%s ATM_Vol=%d",
+                    f"{self.options_metrics.pcr:.2f}" if self.options_metrics.pcr is not None else "N/A",
+                    f"{self.options_metrics.max_pain:.0f}" if self.options_metrics.max_pain is not None else "N/A",
+                    self.options_metrics.atm_option_volume,
                 )
         except Exception:
             logger.exception("Error updating options chain")

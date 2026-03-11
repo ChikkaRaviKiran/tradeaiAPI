@@ -22,7 +22,7 @@ from app.core.models import (
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are an expert NIFTY options trading analyst. You receive market data and a strategy signal. 
+SYSTEM_PROMPT = """You are an expert NIFTY options trading analyst. You receive real-time market data and a strategy signal with the actual option premium (LTP).
 Your job is to validate the trade signal and provide a final decision.
 
 You must respond ONLY with a valid JSON object (no markdown, no extra text) in this exact format:
@@ -40,10 +40,19 @@ Rules:
 - Only approve trades with confidence >= 70
 - Consider market regime, volatility, and time of day
 - Be conservative — prefer no trade over a bad trade
-- Stoploss should be 25-30% of option premium
-- Target1 = 50% profit, Target2 = 100% profit
-- Consider options OI data for confirmation
+- entry_price, stoploss, target1, target2 are all OPTION PREMIUM values (not NIFTY spot)
+- The signal includes ATR-based suggested SL/targets — evaluate whether they are reasonable given the ATR value
+- Use the ATR value to judge if SL is too tight or too wide for current volatility
+- If ATR is null, reject the trade (volatility data unavailable)
+- Consider PCR, OI data, and option volumes for flow confirmation — if PCR is null, options data is unavailable
+- total_call_volume, total_put_volume, atm_option_volume show real options market participation
+- oi_change shows whether new positions are being built (positive) or unwound (negative)
+- vwap_is_volume_weighted indicates if VWAP is computed from real futures volume (true) or just price average (false)
+- Consider global market bias — if "unavailable", ignore global context
 - Avoid trades in last 30 minutes of market (after 15:00)
+- Avoid trades when regime is "insufficient_data" — not enough market data yet
+- Bollinger bands help assess if price is extended — reject if price is at extreme bands without reversal signal
+- Any null indicator means that data point is genuinely unavailable — do not assume a default value
 """
 
 
@@ -102,6 +111,7 @@ class AIDecisionEngine:
                 "market_snapshot": {
                     "nifty_price": snapshot.nifty_price,
                     "vwap": snapshot.vwap,
+                    "vwap_is_volume_weighted": snapshot.indicators.vwap_is_volume_weighted,
                     "timestamp": now.strftime("%H:%M:%S"),
                 },
                 "technical_indicators": {
@@ -110,8 +120,11 @@ class AIDecisionEngine:
                     "ema50": snapshot.indicators.ema50,
                     "rsi": snapshot.indicators.rsi,
                     "macd": snapshot.indicators.macd,
+                    "macd_histogram": snapshot.indicators.macd_hist,
                     "adx": snapshot.indicators.adx,
                     "atr": snapshot.indicators.atr,
+                    "bollinger_upper": snapshot.indicators.bollinger_upper,
+                    "bollinger_lower": snapshot.indicators.bollinger_lower,
                 },
                 "market_structure": {
                     "regime": snapshot.regime.value,
@@ -121,6 +134,10 @@ class AIDecisionEngine:
                     "max_pain": snapshot.options_metrics.max_pain,
                     "call_oi_cluster": snapshot.options_metrics.call_oi_cluster,
                     "put_oi_cluster": snapshot.options_metrics.put_oi_cluster,
+                    "oi_change": snapshot.options_metrics.oi_change,
+                    "total_call_volume": snapshot.options_metrics.total_call_volume,
+                    "total_put_volume": snapshot.options_metrics.total_put_volume,
+                    "atm_option_volume": snapshot.options_metrics.atm_option_volume,
                 },
                 "global_context": {
                     "bias": snapshot.global_bias.value,
@@ -128,8 +145,11 @@ class AIDecisionEngine:
                 "strategy_signal": {
                     "strategy": signal.strategy.value,
                     "option_type": signal.option_type.value,
-                    "entry_price": signal.entry_price,
                     "strike_price": signal.strike_price,
+                    "option_premium_ltp": signal.entry_price,
+                    "suggested_stoploss": signal.stoploss,
+                    "suggested_target1": signal.target1,
+                    "suggested_target2": signal.target2,
                     "score": score,
                     "details": signal.details,
                 },

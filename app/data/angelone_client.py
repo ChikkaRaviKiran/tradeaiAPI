@@ -12,7 +12,7 @@ import pyotp
 from SmartApi import SmartConnect
 
 from app.core.config import settings
-from app.core.models import Candle, GlobalIndex, OptionsChainRow
+from app.core.models import Candle, OptionsChainRow
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,52 @@ class AngelOneClient:
             self.nifty_token, self.exchange, interval, from_date, to_date
         )
 
+    def get_nifty_futures_candles(
+        self,
+        interval: str = "ONE_MINUTE",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> list[Candle]:
+        """Fetch current month NIFTY Futures candle data.
+
+        NIFTY futures have real volume, unlike the spot index (always 0).
+        Used to get volume data for VWAP computation and volume analysis.
+        """
+        token = self._get_nifty_fut_token()
+        if not token:
+            logger.warning("Could not find NIFTY Futures token — no volume data")
+            return []
+        return self.get_candle_data(token, self.nfo_exchange, interval, from_date, to_date)
+
+    def _get_nifty_fut_token(self) -> Optional[str]:
+        """Find the current month NIFTY futures symbol token."""
+        if hasattr(self, "_nifty_fut_token_cache") and self._nifty_fut_token_cache:
+            return self._nifty_fut_token_cache
+
+        try:
+            # Search for the nearest NIFTY futures contract
+            result = self._smart_api.searchScrip(self.nfo_exchange, "NIFTY")
+            if result and result.get("status") and result.get("data"):
+                now = datetime.now()
+                best = None
+                for item in result["data"]:
+                    tsym = item.get("tradingsymbol", "")
+                    # NIFTY futures symbols are like NIFTY27MAR2025FUT
+                    if tsym.startswith("NIFTY") and tsym.endswith("FUT"):
+                        # Pick the nearest expiry
+                        if best is None or len(tsym) < len(best.get("tradingsymbol", "")):
+                            best = item
+                if best:
+                    self._nifty_fut_token_cache = best["symboltoken"]
+                    logger.info(
+                        "NIFTY Futures token: %s (%s)",
+                        best["symboltoken"], best["tradingsymbol"],
+                    )
+                    return self._nifty_fut_token_cache
+        except Exception:
+            logger.exception("Error searching for NIFTY futures token")
+        return None
+
     # ── LTP / Quote ──────────────────────────────────────────────────────
 
     def get_ltp(self, exchange: str, symbol: str, token: str) -> Optional[float]:
@@ -166,8 +212,8 @@ class AngelOneClient:
     def get_option_chain(self, expiry_date: str) -> list[OptionsChainRow]:
         """Fetch NIFTY options chain for a given expiry.
 
-        Uses individual strike data since SmartAPI doesn't have a native
-        options chain endpoint—we build it from LTP + OI calls.
+        Batches token lookups then uses getMarketData(FULL) in batches
+        of up to 50 tokens to minimise API calls and get real OI/volume.
 
         Args:
             expiry_date: Expiry in DDMMMYYYY format (e.g., '06MAR2026').
@@ -181,38 +227,60 @@ class AngelOneClient:
 
         # Build strikes around current price (±1000 range, step 50)
         base = int(round(nifty_ltp / 50) * 50)
-        strikes = range(base - 1000, base + 1050, 50)
+        strikes = list(range(base - 1000, base + 1050, 50))
 
+        # Phase 1: Search all symbol tokens
+        token_map: dict[str, dict] = {}  # token -> symbol_info
+        strike_tokens: dict[int, dict] = {}  # strike -> {ce_token, pe_token}
         for strike in strikes:
+            ce_symbol = f"NIFTY{expiry_date}{strike}CE"
+            pe_symbol = f"NIFTY{expiry_date}{strike}PE"
+            ce_info = self._search_symbol(ce_symbol)
+            pe_info = self._search_symbol(pe_symbol)
+            entry: dict = {}
+            if ce_info:
+                t = ce_info.get("symboltoken", "")
+                entry["ce_token"] = t
+                token_map[t] = ce_info
+            if pe_info:
+                t = pe_info.get("symboltoken", "")
+                entry["pe_token"] = t
+                token_map[t] = pe_info
+            strike_tokens[strike] = entry
+            time.sleep(0.05)  # Rate limiting for searchScrip
+
+        # Phase 2: Batch getMarketData(FULL) — max 50 tokens per call
+        all_tokens = list(token_map.keys())
+        quotes: dict[str, dict] = {}  # token -> market data
+        batch_size = 50
+        for i in range(0, len(all_tokens), batch_size):
+            batch = all_tokens[i : i + batch_size]
             try:
-                ce_symbol = f"NIFTY{expiry_date}{strike}CE"
-                pe_symbol = f"NIFTY{expiry_date}{strike}PE"
+                data = self._smart_api.getMarketData(
+                    "FULL", {self.nfo_exchange: batch}
+                )
+                if data and data.get("status") and data.get("data"):
+                    for item in data["data"].get("fetched", []):
+                        quotes[str(item.get("symbolToken", ""))] = item
+            except Exception as e:
+                logger.warning("Batch market data failed: %s", e)
+            time.sleep(0.3)  # Rate limiting between batches
 
-                # Search for tokens
-                ce_info = self._search_symbol(ce_symbol)
-                pe_info = self._search_symbol(pe_symbol)
-
-                row = OptionsChainRow(strike_price=float(strike))
-
-                if ce_info:
-                    ce_quote = self._get_quote(self.nfo_exchange, ce_info)
-                    if ce_quote:
-                        row.call_ltp = ce_quote.get("ltp", 0.0)
-                        row.call_oi = ce_quote.get("opnInterest", 0)
-                        row.call_volume = ce_quote.get("exchTradVol", 0)
-
-                if pe_info:
-                    pe_quote = self._get_quote(self.nfo_exchange, pe_info)
-                    if pe_quote:
-                        row.put_ltp = pe_quote.get("ltp", 0.0)
-                        row.put_oi = pe_quote.get("opnInterest", 0)
-                        row.put_volume = pe_quote.get("exchTradVol", 0)
-
-                rows.append(row)
-                time.sleep(0.1)  # Rate limiting
-            except Exception:
-                logger.debug("Skipping strike %s", strike)
-                continue
+        # Phase 3: Build rows
+        for strike in strikes:
+            entry = strike_tokens.get(strike, {})
+            row = OptionsChainRow(strike_price=float(strike))
+            ce_q = quotes.get(entry.get("ce_token", ""), {})
+            if ce_q:
+                row.call_ltp = ce_q.get("ltp", 0.0)
+                row.call_oi = ce_q.get("opnInterest", 0)
+                row.call_volume = ce_q.get("exchTradVol", 0)
+            pe_q = quotes.get(entry.get("pe_token", ""), {})
+            if pe_q:
+                row.put_ltp = pe_q.get("ltp", 0.0)
+                row.put_oi = pe_q.get("opnInterest", 0)
+                row.put_volume = pe_q.get("exchTradVol", 0)
+            rows.append(row)
 
         return rows
 
@@ -229,7 +297,22 @@ class AngelOneClient:
         return None
 
     def _get_quote(self, exchange: str, symbol_info: dict) -> Optional[dict]:
-        """Get full quote for a symbol."""
+        """Get full market data for a symbol including OI and volume.
+
+        Uses getMarketData(FULL) which returns:
+          ltp, open, high, low, close, opnInterest, exchTradVol, totBuyQuan, totSelQuan, etc.
+        """
+        try:
+            token = symbol_info.get("symboltoken", "")
+            exchange_tokens = {exchange: [token]}
+            data = self._smart_api.getMarketData("FULL", exchange_tokens)
+            if data and data.get("status") and data.get("data"):
+                fetched = data["data"].get("fetched", [])
+                if fetched:
+                    return fetched[0]
+        except Exception:
+            pass
+        # Fallback to ltpData if getMarketData fails
         try:
             token = symbol_info.get("symboltoken", "")
             tsym = symbol_info.get("tradingsymbol", "")
@@ -239,35 +322,6 @@ class AngelOneClient:
         except Exception:
             pass
         return None
-
-    # ── Global Market Data ───────────────────────────────────────────────
-
-    def get_global_indices(self) -> list[GlobalIndex]:
-        """Fetch global index data (approximate via AngelOne or fallback).
-
-        AngelOne primarily covers Indian markets. For global indices,
-        we use the available index data and can be extended with other APIs.
-        """
-        # These are indicative global index tokens on AngelOne (where available)
-        # In production, supplement with a global markets data API
-        indices: list[GlobalIndex] = []
-        global_symbols = [
-            ("DOW JONES", "^DJI"),
-            ("NASDAQ", "^IXIC"),
-            ("S&P 500", "^GSPC"),
-            ("FTSE", "^FTSE"),
-            ("DAX", "^GDAXI"),
-            ("NIKKEI", "^N225"),
-            ("HANG SENG", "^HSI"),
-        ]
-        # Fallback: return neutral if we can't fetch
-        for name, symbol in global_symbols:
-            indices.append(GlobalIndex(symbol=name, change_pct=0.0, last_price=0.0))
-
-        logger.info(
-            "Global indices fetched (placeholder - integrate dedicated global API)"
-        )
-        return indices
 
     # ── Instrument List ──────────────────────────────────────────────────
 

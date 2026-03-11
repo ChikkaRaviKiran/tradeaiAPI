@@ -45,15 +45,24 @@ class TrendPullbackStrategy(BaseStrategy):
         prev = df.iloc[-2]
         close = last["close"]
         open_ = last["open"]
-        vwap = last.get("vwap", close)
-        ema20 = last.get("ema20", 0)
-        ema50 = last.get("ema50", 0)
-        rsi = last.get("rsi", 50)
+        vwap = last.get("vwap")
+        ema20 = last.get("ema20")
+        ema50 = last.get("ema50")
+        rsi = last.get("rsi")
         volume = last["volume"]
         avg_vol = last.get("avg_volume_10", volume)
 
+        # Require real indicators
+        if any(v is None or (isinstance(v, float) and v != v) for v in [rsi, ema20, ema50]):
+            return None
+        if vwap is None or (isinstance(vwap, float) and vwap != vwap):
+            vwap = close
+
         if avg_vol is None or avg_vol == 0:
             avg_vol = volume
+
+        # For index data (volume=0), skip volume filter
+        is_index = volume == 0 and avg_vol == 0
 
         # Check pullback to EMA20 (price within tolerance)
         if ema20 == 0:
@@ -67,16 +76,12 @@ class TrendPullbackStrategy(BaseStrategy):
             and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
             and 45 <= rsi <= 50
             and close > open_  # bullish candle
-            and volume > 1.2 * avg_vol
+            and (is_index or volume > 1.2 * avg_vol)
         ):
             return StrategySignal(
                 strategy=StrategyName.TREND_PULLBACK,
                 option_type=OptionType.CALL,
-                entry_price=close,
                 strike_price=_nearest_strike(spot_price),
-                stoploss=close * 0.72,
-                target1=close * 1.5,
-                target2=close * 2.0,
                 details={"rsi": rsi, "ema20": ema20, "pullback_pct": round(pullback_distance_pct, 2)},
             )
 
@@ -86,16 +91,12 @@ class TrendPullbackStrategy(BaseStrategy):
             and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
             and 50 <= rsi <= 55
             and close < open_  # bearish candle
-            and volume > 1.2 * avg_vol
+            and (is_index or volume > 1.2 * avg_vol)
         ):
             return StrategySignal(
                 strategy=StrategyName.TREND_PULLBACK,
                 option_type=OptionType.PUT,
-                entry_price=close,
                 strike_price=_nearest_strike(spot_price),
-                stoploss=close * 0.72,
-                target1=close * 1.5,
-                target2=close * 2.0,
                 details={"rsi": rsi, "ema20": ema20, "pullback_pct": round(pullback_distance_pct, 2)},
             )
 

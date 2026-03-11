@@ -48,6 +48,9 @@ class LiquiditySweepStrategy(BaseStrategy):
         if avg_vol is None or avg_vol == 0:
             avg_vol = volume
 
+        # For index data (volume=0), skip volume filter
+        is_index = volume == 0 and avg_vol == 0
+
         # Compute swing high/low from lookback window (excluding last 2 candles)
         lookback = df.iloc[-(SWING_LOOKBACK + 2) : -2]
         swing_low = lookback["low"].min()
@@ -61,20 +64,16 @@ class LiquiditySweepStrategy(BaseStrategy):
             low <= sweep_threshold_low
             and close > open_  # bullish close
             and close > swing_low  # reclaim above swing low
-            and volume >= 1.4 * avg_vol
+            and (is_index or volume >= 1.4 * avg_vol)
         ):
             return StrategySignal(
                 strategy=StrategyName.LIQUIDITY_SWEEP,
                 option_type=OptionType.CALL,
-                entry_price=close,
                 strike_price=_nearest_strike(spot_price),
-                stoploss=close * 0.72,
-                target1=close * 1.5,
-                target2=close * 2.0,
                 details={
                     "swing_low": swing_low,
                     "sweep_depth_pct": round((swing_low - low) / swing_low * 100, 3),
-                    "volume_ratio": round(volume / avg_vol, 2),
+                    "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0,
                 },
             )
 
@@ -88,20 +87,16 @@ class LiquiditySweepStrategy(BaseStrategy):
             and close < open_  # bearish close
             and close < swing_high  # rejected back below
             and upper_wick_pct >= 50
-            and volume >= 1.4 * avg_vol
+            and (is_index or volume >= 1.4 * avg_vol)
         ):
             return StrategySignal(
                 strategy=StrategyName.LIQUIDITY_SWEEP,
                 option_type=OptionType.PUT,
-                entry_price=close,
                 strike_price=_nearest_strike(spot_price),
-                stoploss=close * 0.72,
-                target1=close * 1.5,
-                target2=close * 2.0,
                 details={
                     "swing_high": swing_high,
                     "upper_wick_pct": round(upper_wick_pct, 1),
-                    "volume_ratio": round(volume / avg_vol, 2),
+                    "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0,
                 },
             )
 

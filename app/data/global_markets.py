@@ -118,8 +118,8 @@ def compute_global_bias(indices: list[GlobalIndex]) -> GlobalBias:
     # Only consider indices that actually returned data
     valid = [idx for idx in indices if idx.last_price > 0]
     if not valid:
-        logger.warning("[Global] No valid index data — defaulting to NEUTRAL")
-        return GlobalBias.NEUTRAL
+        logger.warning("[Global] No valid index data — returning UNAVAILABLE")
+        return GlobalBias.UNAVAILABLE
 
     bullish_count = sum(1 for idx in valid if idx.change_pct > 1.0)
     bearish_count = sum(1 for idx in valid if idx.change_pct < -1.0)

@@ -5,8 +5,8 @@
 #
 # Expected directory layout on server:
 #   /opt/tradeai/
-#     backend/   ← this repo (git clone <backend-repo>)
-#     frontend/  ← frontend repo (git clone <frontend-repo>)
+#     backend/   ← tradeai-engine repo
+#     frontend/  ← tradeai-dashboard repo
 set -euo pipefail
 
 APP_DIR="/opt/tradeai"
@@ -37,12 +37,12 @@ fi
 echo "[4/8] Cloning repositories..."
 mkdir -p "$APP_DIR"
 if [ ! -d "$APP_DIR/backend" ]; then
-    echo "  ⚠ Clone your backend repo to $APP_DIR/backend"
-    echo "    git clone <your-backend-repo> $APP_DIR/backend"
+    echo "  ⚠ Clone tradeai-engine repo to $APP_DIR/backend"
+    echo "    git clone https://github.com/<you>/tradeai-engine.git $APP_DIR/backend"
 fi
 if [ ! -d "$APP_DIR/frontend" ]; then
-    echo "  ⚠ Clone your frontend repo to $APP_DIR/frontend"
-    echo "    git clone <your-frontend-repo> $APP_DIR/frontend"
+    echo "  ⚠ Clone tradeai-dashboard repo to $APP_DIR/frontend"
+    echo "    git clone https://github.com/<you>/tradeai-dashboard.git $APP_DIR/frontend"
 fi
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 

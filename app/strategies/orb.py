@@ -56,17 +56,26 @@ class ORBStrategy(BaseStrategy):
         last = post_orb.iloc[-1]
         close = last["close"]
         volume = last["volume"]
-        vwap = last.get("vwap", close)
-        ema20 = last.get("ema20", 0)
-        ema50 = last.get("ema50", 0)
-        rsi = last.get("rsi", 50)
+        vwap = last.get("vwap")
+        ema20 = last.get("ema20")
+        ema50 = last.get("ema50")
+        rsi = last.get("rsi")
         avg_vol = last.get("avg_volume_10", volume)
         high = last["high"]
         low = last["low"]
         open_ = last["open"]
 
+        # Require real indicator data
+        if any(v is None or (isinstance(v, float) and v != v) for v in [rsi, ema20, ema50]):
+            return None
+        if vwap is None or (isinstance(vwap, float) and vwap != vwap):
+            vwap = close  # Fallback: VWAP unavailable, use close (VWAP checks won't earn score)
+
         if avg_vol is None or avg_vol == 0:
             avg_vol = volume
+
+        # For index data (volume=0), skip volume filter
+        is_index = volume == 0 and avg_vol == 0
 
         # Wick ratio check (invalidation)
         body = abs(close - open_)
@@ -84,7 +93,7 @@ class ORBStrategy(BaseStrategy):
         # CALL breakout
         if (
             close > orh * (1 + breakout_buffer)
-            and volume > 1.5 * avg_vol
+            and (is_index or volume > 1.5 * avg_vol)
             and close > vwap
             and ema20 > ema50
             and rsi >= 55
@@ -99,11 +108,7 @@ class ORBStrategy(BaseStrategy):
             return StrategySignal(
                 strategy=StrategyName.ORB,
                 option_type=OptionType.CALL,
-                entry_price=close,
                 strike_price=_nearest_strike(spot_price, "CE"),
-                stoploss=close * 0.72,  # ~28% SL on premium
-                target1=close * 1.5,
-                target2=close * 2.0,
                 details={
                     "orh": orh,
                     "orl": orl,
@@ -115,7 +120,7 @@ class ORBStrategy(BaseStrategy):
         # PUT breakout
         if (
             close < orl * (1 - breakout_buffer)
-            and volume > 1.5 * avg_vol
+            and (is_index or volume > 1.5 * avg_vol)
             and close < vwap
             and ema20 < ema50
             and rsi <= 45
@@ -129,11 +134,7 @@ class ORBStrategy(BaseStrategy):
             return StrategySignal(
                 strategy=StrategyName.ORB,
                 option_type=OptionType.PUT,
-                entry_price=close,
                 strike_price=_nearest_strike(spot_price, "PE"),
-                stoploss=close * 0.72,
-                target1=close * 1.5,
-                target2=close * 2.0,
                 details={
                     "orh": orh,
                     "orl": orl,
