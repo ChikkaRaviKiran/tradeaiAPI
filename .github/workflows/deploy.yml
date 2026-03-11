@@ -96,18 +96,18 @@ jobs:
             cd /opt/tradeai
 
             # Load env vars
-            set -a; source .env; set +a
+            set -a; eval $(sudo cat .env | grep -v '^#' | grep -v '^$'); set +a
 
             # Log in to GHCR
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            echo "${{ secrets.GHCR_TOKEN }}" | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
             # Export for docker-compose
             export BACKEND_IMAGE="${BACKEND_IMAGE}"
             export BACKEND_TAG="${IMAGE_TAG}"
 
             # Pull and restart backend + infra services
-            sudo docker compose -f docker-compose.prod.yml pull backend
-            sudo docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            sudo -E docker compose -f docker-compose.prod.yml pull backend
+            sudo -E docker compose -f docker-compose.prod.yml up -d --remove-orphans
 
             # Clean up old images
             sudo docker image prune -f
