@@ -106,8 +106,8 @@ jobs:
             export BACKEND_IMAGE="${DEPLOY_IMAGE}"
             export BACKEND_TAG="${DEPLOY_TAG}"
 
-            # Log in to GHCR
-            echo "${{ secrets.GHCR_TOKEN }}" | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            # Clear any stale Docker credentials (public images need no auth)
+            sudo docker logout ghcr.io 2>/dev/null || true
 
             # Pull and restart backend + infra services
             sudo -E docker compose -f docker-compose.prod.yml pull backend
