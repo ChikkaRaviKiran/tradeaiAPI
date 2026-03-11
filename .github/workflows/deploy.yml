@@ -117,7 +117,7 @@ jobs:
             sudo docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}"
 
             # Start backend + infrastructure only (frontend is deployed separately)
-            sudo -E docker compose -f docker-compose.prod.yml up -d postgres redis backend nginx
+            sudo -E docker compose -f docker-compose.prod.yml up -d --no-deps postgres redis backend nginx
 
             # Clean up old images
             sudo docker image prune -f

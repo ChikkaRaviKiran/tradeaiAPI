@@ -72,8 +72,6 @@ services:
     container_name: tradeai-frontend
     networks:
       - tradeai-net
-    depends_on:
-      - backend
     restart: unless-stopped
 
   # ── Nginx Reverse Proxy ────────────────────────────────────────────────
