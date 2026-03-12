@@ -7,7 +7,10 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+import pytz
 from openai import AsyncOpenAI
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 from app.core.config import settings
 from app.core.models import (
@@ -105,7 +108,7 @@ class AIDecisionEngine:
         score: float,
     ) -> str:
         """Build structured prompt for AI evaluation."""
-        now = datetime.now()
+        now = datetime.now(_IST)
         return json.dumps(
             {
                 "market_snapshot": {

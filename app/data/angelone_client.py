@@ -9,7 +9,10 @@ from typing import Optional
 
 import pandas as pd
 import pyotp
+import pytz
 from SmartApi import SmartConnect
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 from app.core.config import settings
 from app.core.models import Candle, OptionsChainRow
@@ -55,7 +58,7 @@ class AngelOneClient:
 
             self._auth_token = data["data"]["jwtToken"]
             self._feed_token = self._smart_api.getfeedToken()
-            self._last_auth = datetime.now()
+            self._last_auth = datetime.now(_IST)
             logger.info("AngelOne authenticated successfully.")
             return True
         except Exception:
@@ -67,7 +70,7 @@ class AngelOneClient:
         if (
             self._smart_api is None
             or self._last_auth is None
-            or (datetime.now() - self._last_auth) > timedelta(hours=6)
+            or (datetime.now(_IST) - self._last_auth) > timedelta(hours=6)
         ):
             if not self.authenticate():
                 raise ConnectionError("Failed to authenticate with AngelOne")
@@ -92,7 +95,7 @@ class AngelOneClient:
             to_date: End date in YYYY-MM-DD HH:MM format.
         """
         self.ensure_authenticated()
-        now = datetime.now()
+        now = datetime.now(_IST)
         if to_date is None:
             to_date = now.strftime("%Y-%m-%d %H:%M")
         if from_date is None:
@@ -174,7 +177,6 @@ class AngelOneClient:
             # Search for the nearest NIFTY futures contract
             result = self._smart_api.searchScrip(self.nfo_exchange, "NIFTY")
             if result and result.get("status") and result.get("data"):
-                now = datetime.now()
                 best = None
                 for item in result["data"]:
                     tsym = item.get("tradingsymbol", "")
@@ -182,7 +184,7 @@ class AngelOneClient:
                     if tsym.startswith("NIFTY") and tsym.endswith("FUT"):
                         # Pick the nearest expiry
                         if best is None or len(tsym) < len(best.get("tradingsymbol", "")):
-                            best = item
+                            best = item  # noqa: timezone N/A here
                 if best:
                     self._nifty_fut_token_cache = best["symboltoken"]
                     logger.info(
@@ -359,7 +361,7 @@ class AngelOneClient:
             with urlopen(url, timeout=30) as resp:
                 instruments = json.loads(resp.read().decode())
 
-            today = datetime.now().date()
+            today = datetime.now(_IST).date()
             expiry_dates: set[datetime] = set()
 
             for inst in instruments:

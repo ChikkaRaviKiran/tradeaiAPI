@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
+import pytz
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,8 @@ from app.core.models import PerformanceMetrics, Trade
 from app.db.models import DailyReport, TradeRecord, create_new_async_session_factory
 
 logger = logging.getLogger(__name__)
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 _thread_local = threading.local()
 
@@ -73,7 +76,7 @@ class TradeLogger:
 
     async def get_today_trades(self) -> list[Trade]:
         """Fetch all trades for today."""
-        today = date.today().isoformat()
+        today = datetime.now(_IST).date().isoformat()
         SessionLocal = _get_session_factory()
         async with SessionLocal() as session:
             result = await session.execute(
@@ -142,7 +145,7 @@ class TradeLogger:
 
     async def save_daily_report(self, metrics: PerformanceMetrics) -> None:
         """Save daily summary to database."""
-        today = date.today().isoformat()
+        today = datetime.now(_IST).date().isoformat()
         SessionLocal = _get_session_factory()
         async with SessionLocal() as session:
             async with session.begin():

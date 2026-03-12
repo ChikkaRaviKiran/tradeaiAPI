@@ -7,6 +7,8 @@ import uuid
 from datetime import date, datetime
 from typing import Optional
 
+import pytz
+
 from app.core.config import settings
 from app.core.models import (
     AIDecision,
@@ -17,6 +19,8 @@ from app.core.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 
 class PaperTradingEngine:
@@ -29,7 +33,7 @@ class PaperTradingEngine:
 
     @property
     def all_today_trades(self) -> list[Trade]:
-        today = date.today().isoformat()
+        today = datetime.now(_IST).date().isoformat()
         return [
             t
             for t in self.open_trades + self.closed_trades
@@ -50,7 +54,7 @@ class PaperTradingEngine:
             nfo_symbol: NFO trading symbol (e.g. NIFTY17MAR202622500CE)
                         used for consistent price lookups during exit monitoring.
         """
-        now = datetime.now()
+        now = datetime.now(_IST)
         # Use NFO symbol for price tracking; display-friendly name in reason
         display_name = f"NIFTY {int(signal.strike_price)} {signal.option_type.value}"
         trade = Trade(

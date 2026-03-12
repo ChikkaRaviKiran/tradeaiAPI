@@ -221,7 +221,7 @@ class Orchestrator:
         cycle = self._cycle_count
         try:
             # 1. Fetch NIFTY candle data
-            now = datetime.now()
+            now = datetime.now(IST)
             from_date = now.strftime("%Y-%m-%d 09:15")
             to_date = now.strftime("%Y-%m-%d %H:%M")
 
@@ -552,7 +552,7 @@ class Orchestrator:
             report = (
                 "📊 DAILY REPORT\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                f"Date: {datetime.now().strftime('%Y-%m-%d')}\n"
+                f"Date: {datetime.now(IST).strftime('%Y-%m-%d')}\n"
                 f"Total Trades: {metrics.total_trades}\n"
                 f"Winners: {metrics.winning_trades}\n"
                 f"Losers: {metrics.losing_trades}\n"
@@ -576,7 +576,7 @@ class Orchestrator:
 
         Tries Wednesday first (current NIFTY weekly expiry day), then Thursday.
         """
-        today = datetime.now()
+        today = datetime.now(IST)
         # NIFTY weekly expiry moved to Wednesday
         days_until_wed = (2 - today.weekday()) % 7
         if days_until_wed == 0 and today.hour >= 16:

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
+
+import pytz
 
 from app.core.config import settings
 from app.core.models import Trade, TradeStatus
 
 logger = logging.getLogger(__name__)
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 
 class RiskManager:
@@ -30,7 +34,7 @@ class RiskManager:
     def can_trade(self, today_trades: list[Trade]) -> bool:
         """Check if a new trade is allowed based on risk rules."""
         # Count today's trades
-        today = date.today().isoformat()
+        today = datetime.now(_IST).date().isoformat()
         todays = [t for t in today_trades if t.date == today]
 
         # Max trades per day
@@ -72,7 +76,7 @@ class RiskManager:
 
     def get_daily_pnl(self, today_trades: list[Trade]) -> float:
         """Sum PnL for today's closed trades."""
-        today = date.today().isoformat()
+        today = datetime.now(_IST).date().isoformat()
         return sum(
             t.pnl or 0
             for t in today_trades

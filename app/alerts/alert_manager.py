@@ -8,10 +8,14 @@ from collections import deque
 from datetime import datetime
 from typing import Optional
 
+import pytz
+
 from app.core.config import settings
 from app.core.models import AIDecision, AlertItem, StrategySignal, Trade
 
 logger = logging.getLogger(__name__)
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 MAX_ALERTS = 200  # keep last N alerts in memory
 
@@ -134,7 +138,7 @@ class AlertManager:
             alert_type="signal",
             title=title,
             message=msg,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(_IST),
             strategy=signal.strategy.value,
         )
         self.store.add(alert)
@@ -155,7 +159,7 @@ class AlertManager:
             alert_type="exit",
             title=title,
             message=msg,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(_IST),
             trade_id=trade.trade_id,
             strategy=trade.strategy.value,
             pnl=trade.pnl,
@@ -173,7 +177,7 @@ class AlertManager:
             alert_type="report",
             title="DAILY REPORT",
             message=report,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(_IST),
         )
         self.store.add(alert)
         await self._get_history_logger().save_alert(alert)
@@ -186,7 +190,7 @@ class AlertManager:
             alert_type="info",
             title=title,
             message=message,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(_IST),
         )
         self.store.add(alert)
         await self._get_history_logger().save_alert(alert)
