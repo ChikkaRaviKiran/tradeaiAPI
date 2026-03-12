@@ -6,6 +6,20 @@ server {
         root /var/www/html;
     }
 
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name tradeai.tavabharat.com;
+
+    ssl_certificate /etc/letsencrypt/live/tradeai.tavabharat.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/tradeai.tavabharat.com/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
     # API routes
     location /api/ {
         proxy_pass http://localhost:8001;
