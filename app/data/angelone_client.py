@@ -28,11 +28,32 @@ class AngelOneClient:
         self._auth_token: Optional[str] = None
         self._feed_token: Optional[str] = None
         self._last_auth: Optional[datetime] = None
+        self._instrument_master: Optional[list] = None  # Cached instrument master
         # NIFTY token on AngelOne
         self.nifty_token = "99926000"
         self.nifty_symbol = "NIFTY"
         self.exchange = "NSE"
         self.nfo_exchange = "NFO"
+
+    # ── Instrument Master Cache ───────────────────────────────────────────
+
+    def _get_instrument_master(self) -> list:
+        """Download and cache the AngelOne instrument master JSON.
+
+        Cached for the lifetime of this client (one trading day).
+        """
+        if self._instrument_master is not None:
+            return self._instrument_master
+
+        import json
+        from urllib.request import urlopen
+
+        url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+        logger.info("Downloading AngelOne instrument master (~20MB)...")
+        with urlopen(url, timeout=60) as resp:
+            self._instrument_master = json.loads(resp.read().decode())
+        logger.info("Instrument master loaded: %d instruments", len(self._instrument_master))
+        return self._instrument_master
 
     # ── Authentication ────────────────────────────────────────────────────
 
@@ -169,31 +190,73 @@ class AngelOneClient:
         return self.get_candle_data(token, self.nfo_exchange, interval, from_date, to_date)
 
     def _get_nifty_fut_token(self) -> Optional[str]:
-        """Find the current month NIFTY futures symbol token."""
+        """Find the current month NIFTY futures symbol token.
+
+        Uses the instrument master JSON (same source as expiry discovery)
+        to reliably find the nearest NIFTY futures contract token.
+        searchScrip is unreliable because it returns too many option matches.
+        """
         if hasattr(self, "_nifty_fut_token_cache") and self._nifty_fut_token_cache:
             return self._nifty_fut_token_cache
 
         try:
-            # Search for the nearest NIFTY futures contract
-            result = self._smart_api.searchScrip(self.nfo_exchange, "NIFTY")
-            if result and result.get("status") and result.get("data"):
-                best = None
-                for item in result["data"]:
-                    tsym = item.get("tradingsymbol", "")
-                    # NIFTY futures symbols are like NIFTY27MAR2025FUT
-                    if tsym.startswith("NIFTY") and tsym.endswith("FUT"):
-                        # Pick the nearest expiry
-                        if best is None or len(tsym) < len(best.get("tradingsymbol", "")):
-                            best = item  # noqa: timezone N/A here
-                if best:
-                    self._nifty_fut_token_cache = best["symboltoken"]
-                    logger.info(
-                        "NIFTY Futures token: %s (%s)",
-                        best["symboltoken"], best["tradingsymbol"],
-                    )
-                    return self._nifty_fut_token_cache
+            import json
+            from urllib.request import urlopen
+
+            url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+            logger.info("Fetching instrument master for NIFTY Futures token...")
+
+            instruments = self._get_instrument_master()
+
+            today = datetime.now(_IST).date()
+            best_token = None
+            best_symbol = None
+            best_expiry = None
+
+            for inst in instruments:
+                name = inst.get("name", "")
+                exch_seg = inst.get("exch_seg", "")
+                symbol = inst.get("symbol", "")
+                expiry_str = inst.get("expiry", "")
+                inst_type = inst.get("instrumenttype", "")
+
+                # Look for NIFTY futures in NFO segment
+                if exch_seg != "NFO" or name != "NIFTY":
+                    continue
+                # FUTIDX = Index Futures
+                if inst_type != "FUTIDX":
+                    continue
+                if not symbol.endswith("FUT"):
+                    continue
+                if not expiry_str:
+                    continue
+
+                try:
+                    exp_date = datetime.strptime(expiry_str, "%d%b%Y").date()
+                except ValueError:
+                    continue
+
+                # Must not be expired
+                if exp_date < today:
+                    continue
+
+                # Pick the nearest expiry
+                if best_expiry is None or exp_date < best_expiry:
+                    best_expiry = exp_date
+                    best_token = inst.get("token", "")
+                    best_symbol = symbol
+
+            if best_token:
+                self._nifty_fut_token_cache = best_token
+                logger.info(
+                    "NIFTY Futures token from instrument master: %s (%s, expiry=%s)",
+                    best_token, best_symbol, best_expiry,
+                )
+                return self._nifty_fut_token_cache
+
+            logger.warning("No NIFTY Futures contract found in instrument master")
         except Exception:
-            logger.exception("Error searching for NIFTY futures token")
+            logger.exception("Error fetching NIFTY futures token from instrument master")
         return None
 
     # ── LTP / Quote ──────────────────────────────────────────────────────
@@ -354,12 +417,9 @@ class AngelOneClient:
             import csv
             from urllib.request import urlopen
 
-            url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
             logger.info("Fetching AngelOne instrument master for expiry discovery...")
 
-            import json
-            with urlopen(url, timeout=30) as resp:
-                instruments = json.loads(resp.read().decode())
+            instruments = self._get_instrument_master()
 
             today = datetime.now(_IST).date()
             expiry_dates: set[datetime] = set()

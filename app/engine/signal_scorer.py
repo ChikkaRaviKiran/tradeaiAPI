@@ -8,7 +8,7 @@ Scoring factors (max 100) — every point must come from real market data:
   Global bias:               10  (only if real global data fetched)
   Historical pattern:        15  (EMA alignment, swing structure, ADX)
 
-Trade allowed if score ≥ 70.
+Trade allowed if score ≥ 55.
 No free points. Missing data = 0 points for that factor.
 """
 
@@ -28,7 +28,7 @@ from app.core.models import (
 
 logger = logging.getLogger(__name__)
 
-MIN_SCORE = 70
+MIN_SCORE = 55
 
 
 class SignalScorer:
@@ -173,7 +173,7 @@ class SignalScorer:
         Two data sources:
           1. NIFTY Futures volume (merged into df by orchestrator) — preferred
           2. ATM option volume from options chain — fallback for participation
-        If neither is available, returns 0 (no free points).
+        If neither is available, check candle range vs ATR for implied activity.
         """
         if df.empty:
             return 0
@@ -216,17 +216,28 @@ class SignalScorer:
                     score = 5
 
             self._prev_atm_volume = atm_vol
-        # Path 3: No volume data at all — 0 points
+        # Path 3: No volume data — infer activity from candle range vs ATR
         else:
-            score = 0
+            atr = last.get("atr")
+            high = last.get("high", 0)
+            low = last.get("low", 0)
+            candle_range = high - low
+            if atr and atr > 0 and candle_range > 0:
+                range_ratio = candle_range / atr
+                if range_ratio >= 1.5:
+                    score = 10  # Strong move relative to ATR
+                elif range_ratio >= 1.0:
+                    score = 6
+                elif range_ratio >= 0.7:
+                    score = 3
 
         return score
 
     def _score_vwap(self, signal: StrategySignal, df: pd.DataFrame) -> float:
         """Score based on VWAP alignment (0–15).
 
-        Only awards full points if VWAP is calculated from real volume data.
-        Non-volume-weighted VWAP (index fallback) gets 0 points.
+        Full points if VWAP is calculated from real volume data.
+        Partial points if price aligns with non-volume-weighted VWAP.
         """
         if df.empty:
             return 0
@@ -241,22 +252,21 @@ class SignalScorer:
 
         # Check if volume data exists (futures volume was merged)
         vol_sum = df["volume"].sum() if "volume" in df.columns else 0
-        if vol_sum == 0:
-            # No real volume — VWAP is just cumulative typical price. Not trustworthy.
-            return 0
+        has_real_volume = vol_sum > 0
 
-        # Real volume-weighted VWAP — award points for alignment
+        # Score multiplier: full credit with real volume, partial without
+        max_pts = 15 if has_real_volume else 8
+
         if signal.option_type == OptionType.CALL and close > vwap:
-            # More points for stronger alignment
             pct_above = (close - vwap) / vwap * 100 if vwap > 0 else 0
             if pct_above > 0.1:
-                return 15
-            return 10
+                return max_pts
+            return round(max_pts * 0.67)
         if signal.option_type == OptionType.PUT and close < vwap:
             pct_below = (vwap - close) / vwap * 100 if vwap > 0 else 0
             if pct_below > 0.1:
-                return 15
-            return 10
+                return max_pts
+            return round(max_pts * 0.67)
         return 0
 
     def _score_options(self, signal: StrategySignal, metrics: OptionsMetrics) -> float:
