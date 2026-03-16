@@ -31,12 +31,19 @@ def _get_session_factory():
 async def _ensure_tables():
     """Ensure our tables exist (called once per thread)."""
     if not hasattr(_thread_local, '_tables_created'):
-        _get_session_factory()  # ensure engine is created
-        from app.db.models import Base
-        engine = _thread_local.engine
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        _thread_local._tables_created = True
+        try:
+            _get_session_factory()  # ensure engine is created
+            from app.db.models import Base
+            engine = _thread_local.engine
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            _thread_local._tables_created = True
+        except Exception:
+            # Reset thread-local state so next call retries fresh
+            for attr in ('session_factory', 'engine', '_tables_created'):
+                if hasattr(_thread_local, attr):
+                    delattr(_thread_local, attr)
+            raise
 
 
 class HistoryLogger:
@@ -107,7 +114,12 @@ class HistoryLogger:
                 async with session.begin():
                     session.add(record)
         except Exception as e:
-            logger.warning("DB save_alert failed: %s", str(e))
+            # Reset thread-local state so next attempt retries fresh
+            for attr in ('session_factory', 'engine', '_tables_created'):
+                if hasattr(_thread_local, attr):
+                    delattr(_thread_local, attr)
+            logger.error("Error saving alert")
+            logger.debug("save_alert detail: %s", str(e), exc_info=True)
 
     async def get_snapshots_by_date(self, target_date: str) -> list[dict]:
         """Get all snapshots for a specific date (YYYY-MM-DD)."""

@@ -194,9 +194,15 @@ class Orchestrator:
                 # Fetch global data if never fetched (late start) or stale (>15 min)
                 if self._global_last_fetched is None:
                     logger.info("Late start detected — fetching global data now")
-                    await self._fetch_global_data()
+                    try:
+                        await self._fetch_global_data()
+                    except Exception:
+                        logger.exception("Failed to fetch global data on late start")
                 elif (datetime.now(IST) - self._global_last_fetched).total_seconds() > 900:
-                    await self._fetch_global_data()
+                    try:
+                        await self._fetch_global_data()
+                    except Exception:
+                        logger.exception("Failed to refresh global data")
 
                 await self._run_analysis_cycle()
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
@@ -256,8 +262,9 @@ class Orchestrator:
             if fut_candles:
                 fut_df = self.client.candles_to_dataframe(fut_candles)
                 df = self.feature_engine.merge_futures_volume(df, fut_df)
+                logger.debug("[Cycle %d] Futures volume merged: %d candles", cycle, len(fut_df))
             else:
-                logger.warning("[Cycle %d] No NIFTY Futures data — no volume/VWAP", cycle)
+                logger.warning("[Cycle %d] No NIFTY Futures data — volume/VWAP will use ATR fallback", cycle)
 
             # 3. Feature engineering
             df = self.feature_engine.compute_indicators(df)

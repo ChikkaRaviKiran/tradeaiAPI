@@ -193,4 +193,5 @@ class AlertManager:
             timestamp=datetime.now(_IST),
         )
         self.store.add(alert)
+        logger.info("Alert [info]: %s", title)
         await self._get_history_logger().save_alert(alert)

@@ -183,6 +183,9 @@ class SignalScorer:
         vol = last.get("volume", 0)
         avg = last.get("avg_volume_10", 0)
 
+        # Check if this is index data with no volume
+        is_index = vol == 0 and (avg is None or avg == 0)
+
         # Path 1: Futures volume is available (vol > 0 and avg > 0)
         if vol > 0 and avg and avg > 0:
             ratio = vol / avg
@@ -197,7 +200,7 @@ class SignalScorer:
             # Below average volume = 0
 
         # Path 2: No futures volume — try ATM option volume from chain
-        elif options_metrics.atm_option_volume > 0:
+        elif not is_index and options_metrics.atm_option_volume > 0:
             atm_vol = options_metrics.atm_option_volume
             # Compare against previous cycle's ATM volume
             if self._prev_atm_volume > 0:
@@ -216,8 +219,8 @@ class SignalScorer:
                     score = 5
 
             self._prev_atm_volume = atm_vol
-        # Path 3: No volume data — infer activity from candle range vs ATR
-        else:
+        # Path 3: No volume data (or index data) — infer activity from candle range vs ATR
+        if score == 0:
             atr = last.get("atr")
             high = last.get("high", 0)
             low = last.get("low", 0)
