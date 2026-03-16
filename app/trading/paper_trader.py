@@ -45,6 +45,7 @@ class PaperTradingEngine:
         signal: StrategySignal,
         decision: AIDecision,
         nfo_symbol: str = "",
+        num_lots: int = 1,
     ) -> Trade:
         """Open a new paper trade.
 
@@ -53,6 +54,7 @@ class PaperTradingEngine:
             decision: AI validation result with entry/SL/targets.
             nfo_symbol: NFO trading symbol (e.g. NIFTY17MAR202622500CE)
                         used for consistent price lookups during exit monitoring.
+            num_lots: Number of lots to trade (from risk-based position sizing).
         """
         now = datetime.now(_IST)
         # Use NFO symbol for price tracking; display-friendly name in reason
@@ -71,7 +73,7 @@ class PaperTradingEngine:
             target2=decision.target2,
             confidence=decision.confidence_score,
             status=TradeStatus.OPEN,
-            lot_size=self.lot_size,
+            lot_size=self.lot_size * num_lots,
             reason=decision.reason,
         )
         self.open_trades.append(trade)

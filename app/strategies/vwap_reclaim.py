@@ -1,9 +1,9 @@
 """Strategy 2 — VWAP Reclaim.
 
-Time window: 10:30–14:30
+Time window: 10:00–15:00 (widened from 10:30–14:30)
 
-CALL: Price below VWAP for ≥10 min, closes above VWAP, volume > 1.3× avg, RSI > 50, EMA9 crosses EMA20
-PUT:  Price above VWAP for ≥10 min, closes below VWAP, RSI < 50, EMA9 crosses below EMA20
+CALL: Price below VWAP for ≥8 min, closes above VWAP, RSI > 50, EMA9 crosses EMA20
+PUT:  Price above VWAP for ≥8 min, closes below VWAP, RSI < 50, EMA9 crosses below EMA20
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ from app.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-WINDOW_START = dtime(10, 30)
-WINDOW_END = dtime(14, 30)
-MIN_BELOW_CANDLES = 10  # 10× 1-min candles = 10 minutes
+WINDOW_START = dtime(10, 0)
+WINDOW_END = dtime(15, 0)
+MIN_BELOW_CANDLES = 8  # Reduced from 10 — faster signal generation
 
 
 class VWAPReclaimStrategy(BaseStrategy):
@@ -33,7 +33,7 @@ class VWAPReclaimStrategy(BaseStrategy):
         options_metrics: OptionsMetrics,
         spot_price: float,
     ) -> Optional[StrategySignal]:
-        if df.empty or len(df) < 20:
+        if df.empty or len(df) < 15:
             return None
 
         # Filter to time window

@@ -22,7 +22,7 @@ from app.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-SWING_LOOKBACK = 20
+SWING_LOOKBACK = 15  # Reduced from 20 — faster swing detection
 
 
 class LiquiditySweepStrategy(BaseStrategy):

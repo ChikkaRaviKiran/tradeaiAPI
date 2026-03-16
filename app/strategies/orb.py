@@ -35,7 +35,7 @@ class ORBStrategy(BaseStrategy):
         options_metrics: OptionsMetrics,
         spot_price: float,
     ) -> Optional[StrategySignal]:
-        if df.empty or len(df) < 20:
+        if df.empty or len(df) < 16:  # Need at least 15-min ORB window + 1 candle
             return None
 
         # Identify opening range candles (09:15–09:30)

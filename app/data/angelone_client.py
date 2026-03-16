@@ -294,7 +294,7 @@ class AngelOneClient:
         base = int(round(nifty_ltp / 50) * 50)
         strikes = list(range(base - 1000, base + 1050, 50))
 
-        # Phase 1: Search all symbol tokens
+        # Phase 1: Search all symbol tokens (uses instrument master — no API calls)
         token_map: dict[str, dict] = {}  # token -> symbol_info
         strike_tokens: dict[int, dict] = {}  # strike -> {ce_token, pe_token}
         for strike in strikes:
@@ -312,7 +312,6 @@ class AngelOneClient:
                 entry["pe_token"] = t
                 token_map[t] = pe_info
             strike_tokens[strike] = entry
-            time.sleep(0.05)  # Rate limiting for searchScrip
 
         # Phase 2: Batch getMarketData(FULL) — max 50 tokens per call
         all_tokens = list(token_map.keys())
@@ -350,7 +349,20 @@ class AngelOneClient:
         return rows
 
     def _search_symbol(self, trading_symbol: str) -> Optional[dict]:
-        """Search for a symbol token using the search API."""
+        """Search for a symbol token — first from instrument master, then API fallback."""
+        # Fast path: look up from cached instrument master (no API call)
+        try:
+            master = self._get_instrument_master()
+            for item in master:
+                if item.get("symbol") == trading_symbol and item.get("exch_seg") == self.nfo_exchange:
+                    return {
+                        "tradingsymbol": item.get("symbol", ""),
+                        "symboltoken": item.get("token", ""),
+                    }
+        except Exception:
+            logger.debug("Instrument master lookup failed for %s", trading_symbol)
+
+        # Slow fallback: searchScrip API
         try:
             result = self._smart_api.searchScrip(self.nfo_exchange, trading_symbol)
             if result and result.get("status") and result.get("data"):

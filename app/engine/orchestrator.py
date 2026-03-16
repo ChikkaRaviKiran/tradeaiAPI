@@ -1,10 +1,16 @@
 """Main orchestrator — runs the continuous trading loop during market hours.
 
+Multi-instrument architecture (SRS rebuild):
+    - Loops over all active instruments from config
+    - Each instrument gets independent analysis, regime detection, signal scoring
+    - Shared risk management across all instruments
+    - Supports indices (via AngelOne) and equities (via Yahoo Finance fallback)
+
 Schedule:
     08:45  Load data, authenticate
-    09:00  Fetch global market context
+    09:00  Fetch global market context + institutional/breadth data
     09:15  Start monitoring
-    09:15–15:30  Continuous analysis (1-min loop)
+    09:15–15:30  Continuous analysis (1-min loop per instrument)
     15:20  Close open trades
     15:30–16:00  Daily report
 """
@@ -21,6 +27,11 @@ import pytz
 from app.alerts.alert_manager import AlertManager
 from app.core.config import settings
 from app.core.holidays import is_market_holiday, next_trading_date
+from app.core.instruments import (
+    InstrumentConfig,
+    get_instrument,
+    get_enabled_instruments,
+)
 from app.core.models import (
     GlobalBias,
     MarketRegime,
@@ -35,17 +46,21 @@ from app.data.validator import DataValidator
 from app.engine.ai_decision import AIDecisionEngine
 from app.engine.feature_engine import FeatureEngine
 from app.engine.regime_detector import RegimeDetector
-from app.engine.signal_scorer import SignalScorer, MIN_SCORE
+from app.engine.signal_scorer import SignalScorer, MIN_SCORE, compute_adaptive_min_score
 from app.strategies.base import BaseStrategy
 from app.strategies.liquidity_sweep import LiquiditySweepStrategy
+from app.strategies.momentum_breakout import MomentumBreakoutStrategy
+from app.strategies.ema_breakout import EMABreakoutStrategy
 from app.strategies.orb import ORBStrategy
 from app.strategies.range_breakout import RangeBreakoutStrategy
 from app.strategies.trend_pullback import TrendPullbackStrategy
 from app.strategies.vwap_reclaim import VWAPReclaimStrategy
+from app.strategies.breakout_20d import Breakout20DStrategy
 from app.trading.history_logger import HistoryLogger
 from app.trading.paper_trader import PaperTradingEngine
 from app.trading.risk_manager import RiskManager
 from app.trading.trade_logger import TradeLogger
+from app.backtest.scheduler import EvaluationScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +77,7 @@ LOOP_INTERVAL_SECONDS = 60  # 1-minute analysis cycle
 
 
 class Orchestrator:
-    """Central trading system controller."""
+    """Central trading system controller — multi-instrument aware."""
 
     def __init__(self) -> None:
         # Components
@@ -77,36 +92,62 @@ class Orchestrator:
         self.trade_logger = TradeLogger()
         self.history_logger = HistoryLogger()
         self.alert_manager = AlertManager()
+        self.eval_scheduler = EvaluationScheduler(lookback_days=20)
 
-        # Strategies
+        # Strategies (applied to every instrument)
         self.strategies: list[BaseStrategy] = [
             ORBStrategy(),
             VWAPReclaimStrategy(),
             TrendPullbackStrategy(),
             LiquiditySweepStrategy(),
             RangeBreakoutStrategy(),
+            MomentumBreakoutStrategy(),
+            EMABreakoutStrategy(),
+            Breakout20DStrategy(),
         ]
 
-        # State
+        # Active instruments — resolved from evaluation or config
+        self._active_instruments: list[InstrumentConfig] = []
+        # Per-instrument strategy whitelist from evaluation
+        # {symbol: [strategy_instance, ...]}  — empty means run all
+        self._instrument_strategies: dict[str, list[BaseStrategy]] = {}
+
+        # State — per instrument
         self.running = False
         self._cycle_count = 0
         self._global_last_fetched: Optional[datetime] = None
         self.global_bias = GlobalBias.UNAVAILABLE
-        self.global_indices: list = []  # Store individual index data
+        self.global_indices: list = []
+        # Per-instrument snapshots  {symbol: MarketSnapshot}
+        self.snapshots: dict[str, MarketSnapshot] = {}
+        # Per-instrument options metrics  {symbol: OptionsMetrics}
+        self._options_metrics: dict[str, OptionsMetrics] = {}
+        # Per-instrument expiry  {symbol: str}
+        self._expiries: dict[str, str] = {}
+        # Backward compat
+        # Backward compat
         self.snapshot: Optional[MarketSnapshot] = None
-        self.options_metrics = OptionsMetrics()
 
         # Heartbeat tracking
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
 
-        # Expiry format for current week (needs to be set dynamically)
-        self._expiry: Optional[str] = None
-
     async def start(self) -> None:
         """Main entry point — runs forever, restarting each trading day."""
+        # Load previous evaluation from DB on cold start
+        try:
+            await self.eval_scheduler.load_latest_from_db()
+        except Exception:
+            logger.warning("Could not load previous evaluation from DB")
+
+        # Resolve instruments (auto-select or config)
+        self._active_instruments = self._resolve_instruments()
+        inst_names = [i.symbol for i in self._active_instruments]
+
         logger.info("=" * 60)
-        logger.info("TradeAI Orchestrator started (continuous mode)")
+        logger.info("TradeAI Orchestrator started")
+        logger.info("Mode: %s", "AUTO-SELECT" if settings.auto_select_instruments else "MANUAL")
+        logger.info("Active instruments: %s", ", ".join(inst_names))
         logger.info("Paper trading: %s", settings.paper_trading)
         logger.info("Capital: ₹%s", f"{settings.initial_capital:,.0f}")
         logger.info("=" * 60)
@@ -127,9 +168,10 @@ class Orchestrator:
         self._global_last_fetched = None
         self.global_bias = GlobalBias.UNAVAILABLE
         self.global_indices = []
+        self.snapshots = {}
+        self._options_metrics = {}
+        self._expiries = {}
         self.snapshot = None
-        self.options_metrics = OptionsMetrics()
-        self._expiry = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
         self.paper_trader = PaperTradingEngine()  # Fresh daily paper trader
@@ -162,21 +204,40 @@ class Orchestrator:
 
         self.running = True
 
+        # ── Pre-market evaluation: auto-select instruments ───────────────
+        if settings.auto_select_instruments:
+            await self._run_premarket_evaluation()
+            # Re-resolve instruments based on fresh evaluation
+            self._active_instruments = self._resolve_instruments()
+        else:
+            self._active_instruments = self._resolve_instruments()
+
         # Authenticate with AngelOne
         if not self.client.authenticate():
             logger.error("Failed to authenticate. Aborting today.")
             await self.alert_manager.send_info("AUTH FAILED", "AngelOne authentication failed. Check credentials.")
             return
 
-        # Determine current weekly expiry from live instrument data
-        self._expiry = self.client.get_nearest_weekly_expiry()
-        if not self._expiry:
-            self._expiry = self._get_weekly_expiry_fallback()
-        logger.info("Weekly expiry: %s", self._expiry)
+        # Determine weekly expiry for each index instrument
+        for inst in self._active_instruments:
+            if inst.is_index:
+                expiry = self.client.get_nearest_weekly_expiry()
+                if not expiry:
+                    expiry = self._get_weekly_expiry_fallback()
+                self._expiries[inst.symbol] = expiry
+                logger.info("Weekly expiry for %s: %s", inst.symbol, expiry)
 
+        # Update shared state for API
+        from app.api.routes import get_state
+        state = get_state()
+        state["eval_scheduler"] = self.eval_scheduler
+
+        inst_names = [i.symbol for i in self._active_instruments]
         await self.alert_manager.send_info(
             "SYSTEM STARTED",
-            f"Paper trading: {settings.paper_trading}\nCapital: ₹{settings.initial_capital:,.0f}\nExpiry: {self._expiry}",
+            f"Mode: {'AUTO-SELECT' if settings.auto_select_instruments else 'MANUAL'}\n"
+            f"Instruments: {', '.join(inst_names)}\n"
+            f"Paper trading: {settings.paper_trading}\nCapital: ₹{settings.initial_capital:,.0f}",
         )
 
         while self.running:
@@ -214,9 +275,10 @@ class Orchestrator:
                 await asyncio.sleep(60)
                 continue
 
-            # Post-market: generate daily report
+            # Post-market: generate daily report + run strategy evaluation
             if REPORT_TIME <= current_time <= dtime(16, 0):
                 await self._generate_daily_report()
+                await self._run_post_market_evaluation()
                 self.running = False
                 logger.info("Trading day complete. Will restart next trading day.")
                 return
@@ -228,43 +290,80 @@ class Orchestrator:
     # ── Core Analysis Cycle ──────────────────────────────────────────────
 
     async def _run_analysis_cycle(self) -> None:
-        """Single iteration of the 1-minute analysis loop."""
+        """Single iteration of the 1-minute analysis loop — all instruments."""
         self._cycle_count += 1
         cycle = self._cycle_count
+        now = datetime.now(IST)
+        logger.info("── Cycle %d ── %s ──", cycle, now.strftime("%H:%M:%S"))
+
         try:
-            # 1. Fetch NIFTY candle data
-            now = datetime.now(IST)
+            # Analyze each active instrument
+            for instrument in self._active_instruments:
+                await self._analyze_instrument(instrument, cycle, now)
+
+            # Update shared state for API (use NIFTY as primary if available)
+            from app.api.routes import get_state
+            state = get_state()
+            nifty_snap = self.snapshots.get("NIFTY")
+            if nifty_snap:
+                state["snapshot"] = nifty_snap
+                self.snapshot = nifty_snap
+            elif self.snapshots:
+                first = next(iter(self.snapshots.values()))
+                state["snapshot"] = first
+                self.snapshot = first
+            state["open_trades"] = self.paper_trader.open_trades
+            state["snapshots"] = self.snapshots  # All instrument snapshots
+
+            # Heartbeat alert every 15 cycles
+            if self._consecutive_no_signal > 0 and cycle - self._last_heartbeat_cycle >= 15:
+                self._last_heartbeat_cycle = cycle
+                snap = self.snapshot
+                if snap:
+                    await self.alert_manager.send_info(
+                        f"SYSTEM HEARTBEAT — Cycle #{cycle}",
+                        f"Instruments: {', '.join(i.symbol for i in self._active_instruments)}\n"
+                        f"No signals for {self._consecutive_no_signal} consecutive cycles.\n"
+                        f"Strategies are monitoring — waiting for conditions to align.",
+                    )
+
+        except Exception:
+            logger.exception("Error in analysis cycle")
+
+    async def _analyze_instrument(
+        self, instrument: InstrumentConfig, cycle: int, now: datetime
+    ) -> None:
+        """Run full analysis for a single instrument."""
+        symbol = instrument.symbol
+        try:
+            # 1. Fetch candle data
             from_date = now.strftime("%Y-%m-%d 09:15")
             to_date = now.strftime("%Y-%m-%d %H:%M")
 
-            logger.info("── Cycle %d ── %s ──", cycle, now.strftime("%H:%M:%S"))
-
-            candles = self.client.get_nifty_candles(
-                interval="ONE_MINUTE", from_date=from_date, to_date=to_date
+            candles = self.client.get_candle_data(
+                instrument.token, instrument.exchange.value,
+                "ONE_MINUTE", from_date, to_date
             )
             df = self.client.candles_to_dataframe(candles)
 
             if df.empty:
-                logger.warning("[Cycle %d] No candle data received from AngelOne", cycle)
+                logger.warning("[%s][Cycle %d] No candle data received", symbol, cycle)
                 return
 
-            # 2. Validate data (NIFTY is an index — volume is always 0)
-            df = self.validator.validate_candles(df, is_index=True)
+            # 2. Validate data
+            df = self.validator.validate_candles(df, is_index=instrument.is_index)
             if not self.validator.is_valid_for_trading(df):
-                logger.warning("[Cycle %d] Data validation failed — skipping cycle", cycle)
+                logger.warning("[%s][Cycle %d] Data validation failed", symbol, cycle)
                 return
 
-            # 2b. Fetch NIFTY Futures candles and merge volume into spot data
-            #     This gives us real volume for VWAP and volume analysis
-            fut_candles = self.client.get_nifty_futures_candles(
-                interval="ONE_MINUTE", from_date=from_date, to_date=to_date
-            )
-            if fut_candles:
-                fut_df = self.client.candles_to_dataframe(fut_candles)
-                df = self.feature_engine.merge_futures_volume(df, fut_df)
-                logger.debug("[Cycle %d] Futures volume merged: %d candles", cycle, len(fut_df))
-            else:
-                logger.warning("[Cycle %d] No NIFTY Futures data — volume/VWAP will use ATR fallback", cycle)
+            # 2b. For indices, merge futures volume
+            if instrument.is_index:
+                fut_candles = self.client.get_nifty_futures_candles(
+                    interval="ONE_MINUTE", from_date=from_date, to_date=to_date
+                )
+                if fut_candles:
+                    fut_df = self.client.candles_to_dataframe(fut_candles)
+                    df = self.feature_engine.merge_futures_volume(df, fut_df)
 
             # 3. Feature engineering
             df = self.feature_engine.compute_indicators(df)
@@ -272,201 +371,267 @@ class Orchestrator:
             spot_price = df.iloc[-1]["close"] if not df.empty else 0
 
             logger.info(
-                "[Cycle %d] NIFTY=%.2f | RSI=%s | ADX=%s | MACD=%s | EMA9=%s | EMA20=%s | Vol=%d",
-                cycle, spot_price,
+                "[%s][Cycle %d] Price=%.2f | RSI=%s | ADX=%s | EMA200=%s",
+                symbol, cycle, spot_price,
                 f"{indicators.rsi:.1f}" if indicators.rsi is not None else "N/A",
                 f"{indicators.adx:.1f}" if indicators.adx is not None else "N/A",
-                f"{indicators.macd:.2f}" if indicators.macd is not None else "N/A",
-                f"{indicators.ema9:.1f}" if indicators.ema9 is not None else "N/A",
-                f"{indicators.ema20:.1f}" if indicators.ema20 is not None else "N/A",
-                df.iloc[-1].get("volume", 0) if not df.empty else 0,
+                f"{indicators.ema200:.1f}" if indicators.ema200 is not None else "N/A",
             )
 
-            # 4. Fetch options chain (less frequently — every 5 minutes)
-            if now.minute % 5 == 0:
-                await self._update_options_chain(spot_price)
+            # 4. Options chain (only for index instruments, every 5 min)
+            options_metrics = self._options_metrics.get(symbol, OptionsMetrics())
+            expiry = self._expiries.get(symbol)
+            if instrument.is_index and expiry and (now.minute % 5 == 0 or options_metrics.pcr is None):
+                options_metrics = await self._update_options_chain_for(instrument, spot_price, expiry)
+                self._options_metrics[symbol] = options_metrics
 
             # 5. Market regime detection
             regime = self.regime_detector.detect(df)
 
             # 6. Build market snapshot
-            self.snapshot = MarketSnapshot(
-                nifty_price=spot_price,
+            snap = MarketSnapshot(
+                instrument=symbol,
+                price=spot_price,
+                nifty_price=spot_price if symbol == "NIFTY" else 0,
                 vwap=indicators.vwap,
                 regime=regime,
                 global_bias=self.global_bias,
                 indicators=indicators,
-                options_metrics=self.options_metrics,
+                options_metrics=options_metrics,
                 timestamp=now,
             )
+            self.snapshots[symbol] = snap
+            await self.history_logger.save_snapshot(snap)
 
-            # Update shared state for API
-            from app.api.routes import get_state
-            state = get_state()
-            state["snapshot"] = self.snapshot
-            state["open_trades"] = self.paper_trader.open_trades
+            # 7. Check exits on open trades for this instrument
+            await self._check_trade_exits_for(instrument, spot_price)
 
-            # Persist snapshot to database for historical review
-            await self.history_logger.save_snapshot(self.snapshot)
-
-            # 7. Check exits on open trades
-            await self._check_trade_exits(spot_price)
-
-            # 8. Check risk limits
-            if not self.risk_manager.can_trade(self.paper_trader.all_today_trades):
-                logger.info("[Cycle %d] Risk limits reached — no new trades allowed", cycle)
+            # 8. Global risk check
+            if not self.risk_manager.can_trade(
+                self.paper_trader.all_today_trades,
+                open_count=len(self.paper_trader.open_trades),
+            ):
+                logger.info("[%s][Cycle %d] Risk limits reached", symbol, cycle)
                 return
 
-            # 9. Run strategies
+            # 9. Run strategies (use per-instrument whitelist if available)
+            strategies_to_run = self._instrument_strategies.get(symbol, self.strategies)
             signals: list[StrategySignal] = []
-            for strategy in self.strategies:
-                signal = strategy.evaluate(df, self.options_metrics, spot_price)
+            for strategy in strategies_to_run:
+                signal = strategy.evaluate(df, options_metrics, spot_price)
                 if signal:
+                    signal.instrument = symbol
                     signals.append(signal)
-                    logger.info(
-                        "[Cycle %d] Signal from %s: %s %s @ %.0f",
-                        cycle, signal.strategy.value, signal.option_type.value,
-                        signal.direction.value if hasattr(signal, 'direction') else 'N/A',
-                        signal.strike_price,
-                    )
 
             if not signals:
                 self._consecutive_no_signal += 1
-                logger.info("[Cycle %d] No strategy signals this cycle (regime=%s)", cycle, regime.value)
-
-                # Send heartbeat alert every 15 cycles (~15 min) so user knows system is active
-                if cycle - self._last_heartbeat_cycle >= 15:
-                    self._last_heartbeat_cycle = cycle
-                    await self.alert_manager.send_info(
-                        f"SYSTEM HEARTBEAT — Cycle #{cycle}",
-                        f"NIFTY: {spot_price:,.2f} | Regime: {regime.value}\n"
-                        f"RSI: {indicators.rsi:.1f if indicators.rsi else 'N/A'} | "
-                        f"ADX: {indicators.adx:.1f if indicators.adx else 'N/A'}\n"
-                        f"VWAP: {indicators.vwap:,.2f if indicators.vwap else 'N/A'} | "
-                        f"Global: {self.global_bias.value}\n"
-                        f"No signals for {self._consecutive_no_signal} consecutive cycles.\n"
-                        f"Strategies are monitoring — waiting for conditions to align.",
-                    )
                 return
             else:
                 self._consecutive_no_signal = 0
 
-            # 10. Score and filter signals
+            # 10. Score and filter
+            adaptive_min = compute_adaptive_min_score(options_metrics, self.global_bias)
             best_signal = None
             best_score = 0.0
 
             for signal in signals:
                 score_result = self.signal_scorer.score(
-                    signal, df, self.options_metrics, self.global_bias
+                    signal, df, options_metrics, self.global_bias
                 )
                 logger.info(
-                    "[Cycle %d] %s scored %.0f/100 (min=%d)",
-                    cycle, signal.strategy.value, score_result.total, MIN_SCORE,
+                    "[%s][Cycle %d] %s scored %.0f/100 (min=%d)",
+                    symbol, cycle, signal.strategy.value, score_result.total, adaptive_min,
                 )
-                if score_result.total >= MIN_SCORE and score_result.total > best_score:
+                if score_result.total >= adaptive_min and score_result.total > best_score:
                     best_signal = signal
                     best_score = score_result.total
                     signal.score = score_result.total
 
             if best_signal is None:
-                logger.info("[Cycle %d] All signals below minimum score threshold (%d)", cycle, MIN_SCORE)
-                await self.alert_manager.send_info(
-                    "LOW SCORE SIGNALS",
-                    f"{len(signals)} signal(s) detected but none scored >= {MIN_SCORE}\n"
-                    f"Strategies: {', '.join(s.strategy.value for s in signals)}",
-                )
                 return
 
-            logger.info(
-                "Best signal: %s %s (score=%.0f)",
-                best_signal.strategy.value,
-                best_signal.option_type.value,
-                best_score,
-            )
-
-            # 11. Fetch real option premium from AngelOne
-            option_ltp = self._fetch_option_ltp(best_signal)
+            # 11. Fetch option premium
+            option_ltp = self._fetch_option_ltp_for(instrument, best_signal, expiry)
             if option_ltp is None or option_ltp <= 0:
-                logger.warning(
-                    "Could not fetch option LTP for %s %s — skipping trade",
-                    int(best_signal.strike_price),
-                    best_signal.option_type.value,
-                )
+                logger.warning("[%s] Could not fetch option LTP — skipping trade", symbol)
                 return
 
-            # Set real option premium on the signal
-            # SL and targets are ATR-based, not fixed percentages
+            # Set ATR-based SL/targets
             atr = indicators.atr
             if atr is None or atr <= 0:
-                logger.warning(
-                    "ATR unavailable — cannot compute market-based SL/targets. Skipping trade."
-                )
-                await self.alert_manager.send_info(
-                    f"TRADE SKIPPED — {best_signal.strategy.value}",
-                    f"ATR data unavailable — cannot set SL/targets from real market data.\n"
-                    f"Signal: NIFTY {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
-                    f"Score: {best_score:.0f} | Premium: ₹{option_ltp:.2f}",
-                )
                 return
-
-            # ATR represents the expected NIFTY move per candle
-            # Option premium moves ~50-70% of NIFTY's ATR for ATM options (delta ~0.5)
             option_atr = atr * 0.5
             best_signal.entry_price = option_ltp
             best_signal.stoploss = round(max(option_ltp - (1.5 * option_atr), option_ltp * 0.70), 2)
             best_signal.target1 = round(option_ltp + (2.0 * option_atr), 2)
             best_signal.target2 = round(option_ltp + (3.5 * option_atr), 2)
-            logger.info(
-                "Option premium: %.2f | SL=%.2f | T1=%.2f | T2=%.2f",
-                option_ltp, best_signal.stoploss, best_signal.target1, best_signal.target2,
-            )
 
             # 12. AI validation
-            decision = await self.ai_engine.evaluate(
-                best_signal, self.snapshot, best_score
-            )
+            decision = await self.ai_engine.evaluate(best_signal, snap, best_score)
 
-            if not decision.trade_decision or decision.confidence_score < 70:
+            if not decision.trade_decision or decision.confidence_score < 65:
                 logger.info(
-                    "AI rejected signal (confidence=%.0f%%): %s",
-                    decision.confidence_score,
-                    decision.reason,
+                    "[%s] AI rejected (confidence=%.0f%%): %s",
+                    symbol, decision.confidence_score, decision.reason,
                 )
                 await self.alert_manager.send_info(
-                    f"SIGNAL REJECTED — {best_signal.strategy.value}",
-                    f"NIFTY {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
-                    f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI Confidence: {decision.confidence_score:.0f}%\n"
+                    f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
+                    f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
+                    f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
                     f"Reason: {decision.reason}",
                 )
                 return
 
-            # 13. Build NFO trading symbol for consistent price tracking
-            nfo_symbol = self._build_nfo_symbol(best_signal)
+            # 13. Build NFO trading symbol
+            nfo_symbol = instrument.build_option_symbol(
+                expiry or "", best_signal.strike_price, best_signal.option_type.value
+            )
 
-            # 14. Enter trade
-            trade = self.paper_trader.enter_trade(best_signal, decision, nfo_symbol)
+            # 14. Position size
+            num_lots = self.risk_manager.compute_position_size(
+                decision.entry_price, decision.stoploss
+            )
+
+            # 15. Enter trade
+            trade = self.paper_trader.enter_trade(best_signal, decision, nfo_symbol, num_lots=num_lots)
+            trade.instrument = symbol
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_signal_alert(best_signal, decision)
 
         except Exception:
-            logger.exception("Error in analysis cycle")
+            logger.exception("[%s] Error in instrument analysis", symbol)
 
     # ── Support Methods ──────────────────────────────────────────────────
 
-    def _fetch_option_ltp(self, signal: StrategySignal) -> Optional[float]:
-        """Fetch the real LTP for a specific option contract from AngelOne."""
-        token_info = self.client.get_nifty_option_tokens(
-            self._expiry or "",
-            signal.strike_price,
-            signal.option_type.value,
-        )
-        if not token_info:
-            logger.warning(
-                "Token not found for NIFTY %s %s",
-                int(signal.strike_price), signal.option_type.value,
-            )
-            return None
+    def _resolve_instruments(self) -> list[InstrumentConfig]:
+        """Resolve which instruments to trade.
 
+        If AUTO_SELECT_INSTRUMENTS is True (default):
+          - Uses the latest evaluation recommendations to pick the best
+            instrument+strategy combos.
+          - Also builds per-instrument strategy whitelists so only the
+            proven strategies run during market hours.
+        If False or no evaluation data available:
+          - Falls back to ACTIVE_INSTRUMENTS from config.
+        """
+        # Manual override: if auto-select is off, use config
+        if not settings.auto_select_instruments:
+            return self._resolve_from_config()
+
+        # Auto-select from evaluation data
+        recs = self.eval_scheduler.latest_recommendations
+        if not recs:
+            logger.info("No evaluation data yet — falling back to config / defaults")
+            return self._resolve_from_config()
+
+        return self._resolve_from_recommendations(recs)
+
+    def _resolve_from_config(self) -> list[InstrumentConfig]:
+        """Resolve instruments from ACTIVE_INSTRUMENTS config."""
+        names = settings.get_active_instrument_list()
+        instruments = []
+        for name in names:
+            inst = get_instrument(name)
+            if inst:
+                instruments.append(inst)
+            else:
+                logger.warning("Unknown instrument in config: %s — skipping", name)
+        if not instruments:
+            from app.core.instruments import NIFTY
+            instruments = [NIFTY]
+            logger.warning("No instruments configured — defaulting to NIFTY")
+        # No strategy filter in manual mode — run all
+        self._instrument_strategies = {}
+        return instruments
+
+    def _resolve_from_recommendations(
+        self, recs: list,
+    ) -> list[InstrumentConfig]:
+        """Pick instruments and per-instrument strategies from evaluation."""
+        min_score = settings.min_composite_score
+        max_inst = settings.max_active_instruments
+
+        # Group recommendations by instrument, track best strategies
+        inst_best: dict[str, float] = {}  # symbol -> best composite score
+        inst_strats: dict[str, list[str]] = {}  # symbol -> [strategy names]
+
+        for r in recs:
+            if r.composite_score < min_score:
+                continue
+            sym = r.instrument
+            if sym not in inst_best:
+                inst_best[sym] = r.composite_score
+                inst_strats[sym] = []
+            inst_strats[sym].append(r.strategy)
+
+        if not inst_best:
+            logger.warning(
+                "No recommendations above min score (%.0f) — falling back to config",
+                min_score,
+            )
+            return self._resolve_from_config()
+
+        # Rank instruments by their best composite score, pick top N
+        ranked = sorted(inst_best.items(), key=lambda x: x[1], reverse=True)
+        selected_symbols = [sym for sym, _ in ranked[:max_inst]]
+
+        instruments: list[InstrumentConfig] = []
+        strategy_map: dict[str, BaseStrategy] = {
+            type(s).__name__: s for s in self.strategies
+        }
+        # Build a name -> instance lookup using the same names as evaluator
+        strat_name_map: dict[str, BaseStrategy] = {}
+        from app.backtest.strategy_evaluator import _STRATEGY_REGISTRY
+        for name, _ in _STRATEGY_REGISTRY:
+            # Find matching instance in self.strategies by class
+            for s in self.strategies:
+                if type(s).__name__.upper().replace("STRATEGY", "").replace("_", "") == name.replace("_", ""):
+                    strat_name_map[name] = s
+                    break
+
+        for sym in selected_symbols:
+            inst = get_instrument(sym)
+            if not inst:
+                continue
+            instruments.append(inst)
+
+            # Build strategy whitelist for this instrument
+            allowed_names = inst_strats.get(sym, [])
+            allowed = [strat_name_map[n] for n in allowed_names if n in strat_name_map]
+            if allowed:
+                self._instrument_strategies[sym] = allowed
+
+        logger.info(
+            "AUTO-SELECT: Picked %d instruments from evaluation: %s",
+            len(instruments),
+            ", ".join(
+                f"{i.symbol} ({len(self._instrument_strategies.get(i.symbol, self.strategies))} strats)"
+                for i in instruments
+            ),
+        )
+        for inst in instruments:
+            strats = self._instrument_strategies.get(inst.symbol, self.strategies)
+            strat_names = [type(s).__name__ for s in strats]
+            logger.info("  %s → %s", inst.symbol, ", ".join(strat_names))
+
+        return instruments
+
+    def _fetch_option_ltp_for(
+        self,
+        instrument: InstrumentConfig,
+        signal: StrategySignal,
+        expiry: Optional[str],
+    ) -> Optional[float]:
+        """Fetch the real LTP for a specific option contract from AngelOne."""
+        if not expiry:
+            return None
+        symbol = instrument.build_option_symbol(
+            expiry, signal.strike_price, signal.option_type.value
+        )
+        token_info = self.client._search_symbol(symbol)
+        if not token_info:
+            logger.warning("Token not found for %s", symbol)
+            return None
         ltp = self.client.get_ltp(
             "NFO",
             token_info.get("tradingsymbol", ""),
@@ -474,12 +639,57 @@ class Orchestrator:
         )
         return ltp
 
-    def _build_nfo_symbol(self, signal: StrategySignal) -> str:
-        """Build the NFO trading symbol for an option contract.
+    async def _update_options_chain_for(
+        self,
+        instrument: InstrumentConfig,
+        spot_price: float,
+        expiry: str,
+    ) -> OptionsMetrics:
+        """Fetch options chain and compute metrics for an instrument."""
+        try:
+            chain = self.client.get_option_chain(expiry)
+            metrics = self.feature_engine.compute_options_metrics(chain, spot_price)
+            logger.info(
+                "[%s] Options: PCR=%s MaxPain=%s",
+                instrument.symbol,
+                f"{metrics.pcr:.2f}" if metrics.pcr is not None else "N/A",
+                f"{metrics.max_pain:.0f}" if metrics.max_pain is not None else "N/A",
+            )
+            return metrics
+        except Exception:
+            logger.exception("[%s] Error updating options chain", instrument.symbol)
+            return self._options_metrics.get(instrument.symbol, OptionsMetrics())
 
-        e.g. NIFTY17MAR202622500CE
-        """
-        return f"NIFTY{self._expiry or ''}{int(signal.strike_price)}{signal.option_type.value}"
+    async def _check_trade_exits_for(
+        self,
+        instrument: InstrumentConfig,
+        spot_price: float,
+    ) -> None:
+        """Check open trades for this instrument for exit conditions."""
+        inst_trades = [
+            t for t in self.paper_trader.open_trades
+            if getattr(t, "instrument", "NIFTY") == instrument.symbol
+        ]
+        if not inst_trades:
+            return
+
+        expiry = self._expiries.get(instrument.symbol, "")
+        current_prices: dict[str, float] = {}
+        for trade in inst_trades:
+            token_info = self.client._search_symbol(trade.symbol)
+            if token_info:
+                ltp = self.client.get_ltp(
+                    "NFO",
+                    token_info.get("tradingsymbol", ""),
+                    token_info.get("symboltoken", ""),
+                )
+                if ltp:
+                    current_prices[trade.symbol] = ltp
+
+        closed = self.paper_trader.check_exits(current_prices)
+        for trade in closed:
+            await self.trade_logger.log_trade(trade)
+            await self.alert_manager.send_exit_alert(trade)
 
     async def _fetch_global_data(self) -> None:
         """Fetch and analyze global market indices."""
@@ -500,36 +710,23 @@ class Orchestrator:
             logger.exception("Error fetching global data")
 
     async def _update_options_chain(self, spot_price: float) -> None:
-        """Fetch options chain and compute metrics."""
-        try:
-            if self._expiry:
-                chain = self.client.get_option_chain(self._expiry)
-                self.options_metrics = self.feature_engine.compute_options_metrics(
-                    chain, spot_price
-                )
-                logger.info(
-                    "Options: PCR=%s MaxPain=%s ATM_Vol=%d",
-                    f"{self.options_metrics.pcr:.2f}" if self.options_metrics.pcr is not None else "N/A",
-                    f"{self.options_metrics.max_pain:.0f}" if self.options_metrics.max_pain is not None else "N/A",
-                    self.options_metrics.atm_option_volume,
-                )
-        except Exception:
-            logger.exception("Error updating options chain")
+        """Legacy: update options chain for all index instruments."""
+        for inst in self._active_instruments:
+            if inst.is_index:
+                expiry = self._expiries.get(inst.symbol)
+                if expiry:
+                    self._options_metrics[inst.symbol] = await self._update_options_chain_for(
+                        inst, spot_price, expiry
+                    )
 
     async def _check_trade_exits(self, spot_price: float) -> None:
-        """Check open trades for stoploss/target hits."""
+        """Check all open trades for stoploss/target hits."""
         if not self.paper_trader.open_trades:
             return
 
-        # Build current price map
         current_prices: dict[str, float] = {}
         for trade in self.paper_trader.open_trades:
-            # Fetch current LTP for each option
-            token_info = self.client.get_nifty_option_tokens(
-                self._expiry or "",
-                trade.strike,
-                trade.option_type.value,
-            )
+            token_info = self.client._search_symbol(trade.symbol)
             if token_info:
                 ltp = self.client.get_ltp(
                     "NFO",
@@ -551,11 +748,7 @@ class Orchestrator:
 
         current_prices: dict[str, float] = {}
         for trade in self.paper_trader.open_trades:
-            token_info = self.client.get_nifty_option_tokens(
-                self._expiry or "",
-                trade.strike,
-                trade.option_type.value,
-            )
+            token_info = self.client._search_symbol(trade.symbol)
             if token_info:
                 ltp = self.client.get_ltp(
                     "NFO",
@@ -599,6 +792,57 @@ class Orchestrator:
 
         except Exception:
             logger.exception("Error generating daily report")
+
+    async def _run_premarket_evaluation(self) -> None:
+        """Run strategy evaluation before market open to auto-select instruments.
+
+        Evaluates ALL registered instruments so the system can pick the best ones.
+        Skips if a recent evaluation (from today or yesterday post-market) already exists.
+        """
+        try:
+            recs = self.eval_scheduler.latest_recommendations
+            if recs:
+                eval_date = recs[0].eval_date if recs else ""
+                today_str = datetime.now(IST).strftime("%Y-%m-%d")
+                yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
+                if eval_date in (today_str, yesterday):
+                    logger.info(
+                        "Recent evaluation found (date=%s, %d recs) — skipping pre-market eval",
+                        eval_date, len(recs),
+                    )
+                    return
+
+            logger.info("Running pre-market evaluation on ALL registered instruments...")
+            all_instruments = get_enabled_instruments()
+            report = await self.eval_scheduler.run_evaluation(all_instruments)
+            logger.info(
+                "Pre-market evaluation done: %d recommendations from %d instruments",
+                len(report.recommendations), len(all_instruments),
+            )
+        except Exception:
+            logger.exception("Error in pre-market evaluation — will use existing data or config fallback")
+
+    async def _run_post_market_evaluation(self) -> None:
+        """Run strategy evaluation after daily report — ranks strategies for next day."""
+        try:
+            logger.info("Starting post-market strategy evaluation...")
+            all_instruments = get_enabled_instruments()
+            report = await self.eval_scheduler.run_evaluation(all_instruments)
+
+            # Update shared state so the API can serve recommendations
+            from app.api.routes import get_state
+            state = get_state()
+            state["eval_scheduler"] = self.eval_scheduler
+
+            if report.recommendations:
+                top = report.recommendations[0]
+                logger.info(
+                    "Evaluation done: %d recs | Top: %s on %s (score=%.1f)",
+                    len(report.recommendations), top.strategy,
+                    top.instrument, top.composite_score,
+                )
+        except Exception:
+            logger.exception("Error in post-market strategy evaluation")
 
     @staticmethod
     def _get_weekly_expiry_fallback() -> str:

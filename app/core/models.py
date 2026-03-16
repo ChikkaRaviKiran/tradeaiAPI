@@ -43,6 +43,10 @@ class StrategyName(str, enum.Enum):
     TREND_PULLBACK = "TREND_PULLBACK"
     LIQUIDITY_SWEEP = "LIQUIDITY_SWEEP"
     RANGE_BREAKOUT = "RANGE_BREAKOUT"
+    MOMENTUM_BREAKOUT = "MOMENTUM_BREAKOUT"
+    EMA_BREAKOUT = "EMA_BREAKOUT"
+    BREAKOUT_20D = "BREAKOUT_20D"          # SRS Strategy 2: 20-day high breakout
+    OPTIONS_INCOME = "OPTIONS_INCOME"      # SRS Strategy 3: Iron Condor / range
 
 
 # ── Market Data Models ─────────────────────────────────────────────────────────
@@ -81,6 +85,7 @@ class TechnicalIndicators(BaseModel):
     ema9: Optional[float] = None
     ema20: Optional[float] = None
     ema50: Optional[float] = None
+    ema200: Optional[float] = None
     vwap: Optional[float] = None
     rsi: Optional[float] = None
     macd: Optional[float] = None
@@ -91,6 +96,7 @@ class TechnicalIndicators(BaseModel):
     bollinger_middle: Optional[float] = None
     bollinger_lower: Optional[float] = None
     adx: Optional[float] = None
+    trend_strength: Optional[int] = None  # 0-3: EMA alignment score (3=strong uptrend)
     vwap_is_volume_weighted: bool = False  # True only when real volume data was used
 
 
@@ -109,8 +115,10 @@ class OptionsMetrics(BaseModel):
 
 class StrategySignal(BaseModel):
     strategy: StrategyName
+    instrument: str = "NIFTY"  # Instrument symbol this signal is for
     option_type: OptionType
     score: float = 0.0
+    confidence: float = 0.0  # Strategy-level confidence (0-100)
     entry_price: float = 0.0
     strike_price: float = 0.0
     stoploss: float = 0.0
@@ -146,6 +154,7 @@ class AIDecision(BaseModel):
 
 class Trade(BaseModel):
     trade_id: Optional[str] = None
+    instrument: str = "NIFTY"  # Underlying instrument
     date: str = ""
     time: str = ""
     symbol: str = ""
@@ -167,7 +176,9 @@ class Trade(BaseModel):
 # ── Market Snapshot ───────────────────────────────────────────────────────────
 
 class MarketSnapshot(BaseModel):
-    nifty_price: float = 0.0
+    instrument: str = "NIFTY"  # Which instrument this snapshot is for
+    price: float = 0.0         # Current price (generic, replaces nifty_price)
+    nifty_price: float = 0.0   # Backward compat — alias for price when instrument is NIFTY
     vwap: Optional[float] = None
     regime: MarketRegime = MarketRegime.INSUFFICIENT_DATA
     global_bias: GlobalBias = GlobalBias.UNAVAILABLE
@@ -189,6 +200,39 @@ class AlertItem(BaseModel):
     pnl: Optional[float] = None
 
 
+# ── Sentiment & Stock Ranking (SRS Modules 3.3 / 3.4) ────────────────────────
+
+class SentimentScore(BaseModel):
+    """News / social sentiment for a symbol."""
+    symbol: str = ""
+    score: float = 0.0        # -1.0 (bearish) to +1.0 (bullish)
+    source: str = ""          # e.g. "news", "twitter", "earnings"
+    headline: str = ""
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
+class StockRanking(BaseModel):
+    """AI-ranked stock with factor scores (SRS 3.3)."""
+    symbol: str = ""
+    rank: int = 0
+    trend_strength_score: float = 0.0    # 25%
+    institutional_score: float = 0.0     # 20%
+    volume_breakout_score: float = 0.0   # 20%
+    earnings_growth_score: float = 0.0   # 20%
+    sentiment_score: float = 0.0         # 15%
+    composite_score: float = 0.0         # Weighted total
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
+class MarketPrediction(BaseModel):
+    """AI prediction output (SRS 3.3)."""
+    instrument: str = ""
+    bias: GlobalBias = GlobalBias.NEUTRAL  # Bullish / Bearish / Neutral
+    confidence: float = 0.0               # 0-100%
+    model: str = ""                        # Which model produced this
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
 # ── Performance Metrics ───────────────────────────────────────────────────────
 
 class PerformanceMetrics(BaseModel):
@@ -200,3 +244,4 @@ class PerformanceMetrics(BaseModel):
     profit_factor: float = 0.0
     max_drawdown: float = 0.0
     avg_pnl_per_trade: float = 0.0
+    sharpe_ratio: float = 0.0

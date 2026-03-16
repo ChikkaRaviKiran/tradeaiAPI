@@ -1,4 +1,8 @@
-"""FastAPI application and REST API endpoints."""
+"""FastAPI application and REST API endpoints.
+
+Multi-instrument aware: serves per-instrument snapshots, stock rankings,
+and ML predictions alongside existing trade/performance endpoints.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.core.instruments import get_all_instruments, get_instrument
 from app.core.models import AlertItem, MarketSnapshot, PerformanceMetrics, Trade
 from app.db.models import init_db
 from app.trading.history_logger import HistoryLogger
@@ -23,9 +28,12 @@ _IST = pytz.timezone("Asia/Kolkata")
 # Shared state — populated by the orchestrator
 _state: dict = {
     "snapshot": None,
+    "snapshots": {},       # {symbol: MarketSnapshot}
     "open_trades": [],
     "orchestrator": None,
     "global_indices": [],
+    "stock_rankings": [],  # Latest stock rankings
+    "predictions": {},     # {symbol: MarketPrediction}
 }
 
 
@@ -44,8 +52,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="TradeAI — NIFTY Options Decision System",
-    version="1.0.0",
+    title="TradeAI — Multi-Instrument AI Trading System",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -163,8 +171,14 @@ async def get_system_status():
         "paper_trading": settings.paper_trading,
         "capital": settings.initial_capital,
         "max_trades_per_day": settings.max_trades_per_day,
+        "auto_select": settings.auto_select_instruments,
+        "active_instruments": (
+            [i.symbol for i in orch._active_instruments]
+            if orch and hasattr(orch, "_active_instruments") and orch._active_instruments
+            else settings.get_active_instrument_list() or ["NIFTY"]
+        ),
         "cycle_count": getattr(orch, "_cycle_count", 0) if orch else 0,
-        "expiry": getattr(orch, "_expiry", None) if orch else None,
+        "expiries": getattr(orch, "_expiries", {}) if orch else {},
         "last_snapshot_time": snapshot.timestamp.isoformat() if snapshot else None,
         "open_trades_count": len(_state.get("open_trades", [])),
         "db_connected": db_ok,
@@ -346,4 +360,148 @@ async def get_full_day_data(target_date: str):
         "trades": [t.model_dump() for t in trades],
         "alerts": alerts,
         "performance": perf.model_dump(),
+    }
+
+
+# ── Multi-Instrument Endpoints (SRS rebuild) ────────────────────────────
+
+@app.get("/api/instruments")
+async def list_instruments():
+    """List all registered instruments and their config."""
+    instruments = get_all_instruments()
+    return [
+        {
+            "symbol": i.symbol,
+            "display_name": i.display_name,
+            "exchange": i.exchange.value,
+            "type": i.instrument_type.value,
+            "lot_size": i.lot_size,
+            "strike_interval": i.strike_interval,
+            "is_index": i.is_index,
+            "enabled": i.enabled,
+        }
+        for i in instruments
+    ]
+
+
+@app.get("/api/instruments/active")
+async def list_active_instruments():
+    """List instruments currently being monitored."""
+    return settings.get_active_instrument_list()
+
+
+@app.get("/api/market/snapshot/{symbol}")
+async def get_instrument_snapshot(symbol: str):
+    """Get market snapshot for a specific instrument."""
+    snapshots = _state.get("snapshots", {})
+    snap = snapshots.get(symbol.upper())
+    if snap is None:
+        raise HTTPException(status_code=404, detail=f"No snapshot for {symbol}")
+    return snap
+
+
+@app.get("/api/market/snapshots")
+async def get_all_snapshots():
+    """Get current snapshots for all active instruments."""
+    snapshots = _state.get("snapshots", {})
+    return {k: v.model_dump() if hasattr(v, "model_dump") else v for k, v in snapshots.items()}
+
+
+@app.get("/api/rankings")
+async def get_stock_rankings():
+    """Get latest AI stock rankings."""
+    return _state.get("stock_rankings", [])
+
+
+@app.get("/api/predictions")
+async def get_predictions():
+    """Get latest ML predictions for all instruments."""
+    preds = _state.get("predictions", {})
+    return {k: v.model_dump() if hasattr(v, "model_dump") else v for k, v in preds.items()}
+
+
+@app.get("/api/predictions/{symbol}")
+async def get_prediction_for(symbol: str):
+    """Get ML prediction for a specific instrument."""
+    preds = _state.get("predictions", {})
+    pred = preds.get(symbol.upper())
+    if pred is None:
+        raise HTTPException(status_code=404, detail=f"No prediction for {symbol}")
+    return pred.model_dump() if hasattr(pred, "model_dump") else pred
+
+
+# ── Strategy Evaluation / Recommendations ────────────────────────────────
+
+@app.get("/api/recommendations")
+async def get_recommendations():
+    """Get latest strategy recommendations ranked by composite score."""
+    scheduler = _state.get("eval_scheduler")
+    if scheduler is None:
+        return {"recommendations": [], "eval_date": None}
+    recs = scheduler.latest_recommendations
+    report = scheduler.latest_report
+    return {
+        "eval_date": report.eval_date if report else None,
+        "run_time_seconds": round(report.run_time_seconds, 1) if report else None,
+        "total_simulated_trades": len(report.all_trades) if report else 0,
+        "recommendations": [r.to_dict() for r in recs],
+    }
+
+
+@app.post("/api/evaluate/run")
+async def trigger_evaluation():
+    """Trigger a strategy evaluation on-demand — evaluates ALL registered instruments."""
+    import asyncio
+    scheduler = _state.get("eval_scheduler")
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="Evaluation scheduler not initialized")
+
+    from app.core.instruments import get_enabled_instruments
+    instruments = get_enabled_instruments()
+    if not instruments:
+        raise HTTPException(status_code=400, detail="No instruments registered")
+
+    # Run evaluation in a background task so the API doesn't block
+    async def _run():
+        await scheduler.run_evaluation(instruments)
+    asyncio.create_task(_run())
+
+    return {"message": "Evaluation started", "instruments": [i.symbol for i in instruments]}
+
+
+@app.get("/api/evaluate/history/{target_date}")
+async def get_evaluation_history(target_date: str):
+    """Get evaluation results for a specific date from DB."""
+    from app.db.models import AsyncSessionLocal, StrategyEvalRecord
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(StrategyEvalRecord)
+            .where(StrategyEvalRecord.eval_date == target_date)
+            .order_by(StrategyEvalRecord.rank.asc())
+        )
+        rows = result.scalars().all()
+
+    return {
+        "eval_date": target_date,
+        "recommendations": [
+            {
+                "rank": r.rank,
+                "instrument": r.instrument,
+                "strategy": r.strategy,
+                "win_rate": round(r.win_rate, 1),
+                "profit_factor": round(r.profit_factor, 2),
+                "sharpe_ratio": round(r.sharpe_ratio, 2),
+                "total_pnl": round(r.total_pnl, 2),
+                "total_trades": r.total_trades,
+                "avg_pnl": round(r.avg_pnl, 2),
+                "max_drawdown": round(r.max_drawdown, 2),
+                "composite_score": round(r.composite_score, 1),
+                "current_regime": r.current_regime,
+                "signal_frequency": round(r.signal_frequency, 2),
+                "eval_days": r.eval_days,
+            }
+            for r in rows
+        ],
     }

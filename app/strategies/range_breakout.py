@@ -20,9 +20,9 @@ from app.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-RANGE_LOOKBACK = 60
-ADX_THRESHOLD = 22
-RANGE_PCT_THRESHOLD = 0.50
+RANGE_LOOKBACK = 30  # Was 60 — 30 min range is sufficient
+ADX_THRESHOLD = 25  # Was 22 — realistic range days often have ADX 20-25
+RANGE_PCT_THRESHOLD = 0.65  # Was 0.50% — NIFTY ranges can be slightly wider
 
 
 class RangeBreakoutStrategy(BaseStrategy):
@@ -36,6 +36,9 @@ class RangeBreakoutStrategy(BaseStrategy):
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < RANGE_LOOKBACK + 1:
             return None
+
+        # Need enough candles for the lookback
+        effective_lookback = min(RANGE_LOOKBACK, len(df) - 1)
 
         last = df.iloc[-1]
         adx = last.get("adx")
@@ -55,7 +58,7 @@ class RangeBreakoutStrategy(BaseStrategy):
         is_index = volume == 0 and avg_vol == 0
 
         # Check range condition in the lookback window (excluding current candle)
-        range_window = df.iloc[-(RANGE_LOOKBACK + 1) : -1]
+        range_window = df.iloc[-(effective_lookback + 1) : -1]
         range_high = range_window["high"].max()
         range_low = range_window["low"].min()
         range_pct = (range_high - range_low) / range_low * 100 if range_low > 0 else 999

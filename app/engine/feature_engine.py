@@ -34,6 +34,12 @@ class FeatureEngine:
         df["ema9"] = ta.trend.ema_indicator(df["close"], window=9)
         df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
         df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
+        # EMA200 — use available candles; will be NaN until 200 candles are available
+        if len(df) >= 200:
+            df["ema200"] = ta.trend.ema_indicator(df["close"], window=200)
+        else:
+            # Compute with available data using min_periods
+            df["ema200"] = df["close"].ewm(span=200, min_periods=min(50, len(df)), adjust=False).mean()
 
         # VWAP
         df["vwap"] = self._compute_vwap(df)
@@ -67,6 +73,17 @@ class FeatureEngine:
         df["atr_slope"] = df["atr"].diff(5)
         df["avg_volume_10"] = df["volume"].rolling(window=10).mean()
 
+        # Price momentum — rate of change over 10 candles
+        df["roc_10"] = df["close"].pct_change(10) * 100
+
+        # Trend strength composite: EMA alignment score
+        # +1 if ema9>ema20, +1 if ema20>ema50, +1 if ema50>ema200
+        df["trend_strength"] = (
+            (df["ema9"] > df["ema20"]).astype(int)
+            + (df["ema20"] > df["ema50"]).astype(int)
+            + (df["ema50"] > df["ema200"]).astype(int)
+        )
+
         return df
 
     def get_latest_indicators(self, df: pd.DataFrame) -> TechnicalIndicators:
@@ -80,6 +97,7 @@ class FeatureEngine:
             ema9=_safe(last, "ema9"),
             ema20=_safe(last, "ema20"),
             ema50=_safe(last, "ema50"),
+            ema200=_safe(last, "ema200"),
             vwap=_safe(last, "vwap"),
             rsi=_safe(last, "rsi"),
             macd=_safe(last, "macd"),
@@ -90,6 +108,7 @@ class FeatureEngine:
             bollinger_middle=_safe(last, "bollinger_middle"),
             bollinger_lower=_safe(last, "bollinger_lower"),
             adx=_safe(last, "adx"),
+            trend_strength=int(last["trend_strength"]) if "trend_strength" in last.index and pd.notna(last.get("trend_strength")) else None,
             vwap_is_volume_weighted=(vol_sum > 0),
         )
 

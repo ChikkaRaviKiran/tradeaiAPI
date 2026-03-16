@@ -1,4 +1,13 @@
-"""Risk manager — enforces position limits and loss controls."""
+"""Risk manager — enforces position limits and loss controls.
+
+SRS Rules:
+    Max risk per trade: 1% of capital
+    Max daily loss: 3% of capital
+    Max positions: 3 concurrent trades
+    Max trades per day: 5
+    Consecutive loss limit: 3
+    Position sizing: Automatic based on risk per trade
+"""
 
 from __future__ import annotations
 
@@ -16,12 +25,13 @@ _IST = pytz.timezone("Asia/Kolkata")
 
 
 class RiskManager:
-    """Enforce risk management rules.
+    """Enforce risk management rules per SRS specification.
 
     Rules:
-        Max trades per day: 2
-        Stoploss: 25–30% of option premium
-        Daily loss limit: 2% of capital
+        Max risk per trade: 1% of capital
+        Max daily loss: 3% of capital
+        Max trades per day: 5
+        Max concurrent positions: 3
         Consecutive loss limit: 3
     """
 
@@ -29,17 +39,23 @@ class RiskManager:
         self.capital = settings.initial_capital
         self.max_trades = settings.max_trades_per_day
         self.max_daily_loss_pct = settings.max_daily_loss_pct
+        self.risk_per_trade_pct = settings.risk_per_trade_pct
+        self.max_concurrent = settings.max_concurrent_positions
         self.consecutive_loss_limit = settings.consecutive_loss_limit
 
-    def can_trade(self, today_trades: list[Trade]) -> bool:
+    def can_trade(self, today_trades: list[Trade], open_count: int = 0) -> bool:
         """Check if a new trade is allowed based on risk rules."""
-        # Count today's trades
         today = datetime.now(_IST).date().isoformat()
         todays = [t for t in today_trades if t.date == today]
 
         # Max trades per day
         if len(todays) >= self.max_trades:
             logger.warning("Max daily trades reached (%d)", self.max_trades)
+            return False
+
+        # Max concurrent positions
+        if open_count >= self.max_concurrent:
+            logger.warning("Max concurrent positions reached (%d)", self.max_concurrent)
             return False
 
         # Daily loss limit
@@ -52,18 +68,32 @@ class RiskManager:
         # Consecutive loss limit
         closed = [t for t in todays if t.status == TradeStatus.CLOSED]
         if len(closed) >= self.consecutive_loss_limit:
-            last_n = closed[-self.consecutive_loss_limit :]
+            last_n = closed[-self.consecutive_loss_limit:]
             if all((t.pnl or 0) < 0 for t in last_n):
                 logger.warning("Consecutive loss limit reached (%d)", self.consecutive_loss_limit)
                 return False
 
         return True
 
-    def compute_stoploss(self, entry_price: float, sl_pct: float = 0.27) -> float:
-        """Compute stoploss at given percentage of premium.
+    def compute_position_size(self, entry_price: float, stoploss: float) -> int:
+        """Compute position size based on 1% risk per trade.
 
-        Default: ~27% (midpoint of 25-30% range).
+        Risk per trade = capital × risk_per_trade_pct / 100
+        Lots = risk_amount / (entry - stoploss) / lot_size
+
+        Returns the number of lots (minimum 1).
         """
+        risk_amount = self.capital * (self.risk_per_trade_pct / 100)
+        per_unit_risk = abs(entry_price - stoploss)
+        if per_unit_risk <= 0:
+            return 1
+
+        lot_size = settings.nifty_lot_size
+        max_lots = int(risk_amount / (per_unit_risk * lot_size))
+        return max(1, max_lots)
+
+    def compute_stoploss(self, entry_price: float, sl_pct: float = 0.27) -> float:
+        """Compute stoploss at given percentage of premium."""
         return round(entry_price * (1 - sl_pct), 2)
 
     def compute_targets(
@@ -82,3 +112,23 @@ class RiskManager:
             for t in today_trades
             if t.date == today and t.status == TradeStatus.CLOSED
         )
+
+    def get_risk_status(self, today_trades: list[Trade], open_count: int = 0) -> dict:
+        """Return current risk metrics for dashboard display."""
+        today = datetime.now(_IST).date().isoformat()
+        todays = [t for t in today_trades if t.date == today]
+        daily_pnl = self.get_daily_pnl(today_trades)
+        max_loss = self.capital * (self.max_daily_loss_pct / 100)
+
+        return {
+            "capital": self.capital,
+            "daily_pnl": daily_pnl,
+            "daily_loss_limit": -max_loss,
+            "daily_loss_used_pct": round(abs(daily_pnl) / max_loss * 100, 1) if daily_pnl < 0 else 0,
+            "trades_today": len(todays),
+            "max_trades": self.max_trades,
+            "open_positions": open_count,
+            "max_concurrent": self.max_concurrent,
+            "risk_per_trade_pct": self.risk_per_trade_pct,
+            "can_trade": self.can_trade(today_trades, open_count),
+        }

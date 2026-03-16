@@ -41,6 +41,7 @@ async def run_orchestrator() -> None:
     orchestrator = Orchestrator()
     state = get_state()
     state["orchestrator"] = orchestrator
+    state["eval_scheduler"] = orchestrator.eval_scheduler
     await orchestrator.start()
 
 

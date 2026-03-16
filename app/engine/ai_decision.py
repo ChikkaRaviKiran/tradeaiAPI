@@ -40,22 +40,23 @@ You must respond ONLY with a valid JSON object (no markdown, no extra text) in t
 }
 
 Rules:
-- Only approve trades with confidence >= 70
+- Only approve trades with confidence >= 65 (lowered from 70 to be less conservative)
 - Consider market regime, volatility, and time of day
-- Be conservative — prefer no trade over a bad trade
+- Be realistic — a good setup with 2-3 confirmations should be approved, don't need perfection
 - entry_price, stoploss, target1, target2 are all OPTION PREMIUM values (not NIFTY spot)
 - The signal includes ATR-based suggested SL/targets — evaluate whether they are reasonable given the ATR value
 - Use the ATR value to judge if SL is too tight or too wide for current volatility
 - If ATR is null, reject the trade (volatility data unavailable)
-- Consider PCR, OI data, and option volumes for flow confirmation — if PCR is null, options data is unavailable
-- total_call_volume, total_put_volume, atm_option_volume show real options market participation
-- oi_change shows whether new positions are being built (positive) or unwound (negative)
+- Consider PCR, OI data, and option volumes for flow confirmation — if PCR is null, options data is unavailable (don't penalize)
+- When PCR or global bias data is missing, focus more on technical indicators (RSI, EMAs, ADX)
+- EMA200 provides long-term trend context — price above EMA200 favors CALL, below favors PUT
 - vwap_is_volume_weighted indicates if VWAP is computed from real futures volume (true) or just price average (false)
-- Consider global market bias — if "unavailable", ignore global context
-- Avoid trades in last 30 minutes of market (after 15:00)
+- Consider global market bias — if "unavailable", ignore global context (don't reject because of it)
+- Avoid trades in last 20 minutes of market (after 15:00)
 - Avoid trades when regime is "insufficient_data" — not enough market data yet
 - Bollinger bands help assess if price is extended — reject if price is at extreme bands without reversal signal
 - Any null indicator means that data point is genuinely unavailable — do not assume a default value
+- Trend strength score: 3=strong uptrend (ema9>20>50>200), 0=strong downtrend
 """
 
 
@@ -121,6 +122,7 @@ class AIDecisionEngine:
                     "ema9": snapshot.indicators.ema9,
                     "ema20": snapshot.indicators.ema20,
                     "ema50": snapshot.indicators.ema50,
+                    "ema200": snapshot.indicators.ema200,
                     "rsi": snapshot.indicators.rsi,
                     "macd": snapshot.indicators.macd,
                     "macd_histogram": snapshot.indicators.macd_hist,
@@ -128,6 +130,7 @@ class AIDecisionEngine:
                     "atr": snapshot.indicators.atr,
                     "bollinger_upper": snapshot.indicators.bollinger_upper,
                     "bollinger_lower": snapshot.indicators.bollinger_lower,
+                    "trend_strength": snapshot.indicators.trend_strength,
                 },
                 "market_structure": {
                     "regime": snapshot.regime.value,

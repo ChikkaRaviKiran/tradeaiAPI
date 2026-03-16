@@ -6,10 +6,11 @@ Scoring factors (max 100) — every point must come from real market data:
   VWAP alignment:            15  (only if VWAP is volume-weighted from futures data)
   Options OI signal:         15  (PCR, OI change — only if real data present)
   Global bias:               10  (only if real global data fetched)
-  Historical pattern:        15  (EMA alignment, swing structure, ADX)
+  Historical pattern:        15  (EMA alignment incl. EMA200, swing structure, ADX)
 
-Trade allowed if score ≥ 55.
+Trade allowed if score >= adaptive threshold.
 No free points. Missing data = 0 points for that factor.
+Adaptive threshold reduces when external data sources (PCR, global) are unavailable.
 """
 
 from __future__ import annotations
@@ -29,6 +30,22 @@ from app.core.models import (
 logger = logging.getLogger(__name__)
 
 MIN_SCORE = 55
+
+
+def compute_adaptive_min_score(options_metrics: OptionsMetrics, global_bias: GlobalBias) -> int:
+    """Lower the minimum score threshold when optional data sources are missing.
+
+    Rationale: PCR (15pts) and Global Bias (10pts) are external data sources
+    that may be unavailable. When both are missing, the theoretical max drops
+    from 100 to 75, making 55 unreachable in practice. This adjusts the
+    threshold proportionally so the system can still trade on strong signals.
+    """
+    unavailable_points = 0
+    if options_metrics.pcr is None:
+        unavailable_points += 12  # 15pt bucket is empty, reduce threshold by 12
+    if global_bias in (GlobalBias.UNAVAILABLE, GlobalBias.NEUTRAL):
+        unavailable_points += 8  # 10pt bucket yields 0, reduce by 8
+    return max(MIN_SCORE - unavailable_points, 35)  # Floor at 35
 
 
 class SignalScorer:
@@ -147,12 +164,20 @@ class SignalScorer:
                 score += 5
             elif details["sweep_depth_pct"] > 0.01:
                 score += 2
+        # Range breakout or EMA breakout: breakout percentage
+        elif "breakout_pct" in details:
+            bp = details["breakout_pct"]
+            if bp > 0.1:
+                score += 5
+            elif bp > 0.05:
+                score += 3
+            elif bp > 0.02:
+                score += 2
         # Range breakout: ADX from details
-        elif "adx" in details and details["adx"] > 22:
+        elif "adx" in details and details["adx"] > 20:
             score += 5
         # VWAP reclaim: just passing through, RSI + body carry it
         else:
-            # No specific depth metric — candle/RSI must carry the full weight
             pass
 
         # MACD histogram confirmation (+5)
@@ -330,46 +355,71 @@ class SignalScorer:
         """Score based on price action and trend structure (0–15).
 
         Uses 30-candle lookback for swing structure and EMA trend alignment.
+        Includes EMA200 for long-term trend confirmation.
         Requires real indicator data (None = 0 points).
         """
-        if df.empty or len(df) < 30:
+        if df.empty or len(df) < 20:
             return 0
 
         score = 0.0
-        recent = df.tail(30)
+        lookback = min(30, len(df))
+        recent = df.tail(lookback)
         last = recent.iloc[-1]
 
         ema9 = last.get("ema9")
         ema20 = last.get("ema20")
         ema50 = last.get("ema50")
+        ema200 = last.get("ema200")
         adx = last.get("adx")
+        close = last.get("close", 0)
 
-        # If core indicators are missing, can't score
-        if any(v is None or (isinstance(v, float) and pd.isna(v)) for v in [ema9, ema20, ema50]):
+        # If core short-term indicators are missing, can't score
+        if any(v is None or (isinstance(v, float) and pd.isna(v)) for v in [ema9, ema20]):
             return 0
 
+        # Use EMA50 if available, else skip that check
+        has_ema50 = ema50 is not None and not (isinstance(ema50, float) and pd.isna(ema50))
+        has_ema200 = ema200 is not None and not (isinstance(ema200, float) and pd.isna(ema200))
+
         if signal.option_type == OptionType.CALL:
-            # EMA alignment: 9 > 20 > 50 (strong uptrend)
-            if ema9 > ema20 > ema50 and ema50 > 0:
+            # EMA alignment: short > medium > long (+5)
+            if has_ema50 and ema9 > ema20 > ema50:
                 score += 5
-            # Higher lows over 30 candles (check 5 evenly-spaced lows)
+            elif ema9 > ema20:
+                score += 3  # Partial credit for short-term alignment
+
+            # Higher lows over lookback — trend structure (+5)
             lows = recent["low"].values
-            sampled = [lows[i] for i in range(0, 30, 6)]
-            if all(sampled[i] <= sampled[i + 1] for i in range(len(sampled) - 1)):
-                score += 5
-            # ADX confirming trend (must be real, not default)
-            if adx is not None and not pd.isna(adx) and adx > 20:
-                score += 5
+            n_samples = min(5, len(lows) // 5)
+            if n_samples >= 2:
+                step = max(1, len(lows) // n_samples)
+                sampled = [lows[i] for i in range(0, len(lows), step)][:n_samples]
+                if all(sampled[i] <= sampled[i + 1] for i in range(len(sampled) - 1)):
+                    score += 5
+
+            # ADX + long-term trend confirmation (+5)
+            if adx is not None and not pd.isna(adx) and adx > 18:
+                score += 3
+            if has_ema200 and close > ema200:
+                score += 2  # Extra for being above EMA200
         else:
-            # EMA alignment: 9 < 20 < 50 (strong downtrend)
-            if ema9 < ema20 < ema50 and ema50 > 0:
+            # PUT direction
+            if has_ema50 and ema9 < ema20 < ema50:
                 score += 5
-            # Lower highs over 30 candles
+            elif ema9 < ema20:
+                score += 3
+
             highs = recent["high"].values
-            sampled = [highs[i] for i in range(0, 30, 6)]
-            if all(sampled[i] >= sampled[i + 1] for i in range(len(sampled) - 1)):
-                score += 5
-            if adx is not None and not pd.isna(adx) and adx > 20:
-                score += 5
+            n_samples = min(5, len(highs) // 5)
+            if n_samples >= 2:
+                step = max(1, len(highs) // n_samples)
+                sampled = [highs[i] for i in range(0, len(highs), step)][:n_samples]
+                if all(sampled[i] >= sampled[i + 1] for i in range(len(sampled) - 1)):
+                    score += 5
+
+            if adx is not None and not pd.isna(adx) and adx > 18:
+                score += 3
+            if has_ema200 and close < ema200:
+                score += 2
 
         return min(score, 15)

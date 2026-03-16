@@ -36,16 +36,39 @@ class Settings(BaseSettings):
 
     # Trading
     initial_capital: float = Field(default=100000, alias="INITIAL_CAPITAL")
-    max_trades_per_day: int = Field(default=2, alias="MAX_TRADES_PER_DAY")
-    max_daily_loss_pct: float = Field(default=2.0, alias="MAX_DAILY_LOSS_PCT")
+    max_trades_per_day: int = Field(default=5, alias="MAX_TRADES_PER_DAY")
+    max_daily_loss_pct: float = Field(default=3.0, alias="MAX_DAILY_LOSS_PCT")
+    risk_per_trade_pct: float = Field(default=1.0, alias="RISK_PER_TRADE_PCT")
+    max_concurrent_positions: int = Field(default=3, alias="MAX_CONCURRENT_POSITIONS")
     consecutive_loss_limit: int = Field(default=3, alias="CONSECUTIVE_LOSS_LIMIT")
     nifty_lot_size: int = Field(default=50, alias="NIFTY_LOT_SIZE")
+
+    # Instruments
+    # If auto_select_instruments is True, the system evaluates ALL registered
+    # instruments and picks the best ones automatically each day.
+    # Set to False + ACTIVE_INSTRUMENTS to manually override.
+    auto_select_instruments: bool = Field(default=True, alias="AUTO_SELECT_INSTRUMENTS")
+    max_active_instruments: int = Field(default=3, alias="MAX_ACTIVE_INSTRUMENTS")
+    min_composite_score: float = Field(default=35.0, alias="MIN_COMPOSITE_SCORE")
+    active_instruments: str = Field(default="", alias="ACTIVE_INSTRUMENTS")
+
+    # Data sources
+    yahoo_finance_enabled: bool = Field(default=True, alias="YAHOO_FINANCE_ENABLED")
+    fii_dii_enabled: bool = Field(default=True, alias="FII_DII_ENABLED")
+    news_sentiment_enabled: bool = Field(default=False, alias="NEWS_SENTIMENT_ENABLED")
 
     # System
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    def get_active_instrument_list(self) -> list[str]:
+        """Parse ACTIVE_INSTRUMENTS into a list of symbol names.
+
+        Returns empty list when auto-select is on and nothing manually set.
+        """
+        return [s.strip().upper() for s in self.active_instruments.split(",") if s.strip()]
 
 
 settings = Settings()
