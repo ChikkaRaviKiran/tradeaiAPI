@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 # Thread-local storage so each event loop gets its own engine
 _thread_local = threading.local()
 
+# Track DB errors to avoid spamming logs/alerts
+_db_error_count = 0
+_DB_ERROR_LOG_INTERVAL = 10  # Only log every N failures
+
 
 def _get_session_factory():
     """Return a session factory bound to the current thread's event loop."""
@@ -40,6 +44,7 @@ class HistoryLogger:
 
     async def save_snapshot(self, snapshot: MarketSnapshot) -> None:
         """Save a single market snapshot to the database."""
+        global _db_error_count
         try:
             await _ensure_tables()
             now = snapshot.timestamp
@@ -72,9 +77,17 @@ class HistoryLogger:
             async with SessionLocal() as session:
                 async with session.begin():
                     session.add(record)
+            if _db_error_count > 0:
+                logger.info("DB connection recovered after %d failures", _db_error_count)
+                _db_error_count = 0
             logger.debug("Snapshot saved: NIFTY=%.2f at %s", snapshot.nifty_price, record.time)
-        except Exception:
-            logger.exception("Error saving snapshot")
+        except Exception as e:
+            _db_error_count += 1
+            if _db_error_count == 1 or _db_error_count % _DB_ERROR_LOG_INTERVAL == 0:
+                logger.error(
+                    "DB save_snapshot failed (%d consecutive): %s",
+                    _db_error_count, str(e),
+                )
 
     async def save_alert(self, alert: AlertItem) -> None:
         """Save an alert to the database."""
@@ -93,8 +106,8 @@ class HistoryLogger:
             async with SessionLocal() as session:
                 async with session.begin():
                     session.add(record)
-        except Exception:
-            logger.exception("Error saving alert")
+        except Exception as e:
+            logger.warning("DB save_alert failed: %s", str(e))
 
     async def get_snapshots_by_date(self, target_date: str) -> list[dict]:
         """Get all snapshots for a specific date (YYYY-MM-DD)."""

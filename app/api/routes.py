@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 
+import pytz
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -16,6 +17,8 @@ from app.trading.history_logger import HistoryLogger
 from app.trading.trade_logger import TradeLogger
 
 logger = logging.getLogger(__name__)
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 # Shared state — populated by the orchestrator
 _state: dict = {
@@ -143,6 +146,18 @@ async def get_system_status():
     """System health and status."""
     orch = _state.get("orchestrator")
     snapshot = _state.get("snapshot")
+
+    # Quick DB connectivity check
+    db_ok = False
+    try:
+        from app.db.models import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception as e:
+        logger.warning("DB health check failed: %s", e)
+
     return {
         "status": "running" if orch and getattr(orch, "running", False) else "stopped",
         "paper_trading": settings.paper_trading,
@@ -152,6 +167,7 @@ async def get_system_status():
         "expiry": getattr(orch, "_expiry", None) if orch else None,
         "last_snapshot_time": snapshot.timestamp.isoformat() if snapshot else None,
         "open_trades_count": len(_state.get("open_trades", [])),
+        "db_connected": db_ok,
     }
 
 
@@ -241,12 +257,88 @@ async def get_alerts_by_range(start: str, end: str):
 
 @app.get("/api/history/day/{target_date}")
 async def get_full_day_data(target_date: str):
-    """Get complete data for a day: summary, snapshots, trades, alerts, performance."""
+    """Get complete data for a day: summary, snapshots, trades, alerts, performance.
+
+    For today's date, falls back to live in-memory data if DB has nothing.
+    """
     summary = await history_logger.get_daily_summary(target_date)
     snapshots = await history_logger.get_snapshots_by_date(target_date)
     trades = await trade_logger.get_trades_by_date(target_date)
     alerts = await history_logger.get_alerts_by_date(target_date)
     perf = await trade_logger.compute_performance(trades)
+
+    # For today: if DB has no data, fall back to live in-memory data
+    today_str = datetime.now(_IST).date().isoformat()
+    if target_date == today_str and not snapshots:
+        snapshot = _state.get("snapshot")
+        if snapshot:
+            # Build a snapshot dict from live data
+            live_snap = {
+                "date": today_str,
+                "time": snapshot.timestamp.strftime("%H:%M:%S") if snapshot.timestamp else "",
+                "nifty_price": snapshot.nifty_price,
+                "vwap": snapshot.vwap,
+                "regime": snapshot.regime.value if snapshot.regime else "unknown",
+                "global_bias": snapshot.global_bias.value if snapshot.global_bias else "unavailable",
+                "ema9": snapshot.indicators.ema9 if snapshot.indicators else None,
+                "ema20": snapshot.indicators.ema20 if snapshot.indicators else None,
+                "ema50": snapshot.indicators.ema50 if snapshot.indicators else None,
+                "rsi": snapshot.indicators.rsi if snapshot.indicators else None,
+                "macd": snapshot.indicators.macd if snapshot.indicators else None,
+                "macd_signal": snapshot.indicators.macd_signal if snapshot.indicators else None,
+                "macd_hist": snapshot.indicators.macd_hist if snapshot.indicators else None,
+                "atr": snapshot.indicators.atr if snapshot.indicators else None,
+                "adx": snapshot.indicators.adx if snapshot.indicators else None,
+                "bollinger_upper": snapshot.indicators.bollinger_upper if snapshot.indicators else None,
+                "bollinger_middle": snapshot.indicators.bollinger_middle if snapshot.indicators else None,
+                "bollinger_lower": snapshot.indicators.bollinger_lower if snapshot.indicators else None,
+                "pcr": snapshot.options_metrics.pcr if snapshot.options_metrics else None,
+                "max_pain": snapshot.options_metrics.max_pain if snapshot.options_metrics else None,
+                "call_oi_cluster": snapshot.options_metrics.call_oi_cluster if snapshot.options_metrics else None,
+                "put_oi_cluster": snapshot.options_metrics.put_oi_cluster if snapshot.options_metrics else None,
+                "oi_change": snapshot.options_metrics.oi_change if snapshot.options_metrics else 0,
+            }
+            snapshots = [live_snap]
+
+            # Build summary from live snapshot
+            summary = {
+                "date": today_str,
+                "has_data": True,
+                "total_snapshots": 1,
+                "open_price": snapshot.nifty_price,
+                "close_price": snapshot.nifty_price,
+                "high": snapshot.nifty_price,
+                "low": snapshot.nifty_price,
+                "first_time": live_snap["time"],
+                "last_time": live_snap["time"],
+                "avg_rsi": round(snapshot.indicators.rsi, 1) if snapshot.indicators and snapshot.indicators.rsi else 0,
+                "avg_adx": round(snapshot.indicators.adx, 1) if snapshot.indicators and snapshot.indicators.adx else 0,
+                "regimes": [live_snap["regime"]],
+                "last_pcr": live_snap["pcr"],
+                "last_max_pain": live_snap["max_pain"],
+                "source": "live",
+            }
+
+    # For today: also include in-memory alerts if DB has none
+    if target_date == today_str and not alerts:
+        from app.alerts.alert_manager import alert_store
+        mem_alerts = alert_store.get_all()
+        if mem_alerts:
+            alerts = [
+                {
+                    "id": a.id,
+                    "date": a.timestamp.strftime("%Y-%m-%d") if a.timestamp else today_str,
+                    "alert_type": a.alert_type,
+                    "title": a.title,
+                    "message": a.message,
+                    "trade_id": a.trade_id,
+                    "strategy": a.strategy,
+                    "pnl": a.pnl,
+                    "created_at": a.timestamp.isoformat() if a.timestamp else None,
+                }
+                for a in mem_alerts
+            ]
+
     return {
         "date": target_date,
         "summary": summary,
