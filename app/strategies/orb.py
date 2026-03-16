@@ -3,8 +3,8 @@
 Opening range: 09:15–09:30
 ORH = highest high, ORL = lowest low in that window.
 
-CALL: Close > ORH + 0.05%, Volume > 1.5× avg, Price > VWAP, EMA20 > EMA50, RSI ≥ 55
-PUT:  Close < ORL − 0.05%, Volume > 1.5× avg, Price < VWAP, EMA20 < EMA50, RSI ≤ 45
+CALL: Close > ORH + 0.05%, Volume > 1.5× avg, Price > VWAP, EMA9 > EMA20, RSI ≥ 50
+PUT:  Close < ORL − 0.05%, Volume > 1.5× avg, Price < VWAP, EMA9 < EMA20, RSI ≤ 50
 
 Invalidation: breakout candle wick > 60%, or next candle closes inside range.
 """
@@ -57,8 +57,8 @@ class ORBStrategy(BaseStrategy):
         close = last["close"]
         volume = last["volume"]
         vwap = last.get("vwap")
+        ema9 = last.get("ema9")
         ema20 = last.get("ema20")
-        ema50 = last.get("ema50")
         rsi = last.get("rsi")
         avg_vol = last.get("avg_volume_10", volume)
         high = last["high"]
@@ -66,7 +66,7 @@ class ORBStrategy(BaseStrategy):
         open_ = last["open"]
 
         # Require real indicator data
-        if any(v is None or (isinstance(v, float) and v != v) for v in [rsi, ema20, ema50]):
+        if any(v is None or (isinstance(v, float) and v != v) for v in [rsi, ema9, ema20]):
             return None
         if vwap is None or (isinstance(vwap, float) and vwap != vwap):
             vwap = close  # Fallback: VWAP unavailable, use close (VWAP checks won't earn score)
@@ -90,13 +90,19 @@ class ORBStrategy(BaseStrategy):
 
         breakout_buffer = 0.0005  # 0.05%
 
+        # Log strategy evaluation details at DEBUG level
+        logger.debug(
+            "ORB check: close=%.2f ORH=%.2f ORL=%.2f RSI=%.1f EMA9=%.1f EMA20=%.1f VWAP=%.2f",
+            close, orh, orl, rsi, ema9, ema20, vwap,
+        )
+
         # CALL breakout
         if (
             close > orh * (1 + breakout_buffer)
             and (is_index or volume > 1.5 * avg_vol)
             and close > vwap
-            and ema20 > ema50
-            and rsi >= 55
+            and ema9 > ema20
+            and rsi >= 50
         ):
             # Check next candle doesn't close inside range (if available)
             if len(post_orb) >= 2:
@@ -122,8 +128,8 @@ class ORBStrategy(BaseStrategy):
             close < orl * (1 - breakout_buffer)
             and (is_index or volume > 1.5 * avg_vol)
             and close < vwap
-            and ema20 < ema50
-            and rsi <= 45
+            and ema9 < ema20
+            and rsi <= 50
         ):
             if len(post_orb) >= 2:
                 next_candle = post_orb.iloc[-1]

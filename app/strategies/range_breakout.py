@@ -1,11 +1,11 @@
 """Strategy 5 — Range Breakout.
 
 Range condition:
-  ADX < 18, price range < 0.35% for 60 minutes
+  ADX < 22, price range < 0.5% for 60 minutes
 
 Breakout:
   Volume ≥ 1.5× avg
-  RSI ≥ 60 (CALL), RSI ≤ 40 (PUT)
+  RSI ≥ 55 (CALL), RSI ≤ 45 (PUT)
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from app.strategies.base import BaseStrategy
 logger = logging.getLogger(__name__)
 
 RANGE_LOOKBACK = 60
-ADX_THRESHOLD = 18
-RANGE_PCT_THRESHOLD = 0.35
+ADX_THRESHOLD = 22
+RANGE_PCT_THRESHOLD = 0.50
 
 
 class RangeBreakoutStrategy(BaseStrategy):
@@ -60,12 +60,21 @@ class RangeBreakoutStrategy(BaseStrategy):
         range_low = range_window["low"].min()
         range_pct = (range_high - range_low) / range_low * 100 if range_low > 0 else 999
 
-        # Must be in a range (ADX < 18, range < 0.35%)
+        # Must be in a range (ADX < 22, range < 0.5%)
         if adx is None or adx >= ADX_THRESHOLD or range_pct >= RANGE_PCT_THRESHOLD:
+            logger.debug(
+                "RangeBreakout skip: ADX=%.1f (need <%.0f) range=%.2f%% (need <%.1f%%)",
+                adx, ADX_THRESHOLD, range_pct, RANGE_PCT_THRESHOLD,
+            )
             return None
 
+        logger.debug(
+            "RangeBreakout check: close=%.2f range=[%.2f,%.2f] RSI=%.1f ADX=%.1f range%%=%.2f",
+            close, range_low, range_high, rsi, adx, range_pct,
+        )
+
         # CALL breakout
-        if close > range_high and (is_index or volume >= 1.5 * avg_vol) and rsi >= 60:
+        if close > range_high and (is_index or volume >= 1.5 * avg_vol) and rsi >= 55:
             return StrategySignal(
                 strategy=StrategyName.RANGE_BREAKOUT,
                 option_type=OptionType.CALL,
@@ -81,7 +90,7 @@ class RangeBreakoutStrategy(BaseStrategy):
             )
 
         # PUT breakout
-        if close < range_low and (is_index or volume >= 1.5 * avg_vol) and rsi <= 40:
+        if close < range_low and (is_index or volume >= 1.5 * avg_vol) and rsi <= 45:
             return StrategySignal(
                 strategy=StrategyName.RANGE_BREAKOUT,
                 option_type=OptionType.PUT,

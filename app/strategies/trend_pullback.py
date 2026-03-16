@@ -3,14 +3,14 @@
 CALL:
   - EMA20 > EMA50 AND price > VWAP (uptrend)
   - Price pullback to EMA20
-  - RSI 45–50
+  - RSI 40–55
   - Bullish candle confirmation
   - Volume > 1.2× avg
 
 PUT:
   - EMA20 < EMA50 (downtrend)
   - Price pullback to EMA20
-  - RSI 50–55
+  - RSI 45–60
   - Bearish candle confirmation
 """
 
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 class TrendPullbackStrategy(BaseStrategy):
     """Trend Pullback strategy."""
 
-    PULLBACK_TOLERANCE_PCT = 0.15  # price within 0.15% of EMA20
+    PULLBACK_TOLERANCE_PCT = 0.25  # price within 0.25% of EMA20
 
     def evaluate(
         self,
@@ -38,7 +38,7 @@ class TrendPullbackStrategy(BaseStrategy):
         options_metrics: OptionsMetrics,
         spot_price: float,
     ) -> Optional[StrategySignal]:
-        if df.empty or len(df) < 50:
+        if df.empty or len(df) < 30:
             return None
 
         last = df.iloc[-1]
@@ -69,12 +69,17 @@ class TrendPullbackStrategy(BaseStrategy):
             return None
         pullback_distance_pct = abs(close - ema20) / ema20 * 100
 
+        logger.debug(
+            "TrendPullback check: close=%.2f EMA20=%.1f EMA50=%.1f RSI=%.1f pullback=%.2f%% vwap=%.2f",
+            close, ema20, ema50, rsi, pullback_distance_pct, vwap,
+        )
+
         # CALL: uptrend pullback
         if (
             ema20 > ema50
             and close > vwap
             and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
-            and 45 <= rsi <= 50
+            and 40 <= rsi <= 55
             and close > open_  # bullish candle
             and (is_index or volume > 1.2 * avg_vol)
         ):
@@ -89,7 +94,7 @@ class TrendPullbackStrategy(BaseStrategy):
         if (
             ema20 < ema50
             and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
-            and 50 <= rsi <= 55
+            and 45 <= rsi <= 60
             and close < open_  # bearish candle
             and (is_index or volume > 1.2 * avg_vol)
         ):

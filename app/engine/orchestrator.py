@@ -96,6 +96,10 @@ class Orchestrator:
         self.snapshot: Optional[MarketSnapshot] = None
         self.options_metrics = OptionsMetrics()
 
+        # Heartbeat tracking
+        self._last_heartbeat_cycle = 0
+        self._consecutive_no_signal = 0
+
         # Expiry format for current week (needs to be set dynamically)
         self._expiry: Optional[str] = None
 
@@ -126,6 +130,8 @@ class Orchestrator:
         self.snapshot = None
         self.options_metrics = OptionsMetrics()
         self._expiry = None
+        self._last_heartbeat_cycle = 0
+        self._consecutive_no_signal = 0
         self.paper_trader = PaperTradingEngine()  # Fresh daily paper trader
         self.running = False
         logger.info("Daily state reset complete")
@@ -318,8 +324,25 @@ class Orchestrator:
                     )
 
             if not signals:
+                self._consecutive_no_signal += 1
                 logger.info("[Cycle %d] No strategy signals this cycle (regime=%s)", cycle, regime.value)
+
+                # Send heartbeat alert every 15 cycles (~15 min) so user knows system is active
+                if cycle - self._last_heartbeat_cycle >= 15:
+                    self._last_heartbeat_cycle = cycle
+                    await self.alert_manager.send_info(
+                        f"SYSTEM HEARTBEAT — Cycle #{cycle}",
+                        f"NIFTY: {spot_price:,.2f} | Regime: {regime.value}\n"
+                        f"RSI: {indicators.rsi:.1f if indicators.rsi else 'N/A'} | "
+                        f"ADX: {indicators.adx:.1f if indicators.adx else 'N/A'}\n"
+                        f"VWAP: {indicators.vwap:,.2f if indicators.vwap else 'N/A'} | "
+                        f"Global: {self.global_bias.value}\n"
+                        f"No signals for {self._consecutive_no_signal} consecutive cycles.\n"
+                        f"Strategies are monitoring — waiting for conditions to align.",
+                    )
                 return
+            else:
+                self._consecutive_no_signal = 0
 
             # 10. Score and filter signals
             best_signal = None

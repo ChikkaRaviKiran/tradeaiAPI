@@ -2,8 +2,8 @@
 
 Time window: 10:30–14:30
 
-CALL: Price below VWAP for ≥10 min, closes above VWAP, volume > 1.3× avg, RSI > 55, EMA9 crosses EMA20
-PUT:  Price above VWAP for ≥10 min, closes below VWAP, RSI < 45, EMA9 crosses below EMA20
+CALL: Price below VWAP for ≥10 min, closes above VWAP, volume > 1.3× avg, RSI > 50, EMA9 crosses EMA20
+PUT:  Price above VWAP for ≥10 min, closes below VWAP, RSI < 50, EMA9 crosses below EMA20
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ class VWAPReclaimStrategy(BaseStrategy):
             below_vwap.sum() >= MIN_BELOW_CANDLES
             and close > vwap
             and (is_index or volume > 1.3 * avg_vol)
-            and rsi > 55
+            and rsi > 50
             and _ema_cross_up(window, "ema9", "ema20")
         ):
             return StrategySignal(
@@ -85,7 +85,7 @@ class VWAPReclaimStrategy(BaseStrategy):
             above_vwap.sum() >= MIN_BELOW_CANDLES
             and close < vwap
             and (is_index or volume > 1.3 * avg_vol)
-            and rsi < 45
+            and rsi < 50
             and _ema_cross_down(window, "ema9", "ema20")
         ):
             return StrategySignal(
@@ -99,23 +99,29 @@ class VWAPReclaimStrategy(BaseStrategy):
 
 
 def _ema_cross_up(df: pd.DataFrame, fast: str, slow: str) -> bool:
-    """Check if fast EMA crossed above slow EMA in last 3 candles."""
-    if len(df) < 3:
+    """Check if fast EMA crossed above slow EMA in last 5 candles."""
+    if len(df) < 5:
         return False
-    recent = df.tail(3)
-    prev = recent.iloc[-2]
-    curr = recent.iloc[-1]
-    return prev.get(fast, 0) <= prev.get(slow, 0) and curr.get(fast, 0) > curr.get(slow, 0)
+    recent = df.tail(5)
+    for i in range(1, len(recent)):
+        prev = recent.iloc[i - 1]
+        curr = recent.iloc[i]
+        if prev.get(fast, 0) <= prev.get(slow, 0) and curr.get(fast, 0) > curr.get(slow, 0):
+            return True
+    return False
 
 
 def _ema_cross_down(df: pd.DataFrame, fast: str, slow: str) -> bool:
-    """Check if fast EMA crossed below slow EMA in last 3 candles."""
-    if len(df) < 3:
+    """Check if fast EMA crossed below slow EMA in last 5 candles."""
+    if len(df) < 5:
         return False
-    recent = df.tail(3)
-    prev = recent.iloc[-2]
-    curr = recent.iloc[-1]
-    return prev.get(fast, 0) >= prev.get(slow, 0) and curr.get(fast, 0) < curr.get(slow, 0)
+    recent = df.tail(5)
+    for i in range(1, len(recent)):
+        prev = recent.iloc[i - 1]
+        curr = recent.iloc[i]
+        if prev.get(fast, 0) >= prev.get(slow, 0) and curr.get(fast, 0) < curr.get(slow, 0):
+            return True
+    return False
 
 
 def _nearest_strike(price: float) -> float:
