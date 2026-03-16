@@ -143,6 +143,8 @@ class HistoryLogger:
             return {"date": target_date, "has_data": False}
 
         prices = [s["nifty_price"] for s in snapshots]
+        rsi_values = [s["rsi"] for s in snapshots if s["rsi"] is not None]
+        adx_values = [s["adx"] for s in snapshots if s["adx"] is not None]
         return {
             "date": target_date,
             "has_data": True,
@@ -153,8 +155,8 @@ class HistoryLogger:
             "low": min(prices),
             "first_time": snapshots[0]["time"],
             "last_time": snapshots[-1]["time"],
-            "avg_rsi": round(sum(s["rsi"] for s in snapshots) / len(snapshots), 1),
-            "avg_adx": round(sum(s["adx"] for s in snapshots) / len(snapshots), 1),
+            "avg_rsi": round(sum(rsi_values) / len(rsi_values), 1) if rsi_values else 0,
+            "avg_adx": round(sum(adx_values) / len(adx_values), 1) if adx_values else 0,
             "regimes": list(set(s["regime"] for s in snapshots)),
             "last_pcr": snapshots[-1]["pcr"],
             "last_max_pain": snapshots[-1]["max_pain"],
