@@ -26,7 +26,7 @@ import pytz
 
 from app.alerts.alert_manager import AlertManager
 from app.core.config import settings
-from app.core.holidays import is_market_holiday, next_trading_date
+from app.core.holidays import is_market_holiday, next_trading_date, previous_trading_date
 from app.core.instruments import (
     InstrumentConfig,
     get_instrument,
@@ -336,14 +336,24 @@ class Orchestrator:
         """Run full analysis for a single instrument."""
         symbol = instrument.symbol
         try:
-            # 1. Fetch candle data
-            from_date = now.strftime("%Y-%m-%d 09:15")
+            # 1. Fetch candle data (include previous trading day for indicator warmup)
+            prev_day = previous_trading_date(now.date())
+            from_date = prev_day.strftime("%Y-%m-%d 09:15")
             to_date = now.strftime("%Y-%m-%d %H:%M")
+            today_str = now.strftime("%Y-%m-%d")
 
-            candles = self.client.get_candle_data(
-                instrument.token, instrument.exchange.value,
-                "ONE_MINUTE", from_date, to_date
-            )
+            try:
+                candles = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.client.get_candle_data,
+                        instrument.token, instrument.exchange.value,
+                        "ONE_MINUTE", from_date, to_date,
+                    ),
+                    timeout=45,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[%s][Cycle %d] Candle data fetch timed out", symbol, cycle)
+                return
             df = self.client.candles_to_dataframe(candles)
 
             if df.empty:
@@ -358,17 +368,30 @@ class Orchestrator:
 
             # 2b. For indices, merge futures volume
             if instrument.is_index:
-                fut_candles = self.client.get_nifty_futures_candles(
-                    interval="ONE_MINUTE", from_date=from_date, to_date=to_date
-                )
+                try:
+                    fut_candles = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.client.get_nifty_futures_candles,
+                            interval="ONE_MINUTE", from_date=from_date, to_date=to_date,
+                        ),
+                        timeout=45,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[%s] Futures candle fetch timed out", symbol)
+                    fut_candles = []
                 if fut_candles:
                     fut_df = self.client.candles_to_dataframe(fut_candles)
                     df = self.feature_engine.merge_futures_volume(df, fut_df)
 
-            # 3. Feature engineering
-            df = self.feature_engine.compute_indicators(df)
-            indicators = self.feature_engine.get_latest_indicators(df)
-            spot_price = df.iloc[-1]["close"] if not df.empty else 0
+            # 3. Feature engineering (on full history for proper indicator warmup)
+            df = self.feature_engine.compute_indicators(df, today_date=today_str)
+            # Filter to today-only for strategies/snapshot (indicators are already computed)
+            df_today = df[df.index.strftime("%Y-%m-%d") == today_str]
+            if df_today.empty:
+                logger.warning("[%s][Cycle %d] No today candles after filtering", symbol, cycle)
+                return
+            indicators = self.feature_engine.get_latest_indicators(df_today)
+            spot_price = df_today.iloc[-1]["close"] if not df_today.empty else 0
 
             logger.info(
                 "[%s][Cycle %d] Price=%.2f | RSI=%s | ADX=%s | EMA200=%s",
@@ -388,7 +411,7 @@ class Orchestrator:
             # 5. Market regime detection
             regime = self.regime_detector.detect(df)
 
-            # 6. Build market snapshot
+            # 6. Build market snapshot (use today's data)
             snap = MarketSnapshot(
                 instrument=symbol,
                 price=spot_price,
@@ -414,11 +437,11 @@ class Orchestrator:
                 logger.info("[%s][Cycle %d] Risk limits reached", symbol, cycle)
                 return
 
-            # 9. Run strategies (use per-instrument whitelist if available)
+            # 9. Run strategies (use today-only data for strategy evaluation)
             strategies_to_run = self._instrument_strategies.get(symbol, self.strategies)
             signals: list[StrategySignal] = []
             for strategy in strategies_to_run:
-                signal = strategy.evaluate(df, options_metrics, spot_price)
+                signal = strategy.evaluate(df_today, options_metrics, spot_price)
                 if signal:
                     signal.instrument = symbol
                     signals.append(signal)
@@ -451,7 +474,7 @@ class Orchestrator:
                 return
 
             # 11. Fetch option premium
-            option_ltp = self._fetch_option_ltp_for(instrument, best_signal, expiry)
+            option_ltp = await self._fetch_option_ltp_for(instrument, best_signal, expiry)
             if option_ltp is None or option_ltp <= 0:
                 logger.warning("[%s] Could not fetch option LTP — skipping trade", symbol)
                 return
@@ -616,7 +639,7 @@ class Orchestrator:
 
         return instruments
 
-    def _fetch_option_ltp_for(
+    async def _fetch_option_ltp_for(
         self,
         instrument: InstrumentConfig,
         signal: StrategySignal,
@@ -632,11 +655,19 @@ class Orchestrator:
         if not token_info:
             logger.warning("Token not found for %s", symbol)
             return None
-        ltp = self.client.get_ltp(
-            "NFO",
-            token_info.get("tradingsymbol", ""),
-            token_info.get("symboltoken", ""),
-        )
+        try:
+            ltp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.get_ltp,
+                    "NFO",
+                    token_info.get("tradingsymbol", ""),
+                    token_info.get("symboltoken", ""),
+                ),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("LTP fetch timed out for %s", symbol)
+            return None
         return ltp
 
     async def _update_options_chain_for(
@@ -647,7 +678,10 @@ class Orchestrator:
     ) -> OptionsMetrics:
         """Fetch options chain and compute metrics for an instrument."""
         try:
-            chain = self.client.get_option_chain(expiry)
+            chain = await asyncio.wait_for(
+                asyncio.to_thread(self.client.get_option_chain, expiry),
+                timeout=60,
+            )
             metrics = self.feature_engine.compute_options_metrics(chain, spot_price)
             logger.info(
                 "[%s] Options: PCR=%s MaxPain=%s",
@@ -656,6 +690,9 @@ class Orchestrator:
                 f"{metrics.max_pain:.0f}" if metrics.max_pain is not None else "N/A",
             )
             return metrics
+        except asyncio.TimeoutError:
+            logger.warning("[%s] Options chain fetch timed out after 60s", instrument.symbol)
+            return self._options_metrics.get(instrument.symbol, OptionsMetrics())
         except Exception:
             logger.exception("[%s] Error updating options chain", instrument.symbol)
             return self._options_metrics.get(instrument.symbol, OptionsMetrics())
@@ -678,11 +715,19 @@ class Orchestrator:
         for trade in inst_trades:
             token_info = self.client._search_symbol(trade.symbol)
             if token_info:
-                ltp = self.client.get_ltp(
-                    "NFO",
-                    token_info.get("tradingsymbol", ""),
-                    token_info.get("symboltoken", ""),
-                )
+                try:
+                    ltp = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.client.get_ltp,
+                            "NFO",
+                            token_info.get("tradingsymbol", ""),
+                            token_info.get("symboltoken", ""),
+                        ),
+                        timeout=15,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("LTP fetch timed out for %s", trade.symbol)
+                    ltp = None
                 if ltp:
                     current_prices[trade.symbol] = ltp
 

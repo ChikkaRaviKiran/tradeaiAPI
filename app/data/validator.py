@@ -33,11 +33,13 @@ class DataValidator:
         return df
 
     def has_data_gap(self, df: pd.DataFrame) -> bool:
-        """Check if there is a candle gap > MAX_CANDLE_GAP_MINUTES."""
+        """Check if there is a candle gap > MAX_CANDLE_GAP_MINUTES in recent data."""
         if len(df) < 2:
             return False
 
-        timestamps = df.index.to_series()
+        # Only check the last 10 candles — old gaps don't affect current analysis
+        recent = df.tail(10)
+        timestamps = recent.index.to_series()
         diffs = timestamps.diff().dropna()
         max_gap = diffs.max()
         if max_gap > timedelta(minutes=self.MAX_CANDLE_GAP_MINUTES):

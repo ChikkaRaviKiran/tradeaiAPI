@@ -155,3 +155,11 @@ def next_trading_date(d: date) -> date:
     while is_market_holiday(candidate):
         candidate += timedelta(days=1)
     return candidate
+
+
+def previous_trading_date(d: date) -> date:
+    """Get the most recent trading date before the given date (skips weekends + holidays)."""
+    candidate = d - timedelta(days=1)
+    while is_market_holiday(candidate):
+        candidate -= timedelta(days=1)
+    return candidate

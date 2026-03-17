@@ -30,6 +30,9 @@ class EvaluationScheduler:
         self.evaluator = StrategyEvaluator(lookback_days=lookback_days)
         self._latest_report: EvaluationReport | None = None
         self._running = False
+        self._status: str = "idle"          # idle | running | completed | failed
+        self._status_message: str = ""
+        self._last_run_time: str | None = None
 
     @property
     def latest_report(self) -> EvaluationReport | None:
@@ -41,6 +44,16 @@ class EvaluationScheduler:
             return self._latest_report.recommendations
         return []
 
+    @property
+    def eval_status(self) -> dict:
+        return {
+            "status": self._status,
+            "message": self._status_message,
+            "running": self._running,
+            "last_run_time": self._last_run_time,
+            "has_results": self._latest_report is not None and len(self._latest_report.recommendations) > 0,
+        }
+
     async def run_evaluation(
         self,
         instruments: list[InstrumentConfig],
@@ -48,24 +61,33 @@ class EvaluationScheduler:
         """Run a full evaluation (blocking). Safe to call from API or orchestrator."""
         if self._running:
             logger.warning("Evaluation already in progress — skipping")
+            self._status_message = "Already running"
             if self._latest_report:
                 return self._latest_report
             return EvaluationReport()
 
         self._running = True
+        self._status = "running"
+        self._status_message = f"Evaluating {len(instruments)} instruments..."
         try:
             logger.info(
                 "Starting strategy evaluation for %d instruments...",
                 len(instruments),
             )
-            # Run in thread pool to avoid blocking async event loop
-            loop = asyncio.get_event_loop()
             report = await self.evaluator.evaluate(instruments)
 
             self._latest_report = report
 
             # Persist to DB
             await self._save_to_db(report)
+
+            self._status = "completed"
+            self._last_run_time = datetime.now(_IST).strftime("%Y-%m-%d %H:%M")
+            self._status_message = (
+                f"{len(report.recommendations)} recommendations from "
+                f"{len(report.instruments_evaluated)} instruments in "
+                f"{report.run_time_seconds:.0f}s"
+            )
 
             logger.info(
                 "Evaluation complete: %d recommendations | Top: %s %s (score=%.1f)",
@@ -78,6 +100,8 @@ class EvaluationScheduler:
 
         except Exception:
             logger.exception("Error during strategy evaluation")
+            self._status = "failed"
+            self._status_message = "Evaluation failed — check server logs"
             return EvaluationReport()
         finally:
             self._running = False

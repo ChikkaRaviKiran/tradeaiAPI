@@ -166,17 +166,26 @@ class StrategyEvaluator:
     ) -> EvaluationReport:
         """Run full evaluation across instruments and strategies.
 
-        Args:
-            instruments: Which instruments to evaluate.
-            strategies: Optional override; defaults to all registered strategies.
-
-        Returns:
-            EvaluationReport with ranked recommendations.
+        Offloads sync Yahoo Finance I/O and CPU-intensive computation to a
+        thread so the async event loop stays responsive.
         """
-        start_time = datetime.now()
+        import asyncio
+
         if strategies is None:
             strategies = _STRATEGY_REGISTRY
 
+        report = await asyncio.to_thread(
+            self._evaluate_sync, instruments, strategies
+        )
+        return report
+
+    def _evaluate_sync(
+        self,
+        instruments: list[InstrumentConfig],
+        strategies: list[tuple[str, BaseStrategy]],
+    ) -> EvaluationReport:
+        """Synchronous evaluation — runs in a thread pool."""
+        start_time = datetime.now()
         eval_date = datetime.now(_IST).strftime("%Y-%m-%d")
         report = EvaluationReport(
             eval_date=eval_date,
@@ -188,26 +197,31 @@ class StrategyEvaluator:
         all_recommendations: list[StrategyRecommendation] = []
 
         for instrument in instruments:
-            logger.info("Evaluating %s...", instrument.symbol)
+            try:
+                logger.info("Evaluating %s...", instrument.symbol)
 
-            # Fetch historical intraday data (5-min candles)
-            daily_data = self._fetch_historical_data(instrument)
-            if not daily_data:
-                logger.warning("No historical data for %s — skipping", instrument.symbol)
-                continue
+                # Fetch historical intraday data (5-min candles)
+                daily_data = self._fetch_historical_data(instrument)
+                if not daily_data:
+                    logger.warning("No historical data for %s — skipping", instrument.symbol)
+                    continue
 
-            # Detect current regime from most recent day
-            current_regime = self._detect_current_regime(daily_data)
+                # Detect current regime from most recent day
+                current_regime = self._detect_current_regime(daily_data)
 
-            for strat_name, strategy in strategies:
-                rec = self._evaluate_strategy(
-                    instrument, strat_name, strategy, daily_data, current_regime
-                )
-                if rec.total_trades > 0:
-                    all_recommendations.append(rec)
-                    report.all_trades.extend(
-                        self._get_trades_for(instrument.symbol, strat_name, daily_data, strategy)
-                    )
+                for strat_name, strategy in strategies:
+                    try:
+                        rec = self._evaluate_strategy(
+                            instrument, strat_name, strategy, daily_data, current_regime
+                        )
+                        if rec.total_trades > 0:
+                            all_recommendations.append(rec)
+                    except Exception:
+                        logger.exception(
+                            "Error evaluating %s on %s", strat_name, instrument.symbol
+                        )
+            except Exception:
+                logger.exception("Error processing instrument %s", instrument.symbol)
 
         # Rank by composite score
         all_recommendations.sort(key=lambda r: r.composite_score, reverse=True)

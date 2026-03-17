@@ -463,10 +463,22 @@ async def trigger_evaluation():
 
     # Run evaluation in a background task so the API doesn't block
     async def _run():
-        await scheduler.run_evaluation(instruments)
+        try:
+            await scheduler.run_evaluation(instruments)
+        except Exception:
+            logger.exception("Background evaluation task crashed")
     asyncio.create_task(_run())
 
     return {"message": "Evaluation started", "instruments": [i.symbol for i in instruments]}
+
+
+@app.get("/api/evaluate/status")
+async def get_evaluation_status():
+    """Get current evaluation run status — used by frontend to poll progress."""
+    scheduler = _state.get("eval_scheduler")
+    if scheduler is None:
+        return {"status": "idle", "message": "Scheduler not initialized", "running": False, "has_results": False}
+    return scheduler.eval_status
 
 
 @app.get("/api/evaluate/history/{target_date}")

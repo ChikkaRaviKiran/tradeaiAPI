@@ -22,15 +22,20 @@ class FeatureEngine:
 
     # ── Technical Indicators ──────────────────────────────────────────────
 
-    def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute_indicators(self, df: pd.DataFrame, today_date: str | None = None) -> pd.DataFrame:
         """Add all technical indicator columns to the DataFrame.
 
         Expects OHLCV DataFrame indexed by timestamp.
+        Gracefully handles insufficient candles for each indicator group.
+        If today_date is provided (YYYY-MM-DD), VWAP is computed intraday-only.
         """
-        if df.empty or len(df) < 14:
+        if df.empty or len(df) < 2:
             return df
 
-        # Trend: EMAs
+        n = len(df)
+        _nan = pd.Series([float("nan")] * n, index=df.index)
+
+        # Trend: EMAs (always computable)
         df["ema9"] = ta.trend.ema_indicator(df["close"], window=9)
         df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
         df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
@@ -41,32 +46,47 @@ class FeatureEngine:
             # Compute with available data using min_periods
             df["ema200"] = df["close"].ewm(span=200, min_periods=min(50, len(df)), adjust=False).mean()
 
-        # VWAP
-        df["vwap"] = self._compute_vwap(df)
+        # VWAP (intraday only — reset each day)
+        if today_date:
+            today_mask = df.index.strftime("%Y-%m-%d") == today_date
+            df["vwap"] = float("nan")
+            if today_mask.any():
+                df.loc[today_mask, "vwap"] = self._compute_vwap(df[today_mask]).values
+        else:
+            df["vwap"] = self._compute_vwap(df)
 
-        # Momentum: RSI
-        df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+        # Indicators that need ≥14 candles (RSI, ATR, MACD, Bollinger)
+        if n >= 14:
+            # Momentum: RSI
+            df["rsi"] = ta.momentum.rsi(df["close"], window=14)
 
-        # Momentum: MACD
-        macd = ta.trend.MACD(df["close"])
-        df["macd"] = macd.macd()
-        df["macd_signal"] = macd.macd_signal()
-        df["macd_hist"] = macd.macd_diff()
+            # Momentum: MACD
+            macd = ta.trend.MACD(df["close"])
+            df["macd"] = macd.macd()
+            df["macd_signal"] = macd.macd_signal()
+            df["macd_hist"] = macd.macd_diff()
 
-        # Volatility: ATR
-        df["atr"] = ta.volatility.average_true_range(
-            df["high"], df["low"], df["close"], window=14
-        )
+            # Volatility: ATR
+            df["atr"] = ta.volatility.average_true_range(
+                df["high"], df["low"], df["close"], window=14
+            )
 
-        # Volatility: Bollinger Bands
-        bb = ta.volatility.BollingerBands(df["close"])
-        df["bollinger_upper"] = bb.bollinger_hband()
-        df["bollinger_middle"] = bb.bollinger_mavg()
-        df["bollinger_lower"] = bb.bollinger_lband()
+            # Volatility: Bollinger Bands
+            bb = ta.volatility.BollingerBands(df["close"])
+            df["bollinger_upper"] = bb.bollinger_hband()
+            df["bollinger_middle"] = bb.bollinger_mavg()
+            df["bollinger_lower"] = bb.bollinger_lband()
+        else:
+            for col in ("rsi", "macd", "macd_signal", "macd_hist", "atr",
+                        "bollinger_upper", "bollinger_middle", "bollinger_lower"):
+                df[col] = _nan
 
-        # Trend: ADX
-        adx_indicator = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14)
-        df["adx"] = adx_indicator.adx()
+        # Trend: ADX (requires 2×window candles internally; guard against crash)
+        try:
+            adx_indicator = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14)
+            df["adx"] = adx_indicator.adx()
+        except (IndexError, Exception):
+            df["adx"] = pd.Series([float("nan")] * len(df), index=df.index)
 
         # Derived helpers
         df["ema20_slope"] = df["ema20"].diff(5)
