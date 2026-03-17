@@ -25,7 +25,7 @@ from app.core.models import (
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are an expert NIFTY options trading analyst. You receive real-time market data and a strategy signal with the actual option premium (LTP).
+SYSTEM_PROMPT = """You are an expert Indian market options trading analyst. You receive real-time market data and a strategy signal with the actual option premium (LTP).
 Your job is to validate the trade signal and provide a final decision.
 
 You must respond ONLY with a valid JSON object (no markdown, no extra text) in this exact format:
@@ -113,7 +113,8 @@ class AIDecisionEngine:
         return json.dumps(
             {
                 "market_snapshot": {
-                    "nifty_price": snapshot.nifty_price,
+                    "instrument": snapshot.instrument or "NIFTY",
+                    "spot_price": snapshot.price,
                     "vwap": snapshot.vwap,
                     "vwap_is_volume_weighted": snapshot.indicators.vwap_is_volume_weighted,
                     "timestamp": now.strftime("%H:%M:%S"),

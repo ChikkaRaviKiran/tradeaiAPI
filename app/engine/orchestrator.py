@@ -111,6 +111,8 @@ class Orchestrator:
         # Per-instrument strategy whitelist from evaluation
         # {symbol: [strategy_instance, ...]}  — empty means run all
         self._instrument_strategies: dict[str, list[BaseStrategy]] = {}
+        # Eval score boost: {(symbol, strategy_name): composite_score}
+        self._eval_scores: dict[tuple[str, str], float] = {}
 
         # State — per instrument
         self.running = False
@@ -218,14 +220,17 @@ class Orchestrator:
             await self.alert_manager.send_info("AUTH FAILED", "AngelOne authentication failed. Check credentials.")
             return
 
-        # Determine weekly expiry for each index instrument
+        # Determine weekly/monthly expiry for each active instrument
         for inst in self._active_instruments:
-            if inst.is_index:
-                expiry = self.client.get_nearest_weekly_expiry()
-                if not expiry:
-                    expiry = self._get_weekly_expiry_fallback()
+            inst_name = inst.option_symbol_prefix or inst.symbol
+            expiry = self.client.get_nearest_weekly_expiry(instrument_name=inst_name)
+            if not expiry and inst.is_index:
+                expiry = self._get_weekly_expiry_fallback()
+            if expiry:
                 self._expiries[inst.symbol] = expiry
                 logger.info("Weekly expiry for %s: %s", inst.symbol, expiry)
+            else:
+                logger.warning("No expiry found for %s — options data unavailable", inst.symbol)
 
         # Update shared state for API
         from app.api.routes import get_state
@@ -401,10 +406,10 @@ class Orchestrator:
                 f"{indicators.ema200:.1f}" if indicators.ema200 is not None else "N/A",
             )
 
-            # 4. Options chain (only for index instruments, every 5 min)
+            # 4. Options chain (for all instruments with expiry, every 5 min)
             options_metrics = self._options_metrics.get(symbol, OptionsMetrics())
             expiry = self._expiries.get(symbol)
-            if instrument.is_index and expiry and (now.minute % 5 == 0 or options_metrics.pcr is None):
+            if expiry and (now.minute % 5 == 0 or options_metrics.pcr is None):
                 options_metrics = await self._update_options_chain_for(instrument, spot_price, expiry)
                 self._options_metrics[symbol] = options_metrics
 
@@ -452,7 +457,7 @@ class Orchestrator:
             else:
                 self._consecutive_no_signal = 0
 
-            # 10. Score and filter
+            # 10. Score and filter (with evaluation boost for top-ranked combos)
             adaptive_min = compute_adaptive_min_score(options_metrics, self.global_bias)
             best_signal = None
             best_score = 0.0
@@ -461,14 +466,39 @@ class Orchestrator:
                 score_result = self.signal_scorer.score(
                     signal, df, options_metrics, self.global_bias
                 )
-                logger.info(
-                    "[%s][Cycle %d] %s scored %.0f/100 (min=%d)",
-                    symbol, cycle, signal.strategy.value, score_result.total, adaptive_min,
-                )
-                if score_result.total >= adaptive_min and score_result.total > best_score:
+                raw_score = score_result.total
+
+                # Evaluation boost: top-ranked strategy+instrument combos
+                # get a bonus based on their historical composite score.
+                # Max boost = 15 pts for combos with eval score >= 80.
+                eval_key = (symbol, signal.strategy.value)
+                eval_composite = self._eval_scores.get(eval_key, 0)
+                eval_boost = 0
+                if eval_composite >= 80:
+                    eval_boost = 15
+                elif eval_composite >= 70:
+                    eval_boost = 10
+                elif eval_composite >= 60:
+                    eval_boost = 5
+
+                boosted_score = min(raw_score + eval_boost, 100)
+
+                if eval_boost > 0:
+                    logger.info(
+                        "[%s][Cycle %d] %s scored %.0f + %d eval boost = %.0f/100 (min=%d)",
+                        symbol, cycle, signal.strategy.value,
+                        raw_score, eval_boost, boosted_score, adaptive_min,
+                    )
+                else:
+                    logger.info(
+                        "[%s][Cycle %d] %s scored %.0f/100 (min=%d)",
+                        symbol, cycle, signal.strategy.value, raw_score, adaptive_min,
+                    )
+
+                if boosted_score >= adaptive_min and boosted_score > best_score:
                     best_signal = signal
-                    best_score = score_result.total
-                    signal.score = score_result.total
+                    best_score = boosted_score
+                    signal.score = boosted_score
 
             if best_signal is None:
                 return
@@ -624,6 +654,13 @@ class Orchestrator:
             if allowed:
                 self._instrument_strategies[sym] = allowed
 
+        # Build eval score lookup for signal boost
+        self._eval_scores = {}
+        for r in recs:
+            key = (r.instrument, r.strategy)
+            if key not in self._eval_scores:
+                self._eval_scores[key] = r.composite_score
+
         logger.info(
             "AUTO-SELECT: Picked %d instruments from evaluation: %s",
             len(instruments),
@@ -635,7 +672,16 @@ class Orchestrator:
         for inst in instruments:
             strats = self._instrument_strategies.get(inst.symbol, self.strategies)
             strat_names = [type(s).__name__ for s in strats]
-            logger.info("  %s → %s", inst.symbol, ", ".join(strat_names))
+            # Show eval scores for each strategy
+            boost_info = []
+            for s in strats:
+                for name, _ in _STRATEGY_REGISTRY:
+                    if type(s).__name__.upper().replace("STRATEGY", "").replace("_", "") == name.replace("_", ""):
+                        sc = self._eval_scores.get((inst.symbol, name), 0)
+                        if sc > 0:
+                            boost_info.append(f"{name}={sc:.0f}")
+                        break
+            logger.info("  %s → %s | eval: %s", inst.symbol, ", ".join(strat_names), ", ".join(boost_info) or "none")
 
         return instruments
 
@@ -679,7 +725,13 @@ class Orchestrator:
         """Fetch options chain and compute metrics for an instrument."""
         try:
             chain = await asyncio.wait_for(
-                asyncio.to_thread(self.client.get_option_chain, expiry),
+                asyncio.to_thread(
+                    self.client.get_option_chain,
+                    expiry,
+                    symbol_prefix=instrument.option_symbol_prefix or instrument.symbol,
+                    spot_price=spot_price,
+                    strike_interval=instrument.strike_interval,
+                ),
                 timeout=60,
             )
             metrics = self.feature_engine.compute_options_metrics(chain, spot_price)
@@ -901,4 +953,4 @@ class Orchestrator:
         if days_until_wed == 0 and today.hour >= 16:
             days_until_wed = 7
         expiry_date = today + timedelta(days=days_until_wed)
-        return expiry_date.strftime("%d%b%Y").upper()
+        return expiry_date.strftime("%d%b%y").upper()

@@ -34,13 +34,15 @@ class AngelOneClient:
         self.nifty_symbol = "NIFTY"
         self.exchange = "NSE"
         self.nfo_exchange = "NFO"
+        self._nfo_symbol_index: dict[str, dict] = {}  # symbol -> {tradingsymbol, symboltoken}
 
-    # ── Instrument Master Cache ───────────────────────────────────────────
+    # ── Instrument Master Cache ─────────────────────────────────────────
 
     def _get_instrument_master(self) -> list:
         """Download and cache the AngelOne instrument master JSON.
 
         Cached for the lifetime of this client (one trading day).
+        Also builds an NFO symbol index for O(1) lookups.
         """
         if self._instrument_master is not None:
             return self._instrument_master
@@ -53,6 +55,17 @@ class AngelOneClient:
         with urlopen(url, timeout=60) as resp:
             self._instrument_master = json.loads(resp.read().decode())
         logger.info("Instrument master loaded: %d instruments", len(self._instrument_master))
+
+        # Build NFO symbol -> token index for fast option lookups
+        for item in self._instrument_master:
+            if item.get("exch_seg") == self.nfo_exchange:
+                sym = item.get("symbol", "")
+                if sym:
+                    self._nfo_symbol_index[sym] = {
+                        "tradingsymbol": sym,
+                        "symboltoken": item.get("token", ""),
+                    }
+        logger.info("NFO symbol index built: %d entries", len(self._nfo_symbol_index))
         return self._instrument_master
 
     # ── Authentication ────────────────────────────────────────────────────
@@ -274,32 +287,43 @@ class AngelOneClient:
 
     # ── Options Chain ────────────────────────────────────────────────────
 
-    def get_option_chain(self, expiry_date: str) -> list[OptionsChainRow]:
-        """Fetch NIFTY options chain for a given expiry.
+    def get_option_chain(
+        self,
+        expiry_date: str,
+        symbol_prefix: str = "NIFTY",
+        spot_price: Optional[float] = None,
+        strike_interval: float = 50,
+    ) -> list[OptionsChainRow]:
+        """Fetch options chain for a given instrument and expiry.
 
         Batches token lookups then uses getMarketData(FULL) in batches
         of up to 50 tokens to minimise API calls and get real OI/volume.
 
         Args:
-            expiry_date: Expiry in DDMMMYYYY format (e.g., '06MAR2026').
+            expiry_date: Expiry in DDMMMYY format (e.g., '06MAR26').
+            symbol_prefix: Option symbol prefix (e.g., 'NIFTY', 'FINNIFTY', 'RELIANCE').
+            spot_price: Current spot price. If None, fetches NIFTY LTP.
+            strike_interval: Strike gap (50 for NIFTY/FINNIFTY, 100 for BANKNIFTY, etc.).
         """
         self.ensure_authenticated()
         rows: list[OptionsChainRow] = []
 
-        nifty_ltp = self.get_ltp(self.exchange, self.nifty_symbol, self.nifty_token)
-        if nifty_ltp is None:
+        if spot_price is None:
+            spot_price = self.get_ltp(self.exchange, self.nifty_symbol, self.nifty_token)
+        if spot_price is None:
             return rows
 
-        # Build strikes around current price (±1000 range, step 50)
-        base = int(round(nifty_ltp / 50) * 50)
-        strikes = list(range(base - 1000, base + 1050, 50))
+        # Build strikes around current price (±1000 range)
+        step = int(strike_interval)
+        base = int(round(spot_price / strike_interval) * strike_interval)
+        strikes = list(range(base - 1000, base + 1000 + step, step))
 
         # Phase 1: Search all symbol tokens (uses instrument master — no API calls)
         token_map: dict[str, dict] = {}  # token -> symbol_info
         strike_tokens: dict[int, dict] = {}  # strike -> {ce_token, pe_token}
         for strike in strikes:
-            ce_symbol = f"NIFTY{expiry_date}{strike}CE"
-            pe_symbol = f"NIFTY{expiry_date}{strike}PE"
+            ce_symbol = f"{symbol_prefix}{expiry_date}{strike}CE"
+            pe_symbol = f"{symbol_prefix}{expiry_date}{strike}PE"
             ce_info = self._search_symbol(ce_symbol)
             pe_info = self._search_symbol(pe_symbol)
             entry: dict = {}
@@ -349,28 +373,12 @@ class AngelOneClient:
         return rows
 
     def _search_symbol(self, trading_symbol: str) -> Optional[dict]:
-        """Search for a symbol token — first from instrument master, then API fallback."""
-        # Fast path: look up from cached instrument master (no API call)
-        try:
-            master = self._get_instrument_master()
-            for item in master:
-                if item.get("symbol") == trading_symbol and item.get("exch_seg") == self.nfo_exchange:
-                    return {
-                        "tradingsymbol": item.get("symbol", ""),
-                        "symboltoken": item.get("token", ""),
-                    }
-        except Exception:
-            logger.debug("Instrument master lookup failed for %s", trading_symbol)
-
-        # Slow fallback: searchScrip API
-        try:
-            result = self._smart_api.searchScrip(self.nfo_exchange, trading_symbol)
-            if result and result.get("status") and result.get("data"):
-                for item in result["data"]:
-                    if item.get("tradingsymbol") == trading_symbol:
-                        return item
-        except Exception:
-            pass
+        """Search for a symbol token using the O(1) NFO index."""
+        # Ensure instrument master (and index) is loaded
+        self._get_instrument_master()
+        result = self._nfo_symbol_index.get(trading_symbol)
+        if result:
+            return result
         return None
 
     def _get_quote(self, exchange: str, symbol_info: dict) -> Optional[dict]:
@@ -408,7 +416,7 @@ class AngelOneClient:
         """Get token info for a specific NIFTY option.
 
         Args:
-            expiry: Expiry in DDMMMYYYY (e.g. '06MAR2026').
+            expiry: Expiry in DDMMMYY (e.g. '06MAR26').
             strike: Strike price.
             option_type: 'CE' or 'PE'.
         """
@@ -417,19 +425,18 @@ class AngelOneClient:
 
     # ── Expiry Discovery ─────────────────────────────────────────────────
 
-    def get_nearest_weekly_expiry(self) -> Optional[str]:
-        """Find the nearest valid NIFTY weekly expiry from the AngelOne instrument list.
+    def get_nearest_weekly_expiry(self, instrument_name: str = "NIFTY") -> Optional[str]:
+        """Find the nearest valid weekly expiry for an instrument.
 
-        Downloads the OpenAPI instrument master CSV, filters for NIFTY options,
-        and returns the nearest expiry in DDMMMYYYY format.
+        Uses the OpenAPI instrument master, filters for the given instrument's
+        option contracts, and returns the nearest expiry in DDMMMYY format.
+
+        Args:
+            instrument_name: Instrument name in the master (e.g. 'NIFTY', 'FINNIFTY', 'BANKNIFTY').
         """
         self.ensure_authenticated()
         try:
-            import io
-            import csv
-            from urllib.request import urlopen
-
-            logger.info("Fetching AngelOne instrument master for expiry discovery...")
+            logger.info("Fetching AngelOne instrument master for %s expiry discovery...", instrument_name)
 
             instruments = self._get_instrument_master()
 
@@ -442,7 +449,7 @@ class AngelOneClient:
                 symbol = inst.get("symbol", "")
                 expiry_str = inst.get("expiry", "")
 
-                if exch_seg != "NFO" or name != "NIFTY":
+                if exch_seg != "NFO" or name != instrument_name:
                     continue
                 # Only option contracts (CE/PE in symbol)
                 if "CE" not in symbol and "PE" not in symbol:
@@ -458,12 +465,12 @@ class AngelOneClient:
                     continue
 
             if not expiry_dates:
-                logger.warning("No NIFTY expiry dates found in instrument master")
+                logger.warning("No %s expiry dates found in instrument master", instrument_name)
                 return None
 
             nearest = min(expiry_dates)
-            result = nearest.strftime("%d%b%Y").upper()
-            logger.info("Nearest NIFTY weekly expiry from instrument master: %s", result)
+            result = nearest.strftime("%d%b%y").upper()
+            logger.info("Nearest %s weekly expiry from instrument master: %s", instrument_name, result)
             return result
 
         except Exception:
