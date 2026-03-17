@@ -46,6 +46,7 @@ class PaperTradingEngine:
         decision: AIDecision,
         nfo_symbol: str = "",
         num_lots: int = 1,
+        instrument_lot_size: int = 0,
     ) -> Trade:
         """Open a new paper trade.
 
@@ -55,15 +56,27 @@ class PaperTradingEngine:
             nfo_symbol: NFO trading symbol (e.g. NIFTY17MAR202622500CE)
                         used for consistent price lookups during exit monitoring.
             num_lots: Number of lots to trade (from risk-based position sizing).
+            instrument_lot_size: Lot size from instrument config (0 = use default).
         """
+        # Prevent duplicate trades on the same option symbol
+        symbol_to_use = nfo_symbol or f"NIFTY {int(signal.strike_price)} {signal.option_type.value}"
+        for t in self.open_trades:
+            if t.symbol == symbol_to_use:
+                logger.warning(
+                    "DUPLICATE BLOCKED: %s already has an open trade — skipping",
+                    symbol_to_use,
+                )
+                return t  # Return existing trade instead of creating a new one
+
         now = datetime.now(_IST)
-        # Use NFO symbol for price tracking; display-friendly name in reason
+        # Use instrument lot size if provided, otherwise fall back to default
+        lot_size = instrument_lot_size if instrument_lot_size > 0 else self.lot_size
         display_name = f"NIFTY {int(signal.strike_price)} {signal.option_type.value}"
         trade = Trade(
             trade_id=str(uuid.uuid4())[:8],
             date=now.strftime("%Y-%m-%d"),
             time=now.strftime("%H:%M:%S"),
-            symbol=nfo_symbol or display_name,
+            symbol=symbol_to_use,
             strike=signal.strike_price,
             option_type=signal.option_type,
             strategy=signal.strategy,
@@ -73,17 +86,19 @@ class PaperTradingEngine:
             target2=decision.target2,
             confidence=decision.confidence_score,
             status=TradeStatus.OPEN,
-            lot_size=self.lot_size * num_lots,
+            lot_size=lot_size * num_lots,
             reason=decision.reason,
         )
         self.open_trades.append(trade)
         logger.info(
-            "TRADE ENTERED: %s | Entry=%.2f | SL=%.2f | T1=%.2f | T2=%.2f",
+            "TRADE ENTERED: %s | Entry=%.2f @%s | SL=%.2f | T1=%.2f | T2=%.2f | LotSize=%d",
             trade.symbol,
             trade.entry_price,
+            trade.time,
             trade.stoploss,
             trade.target1,
             trade.target2,
+            trade.lot_size,
         )
         return trade
 
@@ -109,17 +124,17 @@ class PaperTradingEngine:
             # Check stoploss
             if current_ltp <= trade.stoploss:
                 exit_reason = "stoploss"
-                trade.exit_price = trade.stoploss
+                trade.exit_price = current_ltp
 
             # Check target 2 first (full exit)
             elif current_ltp >= trade.target2:
                 exit_reason = "target2"
-                trade.exit_price = trade.target2
+                trade.exit_price = current_ltp
 
             # Check target 1 (partial — for simplicity, full exit at T1)
             elif current_ltp >= trade.target1:
                 exit_reason = "target1"
-                trade.exit_price = trade.target1
+                trade.exit_price = current_ltp
 
             if exit_reason:
                 self._close_trade(trade, exit_reason)
@@ -142,6 +157,7 @@ class PaperTradingEngine:
         if trade.exit_price is None:
             trade.exit_price = trade.entry_price
 
+        trade.exit_time = datetime.now(_IST).strftime("%H:%M:%S")
         trade.pnl = round(
             (trade.exit_price - trade.entry_price) * trade.lot_size, 2
         )
@@ -152,12 +168,15 @@ class PaperTradingEngine:
         self.closed_trades.append(trade)
 
         logger.info(
-            "TRADE CLOSED [%s]: %s | Entry=%.2f | Exit=%.2f | PnL=%.2f",
+            "TRADE CLOSED [%s]: %s | Entry=%.2f @%s | Exit=%.2f @%s | PnL=%.2f | Lots=%d",
             reason,
             trade.symbol,
             trade.entry_price,
+            trade.time,
             trade.exit_price,
+            trade.exit_time,
             trade.pnl,
+            trade.lot_size,
         )
 
     def get_unrealized_pnl(self, current_prices: dict[str, float]) -> float:

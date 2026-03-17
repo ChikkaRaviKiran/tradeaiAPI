@@ -46,6 +46,7 @@ class TradeLogger:
                         .where(TradeRecord.trade_id == trade.trade_id)
                         .values(
                             exit_price=trade.exit_price,
+                            exit_time=trade.exit_time,
                             pnl=trade.pnl,
                             status=trade.status.value,
                         )
@@ -55,6 +56,7 @@ class TradeLogger:
                         trade_id=trade.trade_id,
                         date=trade.date,
                         time=trade.time,
+                        exit_time=trade.exit_time,
                         symbol=trade.symbol,
                         strike=trade.strike,
                         option_type=trade.option_type.value,
@@ -181,6 +183,7 @@ class TradeLogger:
             trade_id=record.trade_id,
             date=record.date,
             time=record.time,
+            exit_time=record.exit_time,
             symbol=record.symbol,
             strike=record.strike,
             option_type=OptionType(record.option_type),

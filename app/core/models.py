@@ -157,6 +157,7 @@ class Trade(BaseModel):
     instrument: str = "NIFTY"  # Underlying instrument
     date: str = ""
     time: str = ""
+    exit_time: Optional[str] = None
     symbol: str = ""
     strike: float = 0.0
     option_type: OptionType = OptionType.CALL

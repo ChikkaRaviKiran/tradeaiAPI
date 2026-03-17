@@ -509,6 +509,12 @@ class Orchestrator:
                 logger.warning("[%s] Could not fetch option LTP — skipping trade", symbol)
                 return
 
+            logger.info(
+                "[%s] Option LTP fetched: %s %.0f%s = ₹%.2f",
+                symbol, instrument.symbol, best_signal.strike_price,
+                best_signal.option_type.value, option_ltp,
+            )
+
             # Set ATR-based SL/targets
             atr = indicators.atr
             if atr is None or atr <= 0:
@@ -545,8 +551,11 @@ class Orchestrator:
                 decision.entry_price, decision.stoploss
             )
 
-            # 15. Enter trade
-            trade = self.paper_trader.enter_trade(best_signal, decision, nfo_symbol, num_lots=num_lots)
+            # 15. Enter trade (use instrument-specific lot size)
+            trade = self.paper_trader.enter_trade(
+                best_signal, decision, nfo_symbol,
+                num_lots=num_lots, instrument_lot_size=instrument.lot_size,
+            )
             trade.instrument = symbol
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_signal_alert(best_signal, decision)

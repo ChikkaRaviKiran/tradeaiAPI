@@ -34,6 +34,7 @@ class TradeRecord(Base):
     instrument = Column(String(20), nullable=False, default="NIFTY", index=True)
     date = Column(String(10), nullable=False, index=True)
     time = Column(String(8), nullable=False)
+    exit_time = Column(String(8), nullable=True)
     symbol = Column(String(60), nullable=False)
     strike = Column(Float, nullable=False)
     option_type = Column(String(2), nullable=False)
@@ -225,6 +226,7 @@ async def init_db() -> None:
             "ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS instrument VARCHAR(20) DEFAULT 'NIFTY'",
             "ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS price FLOAT",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS instrument VARCHAR(20) DEFAULT 'NIFTY'",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_time VARCHAR(8)",
         ]
         for sql in migrations:
             try:
