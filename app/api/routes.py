@@ -155,16 +155,25 @@ async def get_system_status():
     orch = _state.get("orchestrator")
     snapshot = _state.get("snapshot")
 
-    # Quick DB connectivity check
+    # Quick DB connectivity check (uses its own engine to avoid event-loop
+    # mismatch with the orchestrator thread's loop)
     db_ok = False
     try:
-        from app.db.models import AsyncSessionLocal
         from sqlalchemy import text
-        async with AsyncSessionLocal() as session:
+        from app.db.models import create_new_async_session_factory
+        if not hasattr(get_system_status, "_health_sf"):
+            sf, eng = create_new_async_session_factory()
+            get_system_status._health_sf = sf
+            get_system_status._health_eng = eng
+        async with get_system_status._health_sf() as session:
             await session.execute(text("SELECT 1"))
         db_ok = True
     except Exception as e:
         logger.warning("DB health check failed: %s", e)
+        # Reset so it rebinds to current loop on next call
+        for attr in ("_health_sf", "_health_eng"):
+            if hasattr(get_system_status, attr):
+                delattr(get_system_status, attr)
 
     return {
         "status": "running" if orch and getattr(orch, "running", False) else "stopped",
