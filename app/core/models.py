@@ -172,6 +172,7 @@ class Trade(BaseModel):
     status: TradeStatus = TradeStatus.OPEN
     lot_size: int = 50
     reason: str = ""
+    breakout_level: Optional[float] = None  # Spot level that triggered breakout entry
 
 
 # ── Market Snapshot ───────────────────────────────────────────────────────────
@@ -190,6 +191,7 @@ class MarketSnapshot(BaseModel):
     prev_day_low: Optional[float] = None    # Previous day low — key support
     prev_day_close: Optional[float] = None  # Previous day close — reference level
     is_expiry_day: bool = False             # True if today is this instrument's options expiry
+    htf_trend: Optional[str] = None         # Higher-timeframe (5-min) trend: "bullish", "bearish", "neutral"
 
 
 # ── Alert Item ────────────────────────────────────────────────────────────────

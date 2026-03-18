@@ -133,6 +133,37 @@ class FeatureEngine:
             vwap_is_volume_weighted=(vol_sum > 0),
         )
 
+    def compute_htf_bias(self, df_5min: pd.DataFrame) -> str:
+        """Compute higher-timeframe trend bias from 5-minute candles.
+
+        Uses EMA9/EMA20 alignment and EMA20 slope on the 5-min chart
+        to determine the dominant intraday trend direction.
+
+        Returns: 'bullish', 'bearish', or 'neutral'
+        """
+        if df_5min.empty or len(df_5min) < 12:
+            return "neutral"
+
+        ema9 = ta.trend.ema_indicator(df_5min["close"], window=9)
+        ema20 = ta.trend.ema_indicator(df_5min["close"], window=20)
+
+        last_ema9 = ema9.iloc[-1]
+        last_ema20 = ema20.iloc[-1]
+
+        if pd.isna(last_ema9) or pd.isna(last_ema20):
+            return "neutral"
+
+        # EMA20 slope over last 3 bars for trend momentum
+        ema20_slope = ema20.iloc[-1] - ema20.iloc[-4] if len(ema20) >= 4 else 0
+        if pd.isna(ema20_slope):
+            ema20_slope = 0
+
+        if last_ema9 > last_ema20 and ema20_slope > 0:
+            return "bullish"
+        elif last_ema9 < last_ema20 and ema20_slope < 0:
+            return "bearish"
+        return "neutral"
+
     @staticmethod
     def _compute_vwap(df: pd.DataFrame) -> pd.Series:
         """Compute intraday VWAP.

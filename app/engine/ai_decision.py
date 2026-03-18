@@ -76,6 +76,7 @@ Rules:
 - FII selling > 1000cr is bearish; DII buying > 1000cr supports market
 - Market breadth A/D ratio > 1.5 is bullish, < 0.7 is bearish
 - Apply lessons from past trade patterns mentioned in the intelligence context
+- If htf_trend is provided ("bullish"/"bearish"/"neutral"), it represents the 5-minute chart EMA trend direction. Signals opposing this trend are lower probability — require extra confirmation.
 """
 
 
@@ -170,6 +171,7 @@ class AIDecisionEngine:
                 },
                 "market_structure": {
                     "regime": snapshot.regime.value,
+                    "htf_trend": snapshot.htf_trend,
                 },
                 "options_data": {
                     "pcr": snapshot.options_metrics.pcr,

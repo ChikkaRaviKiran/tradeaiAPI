@@ -107,6 +107,30 @@ def _strategy_compatible_with_regime(strategy: BaseStrategy, regime: MarketRegim
     return regime in allowed_regimes
 
 
+# Breakout level keys per strategy — used for failed breakout detection
+from app.core.models import OptionType, StrategyName as _SN
+
+_BREAKOUT_LEVEL_KEYS: dict[_SN, dict[str, str]] = {
+    _SN.ORB: {"CE": "orh", "PE": "orl"},
+    _SN.RANGE_BREAKOUT: {"CE": "range_high", "PE": "range_low"},
+    _SN.MOMENTUM_BREAKOUT: {"CE": "lookback_high", "PE": "lookback_low"},
+    _SN.BREAKOUT_20D: {"CE": "high_20d", "PE": "low_20d"},
+    _SN.EMA_BREAKOUT: {"CE": "ema50", "PE": "ema50"},
+}
+
+
+def _extract_breakout_level(signal: StrategySignal) -> Optional[float]:
+    """Extract the spot price breakout level from signal details."""
+    keys = _BREAKOUT_LEVEL_KEYS.get(signal.strategy)
+    if keys is None:
+        return None
+    key = keys.get(signal.option_type.value)
+    if key is None:
+        return None
+    level = signal.details.get(key)
+    return float(level) if level is not None else None
+
+
 class Orchestrator:
     """Central trading system controller — multi-instrument aware."""
 
@@ -166,6 +190,8 @@ class Orchestrator:
         self._expiries: dict[str, str] = {}
         # Per-instrument expiry dates (parsed from SmartAPI)  {symbol: date}
         self._expiry_dates: dict[str, object] = {}
+        # Per-instrument higher-timeframe trend bias
+        self._htf_biases: dict[str, str] = {}
         # Backward compat
         # Backward compat
         self.snapshot: Optional[MarketSnapshot] = None
@@ -217,6 +243,7 @@ class Orchestrator:
         self._options_metrics = {}
         self._expiries = {}
         self._expiry_dates = {}
+        self._htf_biases = {}
         self.snapshot = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
@@ -491,6 +518,27 @@ class Orchestrator:
                     fut_df = self.client.candles_to_dataframe(fut_candles)
                     df = self.feature_engine.merge_futures_volume(df, fut_df)
 
+            # 2c. Fetch 5-min candles for multi-timeframe filter (every 5 min)
+            if now.minute % 5 == 0 or symbol not in self._htf_biases:
+                try:
+                    candles_5m = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.client.get_candle_data,
+                            instrument.token, instrument.exchange.value,
+                            "FIVE_MINUTE", from_date, to_date,
+                        ),
+                        timeout=30,
+                    )
+                    df_5m = self.client.candles_to_dataframe(candles_5m)
+                    if not df_5m.empty:
+                        htf_bias = self.feature_engine.compute_htf_bias(df_5m)
+                        self._htf_biases[symbol] = htf_bias
+                        logger.debug("[%s] HTF (5-min) trend: %s", symbol, htf_bias)
+                except asyncio.TimeoutError:
+                    logger.warning("[%s] 5-min candle fetch timed out", symbol)
+                except Exception:
+                    logger.warning("[%s] 5-min candle fetch failed (non-critical)", symbol)
+
             # 3. Feature engineering (on full history for proper indicator warmup)
             df = self.feature_engine.compute_indicators(df, today_date=today_str)
             # Filter to today-only for strategies/snapshot (indicators are already computed)
@@ -548,6 +596,7 @@ class Orchestrator:
                 prev_day_low=prev_day_low,
                 prev_day_close=prev_day_close,
                 is_expiry_day=is_expiry,
+                htf_trend=self._htf_biases.get(symbol),
             )
             self.snapshots[symbol] = snap
             await self.history_logger.save_snapshot(snap)
@@ -590,6 +639,24 @@ class Orchestrator:
                 return
             else:
                 self._consecutive_no_signal = 0
+
+            # 9b. Multi-timeframe filter: skip signals against 5-min trend
+            htf_bias = self._htf_biases.get(symbol, "neutral")
+            if htf_bias != "neutral" and signals:
+                pre_count = len(signals)
+                signals = [
+                    s for s in signals
+                    if not (htf_bias == "bullish" and s.option_type == OptionType.PUT)
+                    and not (htf_bias == "bearish" and s.option_type == OptionType.CALL)
+                ]
+                filtered = pre_count - len(signals)
+                if filtered > 0:
+                    logger.info(
+                        "[%s][Cycle %d] HTF filter removed %d signal(s) against %s trend",
+                        symbol, cycle, filtered, htf_bias,
+                    )
+                if not signals:
+                    return
 
             # 10. Score and filter (with evaluation boost for top-ranked combos)
             adaptive_min = compute_adaptive_min_score(options_metrics, self.global_bias)
@@ -703,6 +770,9 @@ class Orchestrator:
                 num_lots=num_lots, instrument_lot_size=instrument.lot_size,
             )
             trade.instrument = symbol
+
+            # Store breakout level for failed breakout detection
+            trade.breakout_level = _extract_breakout_level(best_signal)
 
             # 15b. Place real order if live trading
             if not settings.paper_trading:
@@ -1061,6 +1131,29 @@ class Orchestrator:
                     ltp = None
                 if ltp:
                     current_prices[trade.symbol] = ltp
+
+        # Failed breakout detection: exit early if spot reverses through breakout level
+        for trade in list(inst_trades):
+            if trade.breakout_level is None:
+                continue
+            if trade.symbol not in current_prices:
+                continue
+            is_call = trade.option_type == OptionType.CALL
+            failed = (is_call and spot_price < trade.breakout_level) or \
+                     (not is_call and spot_price > trade.breakout_level)
+            if failed:
+                trade.exit_price = current_prices[trade.symbol]
+                self.paper_trader._close_trade(trade, "failed_breakout")
+                if not settings.paper_trading:
+                    await self._place_live_exit(instrument, trade)
+                await self.trade_logger.log_trade(trade)
+                await self.alert_manager.send_exit_alert(trade)
+                logger.info(
+                    "[%s] FAILED BREAKOUT EXIT: %s spot=%.2f %s breakout=%.2f | PnL=%.2f",
+                    instrument.symbol, trade.symbol, spot_price,
+                    "below" if is_call else "above", trade.breakout_level,
+                    trade.pnl or 0,
+                )
 
         closed = self.paper_trader.check_exits(current_prices)
         for trade in closed:
