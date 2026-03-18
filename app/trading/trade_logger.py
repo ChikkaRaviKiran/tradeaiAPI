@@ -71,6 +71,7 @@ class TradeLogger:
                         status=trade.status.value,
                         lot_size=trade.lot_size,
                         reason=trade.reason,
+                        instrument=trade.instrument,
                     )
                     session.add(record)
 
@@ -198,4 +199,5 @@ class TradeLogger:
             status=TradeStatus(record.status),
             lot_size=record.lot_size,
             reason=record.reason,
+            instrument=record.instrument,
         )

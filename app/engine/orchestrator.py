@@ -64,6 +64,8 @@ from app.backtest.scheduler import EvaluationScheduler
 from app.ai.pre_market_analyst import PreMarketAnalyst
 from app.ai.insight_manager import InsightManager
 from app.engine.ai_decision import set_ai_insight_manager
+from app.execution.angelone_broker import AngelOneBroker
+from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,7 @@ class Orchestrator:
         self.ai_engine = AIDecisionEngine()
         self.risk_manager = RiskManager()
         self.paper_trader = PaperTradingEngine()
+        self.broker = AngelOneBroker()
         self.trade_logger = TradeLogger()
         self.history_logger = HistoryLogger()
         self.alert_manager = AlertManager()
@@ -291,6 +294,21 @@ class Orchestrator:
             f"Instruments: {', '.join(inst_names)}\n"
             f"Paper trading: {settings.paper_trading}\nCapital: ₹{settings.initial_capital:,.0f}",
         )
+
+        # ── Crash recovery: reload open trades from DB ───────────────────
+        await self._recover_open_trades()
+
+        # Authenticate broker for live trading
+        if not settings.paper_trading:
+            if self.broker.authenticate():
+                logger.info("AngelOneBroker authenticated for live trading")
+            else:
+                logger.error("AngelOneBroker auth failed — falling back to paper trading for safety")
+                await self.alert_manager.send_info(
+                    "BROKER AUTH FAILED",
+                    "Live broker authentication failed. System will NOT place real orders today.\n"
+                    "Paper trading mode active as safety fallback.",
+                )
 
         # ── Pre-market intelligence: AI analysis of all data sources ─────
         try:
@@ -685,6 +703,24 @@ class Orchestrator:
                 num_lots=num_lots, instrument_lot_size=instrument.lot_size,
             )
             trade.instrument = symbol
+
+            # 15b. Place real order if live trading
+            if not settings.paper_trading:
+                order_resp = await self._place_live_order(
+                    instrument, trade, nfo_symbol, OrderSide.BUY,
+                )
+                if not order_resp or order_resp.status.value == "REJECTED":
+                    # Remove from paper tracker if live order failed
+                    if trade in self.paper_trader.open_trades:
+                        self.paper_trader.open_trades.remove(trade)
+                    logger.error("[%s] Live BUY order REJECTED: %s", symbol, order_resp.message if order_resp else "no response")
+                    await self.alert_manager.send_info(
+                        f"ORDER REJECTED — {symbol}",
+                        f"{nfo_symbol}\nError: {order_resp.message if order_resp else 'no response'}",
+                    )
+                    return
+                logger.info("[%s] Live BUY order placed: %s", symbol, order_resp.order_id)
+
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_signal_alert(best_signal, decision)
 
@@ -822,6 +858,112 @@ class Orchestrator:
 
         return instruments
 
+    # ── Live Order Execution ─────────────────────────────────────────────
+
+    async def _place_live_order(
+        self,
+        instrument: InstrumentConfig,
+        trade: "Trade",
+        nfo_symbol: str,
+        side: OrderSide,
+    ):
+        """Place a real order via AngelOneBroker (live trading only)."""
+        token_info = self.client._search_symbol(nfo_symbol)
+        if not token_info:
+            logger.error("Cannot find token for %s — order not placed", nfo_symbol)
+            return None
+
+        request = OrderRequest(
+            instrument=instrument,
+            trading_symbol=token_info.get("tradingsymbol", nfo_symbol),
+            symbol_token=token_info.get("symboltoken", ""),
+            exchange="NFO",
+            side=side,
+            order_type=OrderType.MARKET,
+            product_type=ProductType.INTRADAY,
+            quantity=trade.lot_size,
+            price=0.0,
+            trigger_price=0.0,
+        )
+        try:
+            resp = await asyncio.to_thread(self.broker.place_order, request)
+            return resp
+        except Exception:
+            logger.exception("Live order placement failed for %s", nfo_symbol)
+            return None
+
+    async def _place_live_exit(
+        self,
+        instrument: Optional[InstrumentConfig],
+        trade: "Trade",
+    ) -> None:
+        """Place sell order for an exiting trade (live trading only)."""
+        token_info = self.client._search_symbol(trade.symbol)
+        if not token_info:
+            logger.error("Cannot find token for exit: %s", trade.symbol)
+            return
+        # Resolve instrument config for the order request
+        if instrument is None:
+            inst_sym = getattr(trade, "instrument", "NIFTY")
+            instrument = get_instrument(inst_sym)
+            if instrument is None:
+                from app.core.instruments import NIFTY
+                instrument = NIFTY
+
+        request = OrderRequest(
+            instrument=instrument,
+            trading_symbol=token_info.get("tradingsymbol", trade.symbol),
+            symbol_token=token_info.get("symboltoken", ""),
+            exchange="NFO",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            product_type=ProductType.INTRADAY,
+            quantity=trade.lot_size,
+            price=0.0,
+            trigger_price=0.0,
+        )
+        try:
+            resp = await asyncio.to_thread(self.broker.place_order, request)
+            if resp and resp.status.value != "REJECTED":
+                logger.info("Live SELL order placed for %s: %s", trade.symbol, resp.order_id)
+            else:
+                logger.error("Live SELL order REJECTED for %s: %s", trade.symbol, resp.message if resp else "no response")
+                await self.alert_manager.send_info(
+                    f"EXIT ORDER REJECTED — {trade.symbol}",
+                    f"Failed to close position. Manual intervention needed.\n{resp.message if resp else 'no response'}",
+                )
+        except Exception:
+            logger.exception("Live exit order failed for %s", trade.symbol)
+            await self.alert_manager.send_info(
+                f"EXIT ORDER ERROR — {trade.symbol}",
+                "Exception during exit order placement. Check positions manually.",
+            )
+
+    async def _recover_open_trades(self) -> None:
+        """Recover open trades from DB after a mid-day restart.
+
+        Reloads trades with status='open' for today into the paper trader's
+        open_trades list so exit monitoring continues seamlessly.
+        """
+        try:
+            today_trades = await self.trade_logger.get_today_trades()
+            open_trades = [t for t in today_trades if t.status.value == "open"]
+            if open_trades:
+                for trade in open_trades:
+                    # Avoid duplicates
+                    if not any(t.trade_id == trade.trade_id for t in self.paper_trader.open_trades):
+                        self.paper_trader.open_trades.append(trade)
+                logger.info("Recovered %d open trades from DB", len(open_trades))
+                await self.alert_manager.send_info(
+                    "CRASH RECOVERY",
+                    f"Recovered {len(open_trades)} open trades from database.\n"
+                    + "\n".join(f"  {t.symbol} @ {t.entry_price}" for t in open_trades),
+                )
+            else:
+                logger.info("No open trades to recover from DB")
+        except Exception:
+            logger.exception("Failed to recover open trades from DB")
+
     async def _fetch_option_ltp_for(
         self,
         instrument: InstrumentConfig,
@@ -922,6 +1064,9 @@ class Orchestrator:
 
         closed = self.paper_trader.check_exits(current_prices)
         for trade in closed:
+            # Place live sell order if not paper trading
+            if not settings.paper_trading:
+                await self._place_live_exit(instrument, trade)
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_exit_alert(trade)
 
@@ -1016,6 +1161,8 @@ class Orchestrator:
 
         closed = self.paper_trader.close_all_open(current_prices)
         for trade in closed:
+            if not settings.paper_trading:
+                await self._place_live_exit(None, trade)
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_exit_alert(trade)
 
