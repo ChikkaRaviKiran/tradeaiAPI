@@ -25,6 +25,16 @@ from app.core.models import (
 
 logger = logging.getLogger(__name__)
 
+# Optional: InsightManager reference (set by orchestrator)
+_insight_manager = None
+
+
+def set_ai_insight_manager(manager) -> None:
+    """Set the insight manager for enriching AI prompts."""
+    global _insight_manager
+    _insight_manager = manager
+
+
 SYSTEM_PROMPT = """You are an expert Indian market options trading analyst. You receive real-time market data and a strategy signal with the actual option premium (LTP).
 Your job is to validate the trade signal and provide a final decision.
 
@@ -57,6 +67,10 @@ Rules:
 - Bollinger bands help assess if price is extended — reject if price is at extreme bands without reversal signal
 - Any null indicator means that data point is genuinely unavailable — do not assume a default value
 - Trend strength score: 3=strong uptrend (ema9>20>50>200), 0=strong downtrend
+- If pre-market intelligence data is provided, consider FII/DII flows, market breadth, and news sentiment
+- FII selling > 1000cr is bearish; DII buying > 1000cr supports market
+- Market breadth A/D ratio > 1.5 is bullish, < 0.7 is bearish
+- Apply lessons from past trade patterns mentioned in the intelligence context
 """
 
 
@@ -80,14 +94,27 @@ class AIDecisionEngine:
         """Send signal + market context to AI for validation."""
         try:
             prompt = self._build_prompt(signal, snapshot, score)
+
+            # Append intelligence context if available
+            intelligence_context = ""
+            if _insight_manager:
+                intelligence_context = _insight_manager.get_ai_context_block()
+
             client = self._get_client()
+
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+            if intelligence_context:
+                messages.insert(1, {
+                    "role": "system",
+                    "content": f"Pre-market intelligence:\n{intelligence_context}",
+                })
 
             response = await client.chat.completions.create(
                 model=settings.openai_model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=messages,
                 temperature=0.2,
                 max_tokens=500,
             )

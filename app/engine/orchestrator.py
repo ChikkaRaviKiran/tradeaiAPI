@@ -46,7 +46,7 @@ from app.data.validator import DataValidator
 from app.engine.ai_decision import AIDecisionEngine
 from app.engine.feature_engine import FeatureEngine
 from app.engine.regime_detector import RegimeDetector
-from app.engine.signal_scorer import SignalScorer, MIN_SCORE, compute_adaptive_min_score
+from app.engine.signal_scorer import SignalScorer, MIN_SCORE, compute_adaptive_min_score, set_insight_manager
 from app.strategies.base import BaseStrategy
 from app.strategies.liquidity_sweep import LiquiditySweepStrategy
 from app.strategies.momentum_breakout import MomentumBreakoutStrategy
@@ -61,6 +61,9 @@ from app.trading.paper_trader import PaperTradingEngine
 from app.trading.risk_manager import RiskManager
 from app.trading.trade_logger import TradeLogger
 from app.backtest.scheduler import EvaluationScheduler
+from app.ai.pre_market_analyst import PreMarketAnalyst
+from app.ai.insight_manager import InsightManager
+from app.engine.ai_decision import set_ai_insight_manager
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,12 @@ class Orchestrator:
         self.history_logger = HistoryLogger()
         self.alert_manager = AlertManager()
         self.eval_scheduler = EvaluationScheduler(lookback_days=20)
+        self.pre_market_analyst = PreMarketAnalyst()
+        self.insight_manager = InsightManager(self.pre_market_analyst)
+
+        # Wire insight manager into signal scorer and AI decision engine
+        set_insight_manager(self.insight_manager)
+        set_ai_insight_manager(self.insight_manager)
 
         # Strategies (applied to every instrument)
         self.strategies: list[BaseStrategy] = [
@@ -248,6 +257,33 @@ class Orchestrator:
             f"Paper trading: {settings.paper_trading}\nCapital: ₹{settings.initial_capital:,.0f}",
         )
 
+        # ── Pre-market intelligence: AI analysis of all data sources ─────
+        try:
+            insight = await self.pre_market_analyst.run_analysis()
+            if insight:
+                # Update shared state for API
+                from app.api.routes import get_state
+                state = get_state()
+                state["intelligence"] = insight
+                state["pre_market_analyst"] = self.pre_market_analyst
+
+                modifier = self.insight_manager.get_score_modifier()
+                bias = self.insight_manager.get_market_bias()
+                logger.info(
+                    "Pre-market intelligence: bias=%s, score_modifier=%+d, risk=%s",
+                    bias, modifier, self.insight_manager.get_risk_advice(),
+                )
+
+                # Send Telegram summary
+                summary = insight.get("summary", "Analysis complete")
+                plan = insight.get("trading_plan", "")
+                await self.alert_manager.send_info(
+                    f"PRE-MARKET ANALYSIS — {bias.upper()}",
+                    f"{summary}\n\nPlan: {plan}\nScore modifier: {modifier:+d}",
+                )
+        except Exception:
+            logger.exception("Pre-market intelligence failed (non-critical)")
+
         while self.running:
             now_ist = datetime.now(IST)
             current_time = now_ist.time()
@@ -322,6 +358,8 @@ class Orchestrator:
                 self.snapshot = first
             state["open_trades"] = self.paper_trader.open_trades
             state["snapshots"] = self.snapshots  # All instrument snapshots
+            state["intelligence"] = self.pre_market_analyst.latest_insight
+            state["pre_market_analyst"] = self.pre_market_analyst
 
             # Heartbeat alert every 15 cycles
             if self._consecutive_no_signal > 0 and cycle - self._last_heartbeat_cycle >= 15:
@@ -465,6 +503,11 @@ class Orchestrator:
 
             # 10. Score and filter (with evaluation boost for top-ranked combos)
             adaptive_min = compute_adaptive_min_score(options_metrics, self.global_bias)
+
+            # Apply insight-based score modifier to threshold
+            insight_modifier = self.insight_manager.get_score_modifier()
+            adaptive_min = max(35, adaptive_min + insight_modifier)
+
             best_signal = None
             best_score = 0.0
 
@@ -804,7 +847,7 @@ class Orchestrator:
             await self.alert_manager.send_exit_alert(trade)
 
     async def _fetch_global_data(self) -> None:
-        """Fetch and analyze global market indices."""
+        """Fetch and analyze global market indices, FII/DII, and breadth."""
         try:
             self.global_indices = await fetch_global_indices()
             self.global_bias = compute_global_bias(self.global_indices)
@@ -820,6 +863,28 @@ class Orchestrator:
             ]
         except Exception:
             logger.exception("Error fetching global data")
+
+        # Fetch FII/DII data (non-blocking — don't fail if unavailable)
+        try:
+            from app.data.institutional import fetch_fii_dii_data
+            fii_data = await fetch_fii_dii_data()
+            if fii_data:
+                self.pre_market_analyst._institutional_flow = fii_data
+                logger.info("FII/DII: FII=%+.0fcr DII=%+.0fcr signal=%s",
+                            fii_data.fii_net, fii_data.dii_net, fii_data.signal)
+        except Exception:
+            logger.warning("FII/DII fetch failed (non-critical)")
+
+        # Fetch market breadth (non-blocking)
+        try:
+            from app.data.market_breadth import fetch_market_breadth
+            breadth = await fetch_market_breadth()
+            if breadth:
+                self.pre_market_analyst._market_breadth = breadth
+                logger.info("Breadth: A/D=%.2f signal=%s",
+                            breadth.advance_decline_ratio, breadth.breadth_signal)
+        except Exception:
+            logger.warning("Market breadth fetch failed (non-critical)")
 
     async def _update_options_chain(self, spot_price: float) -> None:
         """Legacy: update options chain for all index instruments."""

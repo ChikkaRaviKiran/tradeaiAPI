@@ -1,12 +1,15 @@
 """Signal scoring system.
 
 Scoring factors (max 100) — every point must come from real market data:
-  Strategy trigger quality:  25  (RSI confirmation, candle strength, breakout margin)
-  Volume confirmation:       20  (NIFTY futures volume OR options ATM volume)
-  VWAP alignment:            15  (only if VWAP is volume-weighted from futures data)
-  Options OI signal:         15  (PCR, OI change — only if real data present)
-  Global bias:               10  (only if real global data fetched)
-  Historical pattern:        15  (EMA alignment incl. EMA200, swing structure, ADX)
+  Strategy trigger quality:  22  (RSI confirmation, candle strength, breakout margin)
+  Volume confirmation:       18  (NIFTY futures volume OR options ATM volume)
+  VWAP alignment:            13  (only if VWAP is volume-weighted from futures data)
+  Options OI signal:         13  (PCR, OI change — only if real data present)
+  Global bias:                8  (only if real global data fetched)
+  Historical pattern:        11  (EMA alignment incl. EMA200, swing structure, ADX)
+  FII/DII institutional:      6  (from pre-market intelligence)
+  Market breadth:              5  (advance/decline + sector strength)
+  News sentiment:              4  (from Telegram channel analysis)
 
 Trade allowed if score >= adaptive threshold.
 No free points. Missing data = 0 points for that factor.
@@ -29,22 +32,34 @@ from app.core.models import (
 
 logger = logging.getLogger(__name__)
 
+# Optional: InsightManager reference (set by orchestrator)
+_insight_manager = None
+
+
+def set_insight_manager(manager) -> None:
+    """Set the insight manager for scoring with intelligence data."""
+    global _insight_manager
+    _insight_manager = manager
+
 MIN_SCORE = 55
 
 
 def compute_adaptive_min_score(options_metrics: OptionsMetrics, global_bias: GlobalBias) -> int:
     """Lower the minimum score threshold when optional data sources are missing.
 
-    Rationale: PCR (15pts) and Global Bias (10pts) are external data sources
-    that may be unavailable. When both are missing, the theoretical max drops
-    from 100 to 75, making 55 unreachable in practice. This adjusts the
-    threshold proportionally so the system can still trade on strong signals.
+    Rationale: PCR (13pts), Global Bias (8pts), FII/DII (6pts), breadth (5pts),
+    and news (4pts) are external data sources that may be unavailable. When
+    several are missing, the theoretical max drops significantly, making 55
+    unreachable in practice. This adjusts the threshold proportionally.
     """
     unavailable_points = 0
     if options_metrics.pcr is None:
-        unavailable_points += 12  # 15pt bucket is empty, reduce threshold by 12
+        unavailable_points += 10  # 13pt bucket is empty, reduce threshold by 10
     if global_bias in (GlobalBias.UNAVAILABLE, GlobalBias.NEUTRAL):
-        unavailable_points += 8  # 10pt bucket yields 0, reduce by 8
+        unavailable_points += 6  # 8pt bucket yields 0, reduce by 6
+    # Intelligence factors carry their own unavailability handling
+    if _insight_manager is None or not _insight_manager.has_insight:
+        unavailable_points += 10  # 15pts (6+5+4) unavailable, reduce by 10
     return max(MIN_SCORE - unavailable_points, 35)  # Floor at 35
 
 
@@ -66,24 +81,34 @@ class SignalScorer:
     ) -> SignalScore:
         """Compute multi-factor score for a strategy signal."""
         scores = SignalScore()
+        is_call = signal.option_type == OptionType.CALL
 
-        # 1. Strategy trigger (25 pts) — earned from signal quality
+        # 1. Strategy trigger (22 pts) — earned from signal quality
         scores.strategy_trigger = self._score_strategy_trigger(signal, df)
 
-        # 2. Volume confirmation (20 pts) — from futures volume or ATM option volume
+        # 2. Volume confirmation (18 pts) — from futures volume or ATM option volume
         scores.volume_confirmation = self._score_volume(signal, df, options_metrics)
 
-        # 3. VWAP alignment (15 pts) — only if real volume-weighted VWAP
+        # 3. VWAP alignment (13 pts) — only if real volume-weighted VWAP
         scores.vwap_alignment = self._score_vwap(signal, df)
 
-        # 4. Options OI signal (15 pts) — only if real OI data
+        # 4. Options OI signal (13 pts) — only if real OI data
         scores.options_oi_signal = self._score_options(signal, options_metrics)
 
-        # 5. Global bias alignment (10 pts) — only if real global data
+        # 5. Global bias alignment (8 pts) — only if real global data
         scores.global_bias_score = self._score_global_bias(signal, global_bias)
 
-        # 6. Historical pattern (15 pts) — from real price/indicator data
+        # 6. Historical pattern (11 pts) — from real price/indicator data
         scores.historical_pattern = self._score_historical(signal, df)
+
+        # 7-9. Intelligence factors from InsightManager
+        fii_score = 0.0
+        breadth_score = 0.0
+        news_score = 0.0
+        if _insight_manager and _insight_manager.has_insight:
+            fii_score = _insight_manager.get_fii_dii_score()
+            breadth_score = _insight_manager.get_breadth_score(is_call)
+            news_score = _insight_manager.get_news_sentiment_score(is_call)
 
         scores.total = (
             scores.strategy_trigger
@@ -92,10 +117,13 @@ class SignalScorer:
             + scores.options_oi_signal
             + scores.global_bias_score
             + scores.historical_pattern
+            + fii_score
+            + breadth_score
+            + news_score
         )
 
         logger.info(
-            "Signal score: %.0f (strat=%.0f vol=%.0f vwap=%.0f oi=%.0f global=%.0f hist=%.0f)",
+            "Signal score: %.0f (strat=%.0f vol=%.0f vwap=%.0f oi=%.0f global=%.0f hist=%.0f fii=%.0f breadth=%.0f news=%.0f)",
             scores.total,
             scores.strategy_trigger,
             scores.volume_confirmation,
@@ -103,17 +131,20 @@ class SignalScorer:
             scores.options_oi_signal,
             scores.global_bias_score,
             scores.historical_pattern,
+            fii_score,
+            breadth_score,
+            news_score,
         )
         return scores
 
     # ── Component Scorers ────────────────────────────────────────────────
 
     def _score_strategy_trigger(self, signal: StrategySignal, df: pd.DataFrame) -> float:
-        """Score based on strategy trigger quality (0–25).
+        """Score based on strategy trigger quality (0–22).
 
         No free base points. Points earned from:
-          - RSI in directional sweet spot (+8)
-          - Strong candle body > 60% of range (+7)
+          - RSI in directional sweet spot (+7)
+          - Strong candle body > 60% of range (+5)
           - Breakout margin / sweep depth from details (+5)
           - MACD histogram confirming direction (+5)
         """
@@ -127,17 +158,17 @@ class SignalScorer:
         if rsi is None or (isinstance(rsi, float) and pd.isna(rsi)):
             return 0  # No RSI = can't evaluate trigger quality
 
-        # RSI directional confirmation (+8)
+        # RSI directional confirmation (+7)
         if signal.option_type == OptionType.CALL and 55 <= rsi <= 70:
-            score += 8
+            score += 7
         elif signal.option_type == OptionType.PUT and 30 <= rsi <= 45:
-            score += 8
+            score += 7
         elif signal.option_type == OptionType.CALL and rsi > 50:
-            score += 4  # Partial credit for positive momentum
+            score += 3  # Partial credit for positive momentum
         elif signal.option_type == OptionType.PUT and rsi < 50:
-            score += 4
+            score += 3
 
-        # Strong candle body (+7)
+        # Strong candle body (+5)
         open_ = last.get("open", 0)
         close = last.get("close", 0)
         high = last.get("high", 0)
@@ -145,9 +176,9 @@ class SignalScorer:
         candle_range = high - low
         body = abs(close - open_)
         if candle_range > 0 and (body / candle_range) > 0.6:
-            score += 7
+            score += 5
         elif candle_range > 0 and (body / candle_range) > 0.4:
-            score += 3  # Partial for decent body
+            score += 2  # Partial for decent body
 
         # Strategy-specific quality metrics from details (+5)
         details = signal.details
@@ -188,12 +219,12 @@ class SignalScorer:
             elif signal.option_type == OptionType.PUT and macd_hist < 0:
                 score += 5
 
-        return min(score, 25.0)
+        return min(score, 22.0)
 
     def _score_volume(
         self, signal: StrategySignal, df: pd.DataFrame, options_metrics: OptionsMetrics,
     ) -> float:
-        """Score based on volume confirmation (0–20).
+        """Score based on volume confirmation (0–18).
 
         Two data sources:
           1. NIFTY Futures volume (merged into df by orchestrator) — preferred
@@ -215,11 +246,11 @@ class SignalScorer:
         if vol > 0 and avg and avg > 0:
             ratio = vol / avg
             if ratio >= 2.0:
-                score = 20
+                score = 18
             elif ratio >= 1.5:
-                score = 15
+                score = 14
             elif ratio >= 1.3:
-                score = 10
+                score = 9
             elif ratio >= 1.0:
                 score = 5
             # Below average volume = 0
@@ -231,17 +262,17 @@ class SignalScorer:
             if self._prev_atm_volume > 0:
                 opt_ratio = atm_vol / self._prev_atm_volume
                 if opt_ratio >= 2.0:
-                    score = 15  # Slightly capped vs futures (less direct)
+                    score = 14  # Slightly capped vs futures (less direct)
                 elif opt_ratio >= 1.5:
-                    score = 12
+                    score = 10
                 elif opt_ratio >= 1.2:
-                    score = 8
+                    score = 7
             else:
                 # First fetch — can't compare, grant partial if volume is substantial
                 if atm_vol > 50000:
-                    score = 8
+                    score = 7
                 elif atm_vol > 20000:
-                    score = 5
+                    score = 4
 
             self._prev_atm_volume = atm_vol
         # Path 3: No volume data (or index data) — infer activity from candle range vs ATR
@@ -262,7 +293,7 @@ class SignalScorer:
         return score
 
     def _score_vwap(self, signal: StrategySignal, df: pd.DataFrame) -> float:
-        """Score based on VWAP alignment (0–15).
+        """Score based on VWAP alignment (0–13).
 
         Full points if VWAP is calculated from real volume data.
         Partial points if price aligns with non-volume-weighted VWAP.
@@ -283,7 +314,7 @@ class SignalScorer:
         has_real_volume = vol_sum > 0
 
         # Score multiplier: full credit with real volume, partial without
-        max_pts = 15 if has_real_volume else 8
+        max_pts = 13 if has_real_volume else 7
 
         if signal.option_type == OptionType.CALL and close > vwap:
             pct_above = (close - vwap) / vwap * 100 if vwap > 0 else 0
@@ -298,7 +329,7 @@ class SignalScorer:
         return 0
 
     def _score_options(self, signal: StrategySignal, metrics: OptionsMetrics) -> float:
-        """Score based on options chain data (0–15).
+        """Score based on options chain data (0–13).
 
         Only awards points if real OI data is present (pcr is not None).
         """
@@ -310,31 +341,31 @@ class SignalScorer:
         if signal.option_type == OptionType.CALL:
             # Bullish: high PCR (more puts written = market makers see support)
             if metrics.pcr > 1.5:
-                score += 8
+                score += 7
             elif metrics.pcr > 1.2:
-                score += 5
+                score += 4
             elif metrics.pcr > 1.0:
                 score += 2
             # OI increasing confirms participation
             if metrics.oi_change > 0:
-                score += 7
+                score += 6
             elif metrics.oi_change == 0:
                 score += 0  # No change, no confirmation
         else:
             # Bearish: low PCR (more calls written = resistance)
             if metrics.pcr < 0.6:
-                score += 8
+                score += 7
             elif metrics.pcr < 0.8:
-                score += 5
+                score += 4
             elif metrics.pcr < 1.0:
                 score += 2
             if metrics.oi_change < 0:
-                score += 7
+                score += 6
 
-        return min(score, 15)
+        return min(score, 13)
 
     def _score_global_bias(self, signal: StrategySignal, bias: GlobalBias) -> float:
-        """Score based on global market bias alignment (0–10).
+        """Score based on global market bias alignment (0–8).
 
         UNAVAILABLE/NEUTRAL = 0 points. Only directional alignment earns points.
         """
@@ -344,15 +375,15 @@ class SignalScorer:
             return 0  # No directional confirmation
 
         if signal.option_type == OptionType.CALL and bias == GlobalBias.BULLISH:
-            return 10
+            return 8
         if signal.option_type == OptionType.PUT and bias == GlobalBias.BEARISH:
-            return 10
+            return 8
         # Signal direction opposes global bias — this is a negative signal
         # but we don't subtract; we just return 0
         return 0
 
     def _score_historical(self, signal: StrategySignal, df: pd.DataFrame) -> float:
-        """Score based on price action and trend structure (0–15).
+        """Score based on price action and trend structure (0–11).
 
         Uses 30-candle lookback for swing structure and EMA trend alignment.
         Includes EMA200 for long-term trend confirmation.
@@ -382,32 +413,32 @@ class SignalScorer:
         has_ema200 = ema200 is not None and not (isinstance(ema200, float) and pd.isna(ema200))
 
         if signal.option_type == OptionType.CALL:
-            # EMA alignment: short > medium > long (+5)
+            # EMA alignment: short > medium > long (+4)
             if has_ema50 and ema9 > ema20 > ema50:
-                score += 5
+                score += 4
             elif ema9 > ema20:
-                score += 3  # Partial credit for short-term alignment
+                score += 2  # Partial credit for short-term alignment
 
-            # Higher lows over lookback — trend structure (+5)
+            # Higher lows over lookback — trend structure (+4)
             lows = recent["low"].values
             n_samples = min(5, len(lows) // 5)
             if n_samples >= 2:
                 step = max(1, len(lows) // n_samples)
                 sampled = [lows[i] for i in range(0, len(lows), step)][:n_samples]
                 if all(sampled[i] <= sampled[i + 1] for i in range(len(sampled) - 1)):
-                    score += 5
+                    score += 4
 
-            # ADX + long-term trend confirmation (+5)
+            # ADX + long-term trend confirmation (+3)
             if adx is not None and not pd.isna(adx) and adx > 18:
-                score += 3
+                score += 2
             if has_ema200 and close > ema200:
-                score += 2  # Extra for being above EMA200
+                score += 1  # Extra for being above EMA200
         else:
             # PUT direction
             if has_ema50 and ema9 < ema20 < ema50:
-                score += 5
+                score += 4
             elif ema9 < ema20:
-                score += 3
+                score += 2
 
             highs = recent["high"].values
             n_samples = min(5, len(highs) // 5)
@@ -415,11 +446,11 @@ class SignalScorer:
                 step = max(1, len(highs) // n_samples)
                 sampled = [highs[i] for i in range(0, len(highs), step)][:n_samples]
                 if all(sampled[i] >= sampled[i + 1] for i in range(len(sampled) - 1)):
-                    score += 5
+                    score += 4
 
             if adx is not None and not pd.isna(adx) and adx > 18:
-                score += 3
-            if has_ema200 and close < ema200:
                 score += 2
+            if has_ema200 and close < ema200:
+                score += 1
 
-        return min(score, 15)
+        return min(score, 11)

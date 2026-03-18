@@ -200,6 +200,48 @@ class StrategyEvalRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class TelegramNewsRecord(Base):
+    """Scraped news from Telegram channel with GPT Vision extraction."""
+
+    __tablename__ = "telegram_news"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(String(10), nullable=False, index=True)
+    message_id = Column(Integer, nullable=True)
+    image_url = Column(Text, nullable=True)
+    extracted_text = Column(Text, nullable=True)
+    symbols = Column(Text, nullable=True)  # comma-separated stock symbols found
+    sentiment = Column(String(20), nullable=True)  # bullish/bearish/neutral
+    sentiment_score = Column(Float, default=0.0)  # -1.0 to 1.0
+    source = Column(String(50), default="daytradertelugu")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DailyAIInsight(Base):
+    """AI-generated daily market insight from pre-market analysis."""
+
+    __tablename__ = "daily_ai_insights"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(String(10), nullable=False, index=True)
+    insight_type = Column(String(30), nullable=False)  # pre_market / mid_day / post_market
+    market_bias = Column(String(20), nullable=True)  # bullish/bearish/neutral
+    confidence = Column(Float, default=0.0)
+    fii_dii_signal = Column(String(20), nullable=True)
+    fii_net = Column(Float, nullable=True)
+    dii_net = Column(Float, nullable=True)
+    breadth_signal = Column(String(20), nullable=True)
+    advance_decline_ratio = Column(Float, nullable=True)
+    news_sentiment = Column(Float, default=0.0)  # avg of news sentiment scores
+    strong_sectors = Column(Text, nullable=True)  # comma-separated
+    weak_sectors = Column(Text, nullable=True)  # comma-separated
+    key_levels = Column(Text, nullable=True)  # JSON string with support/resistance
+    ai_summary = Column(Text, nullable=True)  # GPT-generated summary
+    trading_plan = Column(Text, nullable=True)  # GPT-generated plan
+    raw_data = Column(Text, nullable=True)  # JSON dump of all input data
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 # Async engine
 async_engine = create_async_engine(settings.database_url, echo=False)
 AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
@@ -227,6 +269,8 @@ async def init_db() -> None:
             "ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS price FLOAT",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS instrument VARCHAR(20) DEFAULT 'NIFTY'",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_time VARCHAR(8)",
+            "CREATE INDEX IF NOT EXISTS ix_telegram_news_date ON telegram_news (date)",
+            "CREATE INDEX IF NOT EXISTS ix_daily_ai_insights_date ON daily_ai_insights (date)",
         ]
         for sql in migrations:
             try:

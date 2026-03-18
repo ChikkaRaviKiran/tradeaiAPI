@@ -498,6 +498,126 @@ async def trigger_evaluation():
     return {"message": "Evaluation started", "instruments": [i.symbol for i in instruments]}
 
 
+# ── Market Intelligence ──────────────────────────────────────────────────
+
+@app.get("/api/intelligence")
+async def get_intelligence():
+    """Get current pre-market intelligence and AI insights."""
+    insight = _state.get("intelligence")
+    analyst = _state.get("pre_market_analyst")
+
+    result = {
+        "insight": insight,
+        "has_insight": insight is not None,
+    }
+
+    # Add live FII/DII data
+    if analyst and analyst.institutional_flow:
+        flow = analyst.institutional_flow
+        result["fii_dii"] = {
+            "fii_buy": flow.fii_buy,
+            "fii_sell": flow.fii_sell,
+            "fii_net": flow.fii_net,
+            "dii_buy": flow.dii_buy,
+            "dii_sell": flow.dii_sell,
+            "dii_net": flow.dii_net,
+            "net_institutional": flow.net_institutional,
+            "signal": flow.signal,
+        }
+
+    # Add live market breadth
+    if analyst and analyst.market_breadth:
+        breadth = analyst.market_breadth
+        result["breadth"] = {
+            "total_advancing": breadth.total_advancing,
+            "total_declining": breadth.total_declining,
+            "total_unchanged": breadth.total_unchanged,
+            "advance_decline_ratio": breadth.advance_decline_ratio,
+            "breadth_signal": breadth.breadth_signal,
+            "strong_sectors": breadth.strong_sectors,
+            "weak_sectors": breadth.weak_sectors,
+            "sectors": [
+                {"name": s.name, "change_pct": round(s.change_pct, 2)}
+                for s in breadth.sectors
+            ],
+        }
+
+    return result
+
+
+@app.get("/api/intelligence/news")
+async def get_intelligence_news(days: int = 1):
+    """Get recent Telegram news items."""
+    if days < 1 or days > 30:
+        days = 1
+    from app.data.telegram_news import get_recent_news
+    news = await get_recent_news(days=days)
+    return {"news": news, "count": len(news)}
+
+
+@app.get("/api/intelligence/history")
+async def get_intelligence_history(limit: int = 7):
+    """Get historical AI insights."""
+    if limit < 1 or limit > 90:
+        limit = 7
+    from app.db.models import DailyAIInsight, AsyncSessionLocal
+    from sqlalchemy import select
+    import json as _json
+
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(DailyAIInsight)
+                .order_by(DailyAIInsight.created_at.desc())
+                .limit(limit)
+            )
+            records = result.scalars().all()
+            return [
+                {
+                    "date": r.date,
+                    "insight_type": r.insight_type,
+                    "market_bias": r.market_bias,
+                    "confidence": r.confidence,
+                    "fii_dii_signal": r.fii_dii_signal,
+                    "fii_net": r.fii_net,
+                    "dii_net": r.dii_net,
+                    "breadth_signal": r.breadth_signal,
+                    "advance_decline_ratio": r.advance_decline_ratio,
+                    "news_sentiment": r.news_sentiment,
+                    "strong_sectors": r.strong_sectors,
+                    "weak_sectors": r.weak_sectors,
+                    "ai_summary": r.ai_summary,
+                    "trading_plan": r.trading_plan,
+                    "key_levels": _json.loads(r.key_levels) if r.key_levels else {},
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in records
+            ]
+    except Exception:
+        logger.exception("Error fetching intelligence history")
+        return []
+
+
+@app.post("/api/intelligence/refresh")
+async def refresh_intelligence():
+    """Trigger a fresh pre-market intelligence analysis."""
+    import asyncio
+    analyst = _state.get("pre_market_analyst")
+    if analyst is None:
+        raise HTTPException(status_code=503, detail="Pre-market analyst not initialized")
+
+    async def _run():
+        try:
+            insight = await analyst.run_analysis()
+            if insight:
+                _state["intelligence"] = insight
+        except Exception:
+            logger.exception("Intelligence refresh failed")
+
+    asyncio.create_task(_run())
+    return {"message": "Intelligence refresh started"}
+
+
 @app.get("/api/evaluate/status")
 async def get_evaluation_status():
     """Get current evaluation run status — used by frontend to poll progress."""
