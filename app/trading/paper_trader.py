@@ -105,6 +105,9 @@ class PaperTradingEngine:
     def check_exits(self, current_prices: dict[str, float]) -> list[Trade]:
         """Check all open trades against current prices for exit conditions.
 
+        Includes trailing stoploss: once price moves 50% toward T1, SL moves to
+        breakeven. After that, SL trails at 40% of the profit from entry.
+
         Args:
             current_prices: Symbol → current LTP mapping.
 
@@ -118,6 +121,22 @@ class PaperTradingEngine:
             current_ltp = current_prices.get(symbol_key)
             if current_ltp is None:
                 continue
+
+            # Trailing stoploss logic
+            move_to_t1 = trade.target1 - trade.entry_price
+            current_profit = current_ltp - trade.entry_price
+
+            if move_to_t1 > 0 and current_profit > 0:
+                # Once price has moved 50% toward T1, move SL to breakeven
+                if current_profit >= move_to_t1 * 0.5:
+                    breakeven_sl = trade.entry_price + (current_profit * 0.4)  # Trail at 40% of profit
+                    new_sl = max(trade.entry_price, breakeven_sl)  # Never below breakeven
+                    if new_sl > trade.stoploss:
+                        logger.debug(
+                            "TRAILING SL: %s | Old=%.2f | New=%.2f | LTP=%.2f",
+                            trade.symbol, trade.stoploss, new_sl, current_ltp,
+                        )
+                        trade.stoploss = round(new_sl, 2)
 
             exit_reason = None
 

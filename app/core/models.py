@@ -186,6 +186,10 @@ class MarketSnapshot(BaseModel):
     indicators: TechnicalIndicators = Field(default_factory=TechnicalIndicators)
     options_metrics: OptionsMetrics = Field(default_factory=OptionsMetrics)
     timestamp: datetime = Field(default_factory=datetime.now)
+    prev_day_high: Optional[float] = None   # Previous day high — key resistance
+    prev_day_low: Optional[float] = None    # Previous day low — key support
+    prev_day_close: Optional[float] = None  # Previous day close — reference level
+    is_expiry_day: bool = False             # True if today is this instrument's options expiry
 
 
 # ── Alert Item ────────────────────────────────────────────────────────────────

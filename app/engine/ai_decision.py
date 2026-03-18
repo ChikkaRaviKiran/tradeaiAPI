@@ -50,9 +50,9 @@ You must respond ONLY with a valid JSON object (no markdown, no extra text) in t
 }
 
 Rules:
-- Only approve trades with confidence >= 65 (lowered from 70 to be less conservative)
+- Only approve trades with confidence >= 70
 - Consider market regime, volatility, and time of day
-- Be realistic — a good setup with 2-3 confirmations should be approved, don't need perfection
+- A good setup needs 3+ confirmations — don't approve marginal setups
 - entry_price, stoploss, target1, target2 are all OPTION PREMIUM values (not NIFTY spot)
 - The signal includes ATR-based suggested SL/targets — evaluate whether they are reasonable given the ATR value
 - Use the ATR value to judge if SL is too tight or too wide for current volatility
@@ -62,8 +62,13 @@ Rules:
 - EMA200 provides long-term trend context — price above EMA200 favors CALL, below favors PUT
 - vwap_is_volume_weighted indicates if VWAP is computed from real futures volume (true) or just price average (false)
 - Consider global market bias — if "unavailable", ignore global context (don't reject because of it)
-- Avoid trades in last 20 minutes of market (after 15:00)
-- Avoid trades when regime is "insufficient_data" — not enough market data yet
+- REJECT trades after 14:30 — last hour has highest chop/reversal rate
+- REJECT when regime is "insufficient_data" — not enough market data yet
+- REJECT when price is within 0.1% of previous day high/low — these are reversal zones
+- Be extra cautious on expiry days (is_expiry_day=true) — gamma risk increases sharply, pin risk near ATM strikes
+- prev_day_high, prev_day_low are key support/resistance levels — price near these levels often reverses
+- If spot is within 0.15% of prev_day_high for CALL or prev_day_low for PUT, be cautious (reversal zone)
+- prev_day_close is the reference — opening gap direction matters (gap up favors CALL momentum, gap down favors PUT)
 - Bollinger bands help assess if price is extended — reject if price is at extreme bands without reversal signal
 - Any null indicator means that data point is genuinely unavailable — do not assume a default value
 - Trend strength score: 3=strong uptrend (ema9>20>50>200), 0=strong downtrend
@@ -145,6 +150,9 @@ class AIDecisionEngine:
                     "vwap": snapshot.vwap,
                     "vwap_is_volume_weighted": snapshot.indicators.vwap_is_volume_weighted,
                     "timestamp": now.strftime("%H:%M:%S"),
+                    "prev_day_high": snapshot.prev_day_high,
+                    "prev_day_low": snapshot.prev_day_low,
+                    "prev_day_close": snapshot.prev_day_close,
                 },
                 "technical_indicators": {
                     "ema9": snapshot.indicators.ema9,
@@ -191,6 +199,8 @@ class AIDecisionEngine:
                 "time_context": {
                     "current_time": now.strftime("%H:%M"),
                     "minutes_to_close": max(0, (15 * 60 + 30) - (now.hour * 60 + now.minute)),
+                    "is_expiry_day": snapshot.is_expiry_day,  # from real SmartAPI expiry data
+                    "day_of_week": now.strftime("%A"),
                 },
             },
             indent=2,

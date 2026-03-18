@@ -39,12 +39,13 @@ class FeatureEngine:
         df["ema9"] = ta.trend.ema_indicator(df["close"], window=9)
         df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
         df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
-        # EMA200 — use available candles; will be NaN until 200 candles are available
+        # EMA200 — only reliable with 200+ candles; mark as NaN otherwise
         if len(df) >= 200:
             df["ema200"] = ta.trend.ema_indicator(df["close"], window=200)
         else:
-            # Compute with available data using min_periods
-            df["ema200"] = df["close"].ewm(span=200, min_periods=min(50, len(df)), adjust=False).mean()
+            # Not enough data for stable EMA200 — leave as NaN
+            # Strategies and scorers will see None and skip EMA200 checks
+            df["ema200"] = float("nan")
 
         # VWAP (intraday only — reset each day)
         if today_date:

@@ -25,7 +25,7 @@ class RegimeDetector:
     ADX_RANGE_THRESHOLD = 20          # Raised from 18 — more forgiving range detection
     RANGE_PCT_THRESHOLD = 0.50        # Raised from 0.35% — NIFTY ranges can be wider
     RANGE_LOOKBACK = 60
-    MIN_CANDLES = 5                   # Allow early regime detection with partial indicators
+    MIN_CANDLES = 20                  # Need 20+ candles for reliable regime detection
 
     def detect(self, df: pd.DataFrame, vix_rising: bool = False) -> MarketRegime:
         """Determine market regime from the latest indicator DataFrame."""

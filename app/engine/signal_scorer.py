@@ -41,26 +41,49 @@ def set_insight_manager(manager) -> None:
     global _insight_manager
     _insight_manager = manager
 
-MIN_SCORE = 55
+MIN_SCORE = 60  # Raised from 55 — require stronger confirmation
+
+# Session-locked threshold: computed once per day, not per-cycle
+_session_min_score: int | None = None
+
+
+def lock_session_threshold(options_available: bool, global_available: bool, intelligence_available: bool) -> int:
+    """Lock the adaptive threshold once at session start, not per-cycle.
+
+    Called once during pre-market setup. The threshold stays constant for the
+    entire trading day so the same signal quality is required regardless of
+    mid-day data fetch failures.
+    """
+    global _session_min_score
+    unavailable_points = 0
+    if not options_available:
+        unavailable_points += 10
+    if not global_available:
+        unavailable_points += 6
+    if not intelligence_available:
+        unavailable_points += 10
+    _session_min_score = max(MIN_SCORE - unavailable_points, 40)  # Floor at 40 (raised from 35)
+    return _session_min_score
 
 
 def compute_adaptive_min_score(options_metrics: OptionsMetrics, global_bias: GlobalBias) -> int:
-    """Lower the minimum score threshold when optional data sources are missing.
+    """Return the session-locked threshold, or compute a conservative one.
 
-    Rationale: PCR (13pts), Global Bias (8pts), FII/DII (6pts), breadth (5pts),
-    and news (4pts) are external data sources that may be unavailable. When
-    several are missing, the theoretical max drops significantly, making 55
-    unreachable in practice. This adjusts the threshold proportionally.
+    If lock_session_threshold() was called, always returns that locked value.
+    Otherwise falls back to per-cycle computation (backward compat).
     """
+    if _session_min_score is not None:
+        return _session_min_score
+
+    # Fallback: per-cycle computation (only if session lock wasn't called)
     unavailable_points = 0
     if options_metrics.pcr is None:
-        unavailable_points += 10  # 13pt bucket is empty, reduce threshold by 10
+        unavailable_points += 10
     if global_bias in (GlobalBias.UNAVAILABLE, GlobalBias.NEUTRAL):
-        unavailable_points += 6  # 8pt bucket yields 0, reduce by 6
-    # Intelligence factors carry their own unavailability handling
+        unavailable_points += 6
     if _insight_manager is None or not _insight_manager.has_insight:
-        unavailable_points += 10  # 15pts (6+5+4) unavailable, reduce by 10
-    return max(MIN_SCORE - unavailable_points, 35)  # Floor at 35
+        unavailable_points += 10
+    return max(MIN_SCORE - unavailable_points, 40)  # Floor at 40
 
 
 class SignalScorer:
@@ -163,12 +186,9 @@ class SignalScorer:
             score += 7
         elif signal.option_type == OptionType.PUT and 30 <= rsi <= 45:
             score += 7
-        elif signal.option_type == OptionType.CALL and rsi > 50:
-            score += 3  # Partial credit for positive momentum
-        elif signal.option_type == OptionType.PUT and rsi < 50:
-            score += 3
+        # No partial credit — RSI must be in the sweet spot to earn points
 
-        # Strong candle body (+5)
+        # Strong candle body (+5) — at least 50% body required
         open_ = last.get("open", 0)
         close = last.get("close", 0)
         high = last.get("high", 0)
@@ -177,8 +197,8 @@ class SignalScorer:
         body = abs(close - open_)
         if candle_range > 0 and (body / candle_range) > 0.6:
             score += 5
-        elif candle_range > 0 and (body / candle_range) > 0.4:
-            score += 2  # Partial for decent body
+        elif candle_range > 0 and (body / candle_range) > 0.5:
+            score += 3
 
         # Strategy-specific quality metrics from details (+5)
         details = signal.details
@@ -276,6 +296,7 @@ class SignalScorer:
 
             self._prev_atm_volume = atm_vol
         # Path 3: No volume data (or index data) — infer activity from candle range vs ATR
+        # CAPPED at 6pts: ATR proxy is less reliable than real volume
         if score == 0:
             atr = last.get("atr")
             high = last.get("high", 0)
@@ -284,11 +305,11 @@ class SignalScorer:
             if atr and atr > 0 and candle_range > 0:
                 range_ratio = candle_range / atr
                 if range_ratio >= 1.5:
-                    score = 10  # Strong move relative to ATR
+                    score = 6  # Capped: ATR proxy doesn't confirm real participation
                 elif range_ratio >= 1.0:
-                    score = 6
+                    score = 4
                 elif range_ratio >= 0.7:
-                    score = 3
+                    score = 2
 
         return score
 
@@ -313,8 +334,8 @@ class SignalScorer:
         vol_sum = df["volume"].sum() if "volume" in df.columns else 0
         has_real_volume = vol_sum > 0
 
-        # Score multiplier: full credit with real volume, partial without
-        max_pts = 13 if has_real_volume else 7
+        # Score multiplier: full credit with real volume, much less without
+        max_pts = 13 if has_real_volume else 4  # Reduced from 7: fake VWAP shouldn't earn much
 
         if signal.option_type == OptionType.CALL and close > vwap:
             pct_above = (close - vwap) / vwap * 100 if vwap > 0 else 0
@@ -379,7 +400,10 @@ class SignalScorer:
         if signal.option_type == OptionType.PUT and bias == GlobalBias.BEARISH:
             return 8
         # Signal direction opposes global bias — this is a negative signal
-        # but we don't subtract; we just return 0
+        if signal.option_type == OptionType.CALL and bias == GlobalBias.BEARISH:
+            return -3  # Penalty for trading against global trend
+        if signal.option_type == OptionType.PUT and bias == GlobalBias.BULLISH:
+            return -3
         return 0
 
     def _score_historical(self, signal: StrategySignal, df: pd.DataFrame) -> float:

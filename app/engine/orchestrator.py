@@ -46,7 +46,7 @@ from app.data.validator import DataValidator
 from app.engine.ai_decision import AIDecisionEngine
 from app.engine.feature_engine import FeatureEngine
 from app.engine.regime_detector import RegimeDetector
-from app.engine.signal_scorer import SignalScorer, MIN_SCORE, compute_adaptive_min_score, set_insight_manager
+from app.engine.signal_scorer import SignalScorer, MIN_SCORE, compute_adaptive_min_score, set_insight_manager, lock_session_threshold
 from app.strategies.base import BaseStrategy
 from app.strategies.liquidity_sweep import LiquiditySweepStrategy
 from app.strategies.momentum_breakout import MomentumBreakoutStrategy
@@ -75,8 +75,34 @@ PRE_CLOSE = dtime(15, 20)
 REPORT_TIME = dtime(15, 30)
 GLOBAL_FETCH_TIME = dtime(9, 0)
 LOAD_TIME = dtime(8, 45)
+NO_NEW_ENTRY_AFTER = dtime(14, 30)  # No new trades in last hour — high chop zone
+MIN_CANDLES_FOR_TRADING = 30  # Need at least 30 candles (30 min) before first trade
 
 LOOP_INTERVAL_SECONDS = 60  # 1-minute analysis cycle
+
+# Regime-strategy compatibility map
+# Strategies not listed here are allowed in all regimes
+_REGIME_STRATEGY_COMPAT: dict[str, set[MarketRegime]] = {
+    "ORBStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
+    "MomentumBreakoutStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
+    "EMABreakoutStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
+    "Breakout20DStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
+    "RangeBreakoutStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.LOW_VOLATILITY, MarketRegime.TRENDING},
+    "VWAPReclaimStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.LOW_VOLATILITY, MarketRegime.TRENDING},
+    "TrendPullbackStrategy": {MarketRegime.TRENDING, MarketRegime.LOW_VOLATILITY},
+    "LiquiditySweepStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.HIGH_VOLATILITY},
+}
+
+
+def _strategy_compatible_with_regime(strategy: BaseStrategy, regime: MarketRegime) -> bool:
+    """Check if a strategy should run in the current market regime."""
+    if regime == MarketRegime.INSUFFICIENT_DATA:
+        return False  # Never trade without regime data
+    class_name = type(strategy).__name__
+    allowed_regimes = _REGIME_STRATEGY_COMPAT.get(class_name)
+    if allowed_regimes is None:
+        return True  # Not in map = allowed everywhere
+    return regime in allowed_regimes
 
 
 class Orchestrator:
@@ -135,6 +161,8 @@ class Orchestrator:
         self._options_metrics: dict[str, OptionsMetrics] = {}
         # Per-instrument expiry  {symbol: str}
         self._expiries: dict[str, str] = {}
+        # Per-instrument expiry dates (parsed from SmartAPI)  {symbol: date}
+        self._expiry_dates: dict[str, object] = {}
         # Backward compat
         # Backward compat
         self.snapshot: Optional[MarketSnapshot] = None
@@ -185,6 +213,7 @@ class Orchestrator:
         self.snapshots = {}
         self._options_metrics = {}
         self._expiries = {}
+        self._expiry_dates = {}
         self.snapshot = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
@@ -232,15 +261,21 @@ class Orchestrator:
             await self.alert_manager.send_info("AUTH FAILED", "AngelOne authentication failed. Check credentials.")
             return
 
-        # Determine weekly/monthly expiry for each active instrument
+        # Determine weekly/monthly expiry for each active instrument (from SmartAPI)
         for inst in self._active_instruments:
             inst_name = inst.option_symbol_prefix or inst.symbol
             expiry = self.client.get_nearest_weekly_expiry(instrument_name=inst_name)
-            if not expiry and inst.is_index:
-                expiry = self._get_weekly_expiry_fallback()
             if expiry:
                 self._expiries[inst.symbol] = expiry
-                logger.info("Weekly expiry for %s: %s", inst.symbol, expiry)
+                # Parse DDMMMYY (e.g. "18MAR26") to actual date for expiry day comparison
+                try:
+                    from datetime import date as date_type
+                    parsed = datetime.strptime(expiry, "%d%b%y").date()
+                    self._expiry_dates[inst.symbol] = parsed
+                    logger.info("Weekly expiry for %s: %s (%s)", inst.symbol, expiry, parsed)
+                except ValueError:
+                    logger.warning("Could not parse expiry date '%s' for %s", expiry, inst.symbol)
+                    logger.info("Weekly expiry for %s: %s", inst.symbol, expiry)
             else:
                 logger.warning("No expiry found for %s — options data unavailable", inst.symbol)
 
@@ -283,6 +318,15 @@ class Orchestrator:
                 )
         except Exception:
             logger.exception("Pre-market intelligence failed (non-critical)")
+
+        # Lock the adaptive threshold for the entire session
+        # Based on what data sources are actually available right now
+        session_threshold = lock_session_threshold(
+            options_available=bool(self._expiries),  # Have expiry = can fetch options
+            global_available=(self.global_bias != GlobalBias.UNAVAILABLE),
+            intelligence_available=self.insight_manager.has_insight,
+        )
+        logger.info("Session threshold locked at: %d", session_threshold)
 
         while self.running:
             now_ist = datetime.now(IST)
@@ -436,6 +480,13 @@ class Orchestrator:
             if df_today.empty:
                 logger.warning("[%s][Cycle %d] No today candles after filtering", symbol, cycle)
                 return
+
+            # 3b. Compute previous day high/low/close for support/resistance context
+            df_prev = df[df.index.strftime("%Y-%m-%d") != today_str]
+            prev_day_high = float(df_prev["high"].max()) if not df_prev.empty else None
+            prev_day_low = float(df_prev["low"].min()) if not df_prev.empty else None
+            prev_day_close = float(df_prev.iloc[-1]["close"]) if not df_prev.empty else None
+
             indicators = self.feature_engine.get_latest_indicators(df_today)
             spot_price = df_today.iloc[-1]["close"] if not df_today.empty else 0
 
@@ -461,6 +512,10 @@ class Orchestrator:
             # Use NIFTY price from existing NIFTY snapshot for non-NIFTY instruments
             nifty_snap = self.snapshots.get("NIFTY")
             nifty_price = spot_price if symbol == "NIFTY" else (nifty_snap.nifty_price if nifty_snap else 0)
+            # Check if today is expiry day for this instrument (from real SmartAPI data)
+            expiry_date = self._expiry_dates.get(symbol)
+            is_expiry = (expiry_date == now.date()) if expiry_date else False
+
             snap = MarketSnapshot(
                 instrument=symbol,
                 price=spot_price,
@@ -471,6 +526,10 @@ class Orchestrator:
                 indicators=indicators,
                 options_metrics=options_metrics,
                 timestamp=now,
+                prev_day_high=prev_day_high,
+                prev_day_low=prev_day_low,
+                prev_day_close=prev_day_close,
+                is_expiry_day=is_expiry,
             )
             self.snapshots[symbol] = snap
             await self.history_logger.save_snapshot(snap)
@@ -478,7 +537,17 @@ class Orchestrator:
             # 7. Check exits on open trades for this instrument
             await self._check_trade_exits_for(instrument, spot_price)
 
-            # 8. Global risk check
+            # 8. Time-of-day circuit breaker — no new entries after 14:30
+            if now.time() >= NO_NEW_ENTRY_AFTER:
+                logger.debug("[%s][Cycle %d] After %s — no new entries", symbol, cycle, NO_NEW_ENTRY_AFTER)
+                return
+
+            # 8b. Minimum candles check — need 30 min of data for reliable indicators
+            if len(df_today) < MIN_CANDLES_FOR_TRADING:
+                logger.debug("[%s][Cycle %d] Only %d candles — waiting for %d", symbol, cycle, len(df_today), MIN_CANDLES_FOR_TRADING)
+                return
+
+            # 8c. Global risk check
             if not self.risk_manager.can_trade(
                 self.paper_trader.all_today_trades,
                 open_count=len(self.paper_trader.open_trades),
@@ -486,10 +555,13 @@ class Orchestrator:
                 logger.info("[%s][Cycle %d] Risk limits reached", symbol, cycle)
                 return
 
-            # 9. Run strategies (use today-only data for strategy evaluation)
+            # 9. Run strategies — filtered by market regime
             strategies_to_run = self._instrument_strategies.get(symbol, self.strategies)
             signals: list[StrategySignal] = []
             for strategy in strategies_to_run:
+                # Regime-strategy filtering: skip strategies that don't fit current regime
+                if not _strategy_compatible_with_regime(strategy, regime):
+                    continue
                 signal = strategy.evaluate(df_today, options_metrics, spot_price)
                 if signal:
                     signal.instrument = symbol
@@ -507,6 +579,13 @@ class Orchestrator:
             # Apply insight-based score modifier to threshold
             insight_modifier = self.insight_manager.get_score_modifier()
             adaptive_min = max(35, adaptive_min + insight_modifier)
+
+            # Expiry day awareness: use real expiry date from SmartAPI
+            # Raise threshold by 5 to require stronger confirmation on expiry days
+            expiry_dt = self._expiry_dates.get(symbol)
+            if expiry_dt and expiry_dt == now.date():
+                adaptive_min += 5
+                logger.debug("[%s] Expiry day (%s) — threshold raised to %d", symbol, expiry_dt, adaptive_min)
 
             best_signal = None
             best_score = 0.0
@@ -577,7 +656,7 @@ class Orchestrator:
             # 12. AI validation
             decision = await self.ai_engine.evaluate(best_signal, snap, best_score)
 
-            if not decision.trade_decision or decision.confidence_score < 65:
+            if not decision.trade_decision or decision.confidence_score < 70:
                 logger.info(
                     "[%s] AI rejected (confidence=%.0f%%): %s",
                     symbol, decision.confidence_score, decision.reason,
@@ -1021,16 +1100,7 @@ class Orchestrator:
         except Exception:
             logger.exception("Error in post-market strategy evaluation")
 
-    @staticmethod
-    def _get_weekly_expiry_fallback() -> str:
-        """Fallback: estimate weekly expiry if instrument master is unavailable.
-
-        Tries Wednesday first (current NIFTY weekly expiry day), then Thursday.
-        """
-        today = datetime.now(IST)
-        # NIFTY weekly expiry moved to Wednesday
-        days_until_wed = (2 - today.weekday()) % 7
-        if days_until_wed == 0 and today.hour >= 16:
-            days_until_wed = 7
-        expiry_date = today + timedelta(days=days_until_wed)
-        return expiry_date.strftime("%d%b%y").upper()
+    # NOTE: No hardcoded expiry day fallback — expiry dates come exclusively from
+    # SmartAPI instrument master via get_nearest_weekly_expiry(). If the instrument
+    # master is unavailable, options data is simply marked as unavailable for that
+    # instrument (no guessing).
