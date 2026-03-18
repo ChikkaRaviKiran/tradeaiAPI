@@ -132,13 +132,30 @@ async def get_today_performance():
 # ── Alerts (UI) ──────────────────────────────────────────────────────────
 
 @app.get("/api/alerts", response_model=list[AlertItem])
-async def get_alerts(limit: int = 50):
-    """Get recent alerts for the dashboard."""
+async def get_alerts(limit: int = 50, target_date: str | None = None):
+    """Get alerts for the dashboard, filtered by date (defaults to today)."""
     from app.alerts.alert_manager import alert_store
 
     if limit < 1 or limit > 200:
         limit = 50
-    return alert_store.get_recent(limit)
+
+    # Determine filter date (default = today IST)
+    filter_date = target_date or datetime.now(_IST).strftime("%Y-%m-%d")
+
+    # Try in-memory alerts first
+    all_alerts = alert_store.get_all()
+    filtered = [
+        a for a in all_alerts
+        if a.timestamp and a.timestamp.strftime("%Y-%m-%d") == filter_date
+    ][:limit]
+
+    # If no in-memory alerts for requested date, try DB
+    if not filtered and target_date:
+        db_alerts = await history_logger.get_alerts_by_date(filter_date)
+        if db_alerts:
+            return db_alerts[:limit]
+
+    return filtered
 
 
 # ── System Control ───────────────────────────────────────────────────────

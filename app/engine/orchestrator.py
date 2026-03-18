@@ -142,6 +142,9 @@ class Orchestrator:
         except Exception:
             logger.warning("Could not load previous evaluation from DB")
 
+        # Start auto-evaluation scheduler (runs daily if not already evaluated)
+        self.eval_scheduler.start_auto_schedule(get_enabled_instruments)
+
         # Resolve instruments (auto-select or config)
         self._active_instruments = self._resolve_instruments()
         inst_names = [i.symbol for i in self._active_instruments]
@@ -417,10 +420,13 @@ class Orchestrator:
             regime = self.regime_detector.detect(df)
 
             # 6. Build market snapshot (use today's data)
+            # Use NIFTY price from existing NIFTY snapshot for non-NIFTY instruments
+            nifty_snap = self.snapshots.get("NIFTY")
+            nifty_price = spot_price if symbol == "NIFTY" else (nifty_snap.nifty_price if nifty_snap else 0)
             snap = MarketSnapshot(
                 instrument=symbol,
                 price=spot_price,
-                nifty_price=spot_price if symbol == "NIFTY" else 0,
+                nifty_price=nifty_price,
                 vwap=indicators.vwap,
                 regime=regime,
                 global_bias=self.global_bias,

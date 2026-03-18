@@ -1,13 +1,14 @@
 """Evaluation scheduler — runs strategy evaluation post-market or on-demand.
 
 Stores results to DB and makes them available via API for next-day planning.
+Auto-evaluates daily at a configured time if not already run.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
 
@@ -145,6 +146,44 @@ class EvaluationScheduler:
 
         except Exception:
             logger.exception("Error saving evaluation to DB")
+
+    def start_auto_schedule(self, instruments_resolver) -> None:
+        """Start background task that auto-runs evaluation daily.
+
+        Args:
+            instruments_resolver: callable returning list[InstrumentConfig]
+        """
+        self._instruments_resolver = instruments_resolver
+        self._auto_task = asyncio.ensure_future(self._auto_evaluate_loop())
+        logger.info("Auto-evaluation scheduler started")
+
+    async def _auto_evaluate_loop(self) -> None:
+        """Background loop: runs evaluation once per day if not already done today."""
+        while True:
+            try:
+                now = datetime.now(_IST)
+                today_str = now.strftime("%Y-%m-%d")
+
+                # Check if evaluation already ran today
+                already_ran = False
+                if self._latest_report and self._latest_report.eval_date == today_str:
+                    already_ran = True
+
+                if not already_ran and not self._running:
+                    instruments = self._instruments_resolver()
+                    if instruments:
+                        logger.info("Auto-evaluation: running for %d instruments", len(instruments))
+                        await self.run_evaluation(instruments)
+                    else:
+                        logger.warning("Auto-evaluation: no instruments available")
+
+                # Sleep until next check — every 6 hours
+                await asyncio.sleep(6 * 3600)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error in auto-evaluation loop")
+                await asyncio.sleep(3600)  # retry in 1 hour
 
     async def load_latest_from_db(self) -> list[StrategyRecommendation]:
         """Load the most recent evaluation from DB (for cold starts)."""
