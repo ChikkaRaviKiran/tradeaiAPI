@@ -103,6 +103,7 @@ class MarketSnapshotRecord(Base):
     call_oi_cluster = Column(Float, nullable=True)
     put_oi_cluster = Column(Float, nullable=True)
     oi_change = Column(Integer, default=0)
+    htf_trend = Column(String(10), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -269,6 +270,7 @@ async def init_db() -> None:
             "ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS price FLOAT",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS instrument VARCHAR(20) DEFAULT 'NIFTY'",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_time VARCHAR(8)",
+            "ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS htf_trend VARCHAR(10)",
             "CREATE INDEX IF NOT EXISTS ix_telegram_news_date ON telegram_news (date)",
             "CREATE INDEX IF NOT EXISTS ix_daily_ai_insights_date ON daily_ai_insights (date)",
         ]

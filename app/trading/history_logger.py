@@ -80,6 +80,7 @@ class HistoryLogger:
                 call_oi_cluster=snapshot.options_metrics.call_oi_cluster,
                 put_oi_cluster=snapshot.options_metrics.put_oi_cluster,
                 oi_change=snapshot.options_metrics.oi_change,
+                htf_trend=snapshot.htf_trend,
             )
             SessionLocal = _get_session_factory()
             async with SessionLocal() as session:
@@ -276,6 +277,7 @@ class HistoryLogger:
             "call_oi_cluster": r.call_oi_cluster,
             "put_oi_cluster": r.put_oi_cluster,
             "oi_change": r.oi_change,
+            "htf_trend": r.htf_trend,
         }
 
     def _alert_to_dict(self, r: AlertRecord) -> dict:
