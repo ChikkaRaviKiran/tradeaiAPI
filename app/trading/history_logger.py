@@ -312,6 +312,10 @@ class HistoryLogger:
         }
 
     def _alert_to_dict(self, r: AlertRecord) -> dict:
+        # created_at is stored as naive IST — append +05:30 so browsers parse correctly
+        created_str = None
+        if r.created_at:
+            created_str = r.created_at.isoformat() + "+05:30" if not r.created_at.tzinfo else r.created_at.isoformat()
         return {
             "id": r.id,
             "date": r.date,
@@ -321,5 +325,5 @@ class HistoryLogger:
             "trade_id": r.trade_id,
             "strategy": r.strategy,
             "pnl": r.pnl,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "created_at": created_str,
         }

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional
 
@@ -202,6 +203,21 @@ class Orchestrator:
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
 
+        # ── Pipeline Activity Log ────────────────────────────────────
+        # Ring buffer of pipeline events for dashboard visibility
+        self.activity_log: deque[dict] = deque(maxlen=500)
+        # Data source health — quick status for dashboard
+        self.data_sources: dict = {
+            "angelone_auth": {"status": "pending", "updated": None},
+            "candles": {"status": "pending", "updated": None, "detail": ""},
+            "options_chain": {"status": "pending", "updated": None, "detail": ""},
+            "fii_dii": {"status": "pending", "updated": None, "detail": ""},
+            "breadth": {"status": "pending", "updated": None, "detail": ""},
+            "news": {"status": "pending", "updated": None, "detail": ""},
+            "global_indices": {"status": "pending", "updated": None, "detail": ""},
+            "ai_insight": {"status": "pending", "updated": None, "detail": ""},
+        }
+
     async def start(self) -> None:
         """Main entry point — runs forever, restarting each trading day."""
         # Load previous evaluation from DB on cold start
@@ -253,6 +269,25 @@ class Orchestrator:
         self.running = False
         logger.info("Daily state reset complete")
 
+    def _log_event(self, event_type: str, message: str, *, cycle: int = 0, instrument: str = "", data: dict | None = None) -> None:
+        """Append a pipeline event to the activity log ring buffer."""
+        self.activity_log.append({
+            "ts": datetime.now(IST).strftime("%H:%M:%S"),
+            "cycle": cycle,
+            "instrument": instrument,
+            "type": event_type,
+            "msg": message,
+            "data": data or {},
+        })
+
+    def _set_source(self, source: str, status: str, detail: str = "") -> None:
+        """Update a data source health entry."""
+        self.data_sources[source] = {
+            "status": status,
+            "updated": datetime.now(IST).strftime("%H:%M:%S"),
+            "detail": detail,
+        }
+
     async def _sleep_until_premarket(self) -> None:
         """Sleep until next trading day's pre-market (08:45 IST)."""
         now = datetime.now(IST)
@@ -290,8 +325,12 @@ class Orchestrator:
         # Authenticate with AngelOne
         if not self.client.authenticate():
             logger.error("Failed to authenticate. Aborting today.")
+            self._set_source("angelone_auth", "error", "Authentication failed")
+            self._log_event("auth", "AngelOne authentication FAILED")
             await self.alert_manager.send_info("AUTH FAILED", "AngelOne authentication failed. Check credentials.")
             return
+        self._set_source("angelone_auth", "ok", "Authenticated")
+        self._log_event("auth", "AngelOne authenticated successfully")
 
         # Sync lot sizes from SmartAPI instrument master (after auth loads the master)
         from app.core.instruments import sync_lot_sizes_from_broker
@@ -359,6 +398,35 @@ class Orchestrator:
                     "Pre-market intelligence: bias=%s, score_modifier=%+d, risk=%s",
                     bias, modifier, self.insight_manager.get_risk_advice(),
                 )
+                self._set_source("ai_insight", "ok", f"Bias: {bias}, modifier: {modifier:+d}")
+                self._log_event("intelligence", f"Pre-market AI: bias={bias}, score_modifier={modifier:+d}", data={
+                    "bias": bias, "modifier": modifier, "risk": self.insight_manager.get_risk_advice(),
+                    "summary": insight.get("summary", "")[:200],
+                })
+
+                # Log data source results
+                analyst = self.pre_market_analyst
+                if analyst.institutional_flow:
+                    self._set_source("fii_dii", "ok", f"FII net: {analyst.institutional_flow.fii_net:+.0f} Cr")
+                    self._log_event("data", f"FII/DII: FII net={analyst.institutional_flow.fii_net:+.0f} Cr, signal={analyst.institutional_flow.signal}")
+                else:
+                    self._set_source("fii_dii", "warn", "Not available")
+                    self._log_event("data", "FII/DII data: NOT available")
+
+                if analyst.market_breadth:
+                    self._set_source("breadth", "ok", f"A/D ratio: {analyst.market_breadth.advance_decline_ratio:.2f}")
+                    self._log_event("data", f"Market breadth: A/D={analyst.market_breadth.advance_decline_ratio:.2f}, signal={analyst.market_breadth.breadth_signal}")
+                else:
+                    self._set_source("breadth", "warn", "Not available")
+                    self._log_event("data", "Market breadth: NOT available")
+
+                news_count = len(analyst._news_items) if hasattr(analyst, '_news_items') else 0
+                if news_count > 0:
+                    self._set_source("news", "ok", f"{news_count} news items")
+                    self._log_event("data", f"Telegram news: {news_count} items collected")
+                else:
+                    self._set_source("news", "warn", "No news collected")
+                    self._log_event("data", "Telegram news: none collected")
 
                 # Send Telegram summary
                 summary = insight.get("summary", "Analysis complete")
@@ -367,8 +435,13 @@ class Orchestrator:
                     f"PRE-MARKET ANALYSIS — {bias.upper()}",
                     f"{summary}\n\nPlan: {plan}\nScore modifier: {modifier:+d}",
                 )
+            else:
+                self._set_source("ai_insight", "warn", "No insight returned")
+                self._log_event("intelligence", "Pre-market AI returned no insight")
         except Exception:
             logger.exception("Pre-market intelligence failed (non-critical)")
+            self._set_source("ai_insight", "error", "Analysis failed")
+            self._log_event("intelligence", "Pre-market AI analysis FAILED (exception)")
 
         # Lock the adaptive threshold for the entire session
         # Based on what data sources are actually available right now
@@ -434,6 +507,7 @@ class Orchestrator:
         cycle = self._cycle_count
         now = datetime.now(IST)
         logger.info("── Cycle %d ── %s ──", cycle, now.strftime("%H:%M:%S"))
+        self._log_event("cycle", f"Cycle #{cycle} started", cycle=cycle)
 
         try:
             # Analyze each active instrument
@@ -494,18 +568,24 @@ class Orchestrator:
                 )
             except asyncio.TimeoutError:
                 logger.warning("[%s][Cycle %d] Candle data fetch timed out", symbol, cycle)
+                self._log_event("candle", "Candle fetch TIMED OUT", cycle=cycle, instrument=symbol)
                 return
             df = self.client.candles_to_dataframe(candles)
 
             if df.empty:
                 logger.warning("[%s][Cycle %d] No candle data received", symbol, cycle)
+                self._log_event("candle", "No candle data received", cycle=cycle, instrument=symbol)
                 return
 
             # 2. Validate data
             df = self.validator.validate_candles(df, is_index=instrument.is_index)
             if not self.validator.is_valid_for_trading(df):
                 logger.warning("[%s][Cycle %d] Data validation failed", symbol, cycle)
+                self._log_event("candle", "Data validation FAILED", cycle=cycle, instrument=symbol)
                 return
+
+            self._set_source("candles", "ok", f"{len(df)} candles for {symbol}")
+            self._log_event("candle", f"Candles OK: {len(df)} rows", cycle=cycle, instrument=symbol)
 
             # 2b. For indices, merge futures volume
             if instrument.is_index:
@@ -580,6 +660,13 @@ class Orchestrator:
                 f"{indicators.adx:.1f}" if indicators.adx is not None else "N/A",
                 f"{indicators.ema200:.1f}" if indicators.ema200 is not None else "N/A",
             )
+            self._log_event("indicators", f"Price={spot_price:.2f} RSI={indicators.rsi:.1f if indicators.rsi else 'N/A'} ADX={indicators.adx:.1f if indicators.adx else 'N/A'}", cycle=cycle, instrument=symbol, data={
+                "price": round(spot_price, 2),
+                "rsi": round(indicators.rsi, 1) if indicators.rsi else None,
+                "adx": round(indicators.adx, 1) if indicators.adx else None,
+                "vwap": round(indicators.vwap, 2) if indicators.vwap else None,
+                "atr": round(indicators.atr, 2) if indicators.atr else None,
+            })
 
             # 4. Options chain (for all instruments with expiry, every 5 min)
             options_metrics = self._options_metrics.get(symbol, OptionsMetrics())
@@ -587,9 +674,13 @@ class Orchestrator:
             if expiry and (now.minute % 5 == 0 or options_metrics.pcr is None):
                 options_metrics = await self._update_options_chain_for(instrument, spot_price, expiry)
                 self._options_metrics[symbol] = options_metrics
+                pcr_val = f"{options_metrics.pcr:.2f}" if options_metrics.pcr else "N/A"
+                self._set_source("options_chain", "ok", f"{symbol} PCR={pcr_val}")
+                self._log_event("options", f"Options chain updated: PCR={pcr_val}, MaxPain={options_metrics.max_pain}", cycle=cycle, instrument=symbol)
 
             # 5. Market regime detection
             regime = self.regime_detector.detect(df)
+            self._log_event("regime", f"Regime: {regime.value}", cycle=cycle, instrument=symbol)
 
             # 6. Build market snapshot (use today's data)
             # Use NIFTY price from existing NIFTY snapshot for non-NIFTY instruments
@@ -626,6 +717,7 @@ class Orchestrator:
             # 8. Time-of-day circuit breaker — no new entries after 14:30
             if now.time() >= NO_NEW_ENTRY_AFTER:
                 logger.debug("[%s][Cycle %d] After %s — no new entries", symbol, cycle, NO_NEW_ENTRY_AFTER)
+                self._log_event("gate", f"Past {NO_NEW_ENTRY_AFTER} — no new entries", cycle=cycle, instrument=symbol)
                 return
 
             # 8b. Global risk check
@@ -634,6 +726,7 @@ class Orchestrator:
                 open_count=len(self.paper_trader.open_trades),
             ):
                 logger.info("[%s][Cycle %d] Risk limits reached", symbol, cycle)
+                self._log_event("gate", "Risk limits reached — skipping", cycle=cycle, instrument=symbol)
                 return
 
             # 9. Run strategies — filtered by market regime
@@ -650,9 +743,11 @@ class Orchestrator:
 
             if not signals:
                 self._consecutive_no_signal += 1
+                self._log_event("signal", "No strategy signals", cycle=cycle, instrument=symbol)
                 return
             else:
                 self._consecutive_no_signal = 0
+                self._log_event("signal", f"{len(signals)} signal(s): {', '.join(s.strategy.value for s in signals)}", cycle=cycle, instrument=symbol)
 
             # 9b. Multi-timeframe filter: skip signals against 5-min trend
             htf_bias = self._htf_biases.get(symbol, "neutral")
@@ -669,7 +764,9 @@ class Orchestrator:
                         "[%s][Cycle %d] HTF filter removed %d signal(s) against %s trend",
                         symbol, cycle, filtered, htf_bias,
                     )
+                    self._log_event("filter", f"HTF filter removed {filtered} signal(s) against {htf_bias} trend", cycle=cycle, instrument=symbol)
                 if not signals:
+                    self._log_event("filter", "All signals filtered by HTF — skipping", cycle=cycle, instrument=symbol)
                     return
 
             # 10. Score and filter (with evaluation boost for top-ranked combos)
@@ -716,11 +813,13 @@ class Orchestrator:
                         symbol, cycle, signal.strategy.value,
                         raw_score, eval_boost, boosted_score, adaptive_min,
                     )
+                    self._log_event("score", f"{signal.strategy.value}: {raw_score:.0f} + {eval_boost} boost = {boosted_score:.0f}/100 (min={adaptive_min})", cycle=cycle, instrument=symbol)
                 else:
                     logger.info(
                         "[%s][Cycle %d] %s scored %.0f/100 (min=%d)",
                         symbol, cycle, signal.strategy.value, raw_score, adaptive_min,
                     )
+                    self._log_event("score", f"{signal.strategy.value}: {raw_score:.0f}/100 (min={adaptive_min})", cycle=cycle, instrument=symbol)
 
                 if boosted_score >= adaptive_min and boosted_score > best_score:
                     best_signal = signal
@@ -728,12 +827,14 @@ class Orchestrator:
                     signal.score = boosted_score
 
             if best_signal is None:
+                self._log_event("score", f"No signal passed threshold ({adaptive_min})", cycle=cycle, instrument=symbol)
                 return
 
             # 11. Fetch option premium
             option_ltp = await self._fetch_option_ltp_for(instrument, best_signal, expiry)
             if option_ltp is None or option_ltp <= 0:
                 logger.warning("[%s] Could not fetch option LTP — skipping trade", symbol)
+                self._log_event("option_ltp", "Option LTP fetch FAILED — skipping", cycle=cycle, instrument=symbol)
                 return
 
             logger.info(
@@ -760,6 +861,10 @@ class Orchestrator:
                     "[%s] AI rejected (confidence=%.0f%%): %s",
                     symbol, decision.confidence_score, decision.reason,
                 )
+                self._log_event("ai", f"AI REJECTED ({decision.confidence_score:.0f}%): {decision.reason}", cycle=cycle, instrument=symbol, data={
+                    "confidence": decision.confidence_score, "reason": decision.reason,
+                    "strategy": best_signal.strategy.value, "score": best_score,
+                })
                 await self.alert_manager.send_info(
                     f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
                     f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
@@ -767,6 +872,12 @@ class Orchestrator:
                     f"Reason: {decision.reason}",
                 )
                 return
+
+            self._log_event("ai", f"AI APPROVED ({decision.confidence_score:.0f}%): {best_signal.strategy.value} {best_signal.option_type.value}", cycle=cycle, instrument=symbol, data={
+                "confidence": decision.confidence_score, "strategy": best_signal.strategy.value,
+                "strike": best_signal.strike_price, "option_type": best_signal.option_type.value,
+                "entry": decision.entry_price, "sl": decision.stoploss, "target": decision.target,
+            })
 
             # 13. Build NFO trading symbol
             nfo_symbol = instrument.build_option_symbol(
@@ -824,6 +935,11 @@ class Orchestrator:
 
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_signal_alert(best_signal, decision)
+            self._log_event("trade", f"TRADE ENTERED: {nfo_symbol} x{num_lots} lots @ ₹{decision.entry_price:.2f}", cycle=cycle, instrument=symbol, data={
+                "symbol": nfo_symbol, "lots": num_lots, "entry": decision.entry_price,
+                "sl": decision.stoploss, "target": decision.target,
+                "live": not settings.paper_trading,
+            })
 
         except Exception:
             logger.exception("[%s] Error in instrument analysis", symbol)
@@ -1270,6 +1386,8 @@ class Orchestrator:
             self.global_bias = compute_global_bias(self.global_indices)
             self._global_last_fetched = datetime.now(IST)
             logger.info("Global bias: %s (%d indices)", self.global_bias.value, len(self.global_indices))
+            self._set_source("global_indices", "ok", f"{len(self.global_indices)} indices, bias={self.global_bias.value}")
+            self._log_event("data", f"Global indices: {len(self.global_indices)} fetched, bias={self.global_bias.value}")
 
             # Update shared state so API can serve index details
             from app.api.routes import get_state
@@ -1280,6 +1398,8 @@ class Orchestrator:
             ]
         except Exception:
             logger.exception("Error fetching global data")
+            self._set_source("global_indices", "error", "Fetch failed")
+            self._log_event("data", "Global indices fetch FAILED")
 
         # Fetch FII/DII data (non-blocking — don't fail if unavailable)
         try:
@@ -1289,8 +1409,13 @@ class Orchestrator:
                 self.pre_market_analyst._institutional_flow = fii_data
                 logger.info("FII/DII: FII=%+.0fcr DII=%+.0fcr signal=%s",
                             fii_data.fii_net, fii_data.dii_net, fii_data.signal)
+                self._set_source("fii_dii", "ok", f"FII={fii_data.fii_net:+.0f}Cr, signal={fii_data.signal}")
+                self._log_event("data", f"FII/DII refreshed: FII={fii_data.fii_net:+.0f}Cr DII={fii_data.dii_net:+.0f}Cr signal={fii_data.signal}")
+            else:
+                self._set_source("fii_dii", "warn", "No data returned")
         except Exception:
             logger.warning("FII/DII fetch failed (non-critical)")
+            self._set_source("fii_dii", "error", "Fetch failed")
 
         # Fetch market breadth (non-blocking)
         try:
@@ -1300,8 +1425,13 @@ class Orchestrator:
                 self.pre_market_analyst._market_breadth = breadth
                 logger.info("Breadth: A/D=%.2f signal=%s",
                             breadth.advance_decline_ratio, breadth.breadth_signal)
+                self._set_source("breadth", "ok", f"A/D={breadth.advance_decline_ratio:.2f}, signal={breadth.breadth_signal}")
+                self._log_event("data", f"Breadth refreshed: A/D={breadth.advance_decline_ratio:.2f} signal={breadth.breadth_signal}")
+            else:
+                self._set_source("breadth", "warn", "No data returned")
         except Exception:
             logger.warning("Market breadth fetch failed (non-critical)")
+            self._set_source("breadth", "error", "Fetch failed")
 
     async def _update_options_chain(self, spot_price: float) -> None:
         """Legacy: update options chain for all index instruments."""

@@ -226,6 +226,39 @@ async def get_recent_logs(lines: int = 100):
     return {"logs": "".join(all_lines[-lines:]), "total_lines": len(all_lines)}
 
 
+@app.get("/api/system/activity")
+async def get_system_activity(limit: int = 200):
+    """Get pipeline activity log and data source health for dashboard visibility."""
+    orch = _state.get("orchestrator")
+    if not orch:
+        return {"events": [], "data_sources": {}, "cycle": 0}
+
+    if limit < 1 or limit > 500:
+        limit = 200
+
+    events = list(orch.activity_log)[-limit:] if hasattr(orch, "activity_log") else []
+    sources = getattr(orch, "data_sources", {})
+    cycle = getattr(orch, "_cycle_count", 0)
+
+    # Add per-instrument regime and HTF bias
+    regimes = {}
+    for sym, snap in (getattr(orch, "snapshots", {}) or {}).items():
+        regimes[sym] = {
+            "regime": snap.regime.value if snap and snap.regime else "unknown",
+            "htf_trend": (getattr(orch, "_htf_biases", {}) or {}).get(sym, "unknown"),
+            "price": round(snap.price, 2) if snap and snap.price else None,
+        }
+
+    return {
+        "events": events,
+        "data_sources": sources,
+        "cycle": cycle,
+        "regimes": regimes,
+        "paper_trading": settings.paper_trading,
+        "open_trades": len(_state.get("open_trades", [])),
+    }
+
+
 @app.post("/api/system/start")
 async def start_system():
     """Start the trading system for the current day."""

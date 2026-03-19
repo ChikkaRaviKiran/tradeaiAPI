@@ -131,15 +131,31 @@ class PreMarketAnalyst:
         self._institutional_flow = fii_data
         self._market_breadth = breadth_data
 
+        # Log data collection results
+        logger.info(
+            "Pre-market data collected: FII/DII=%s, Breadth=%s, News images=%d, Global=%d",
+            "yes" if fii_data else "NO",
+            "yes" if breadth_data else "NO",
+            len(news_items) if isinstance(news_items, list) else 0,
+            len(global_indices) if isinstance(global_indices, list) else 0,
+        )
+
         # Save news to DB
         if news_items:
-            await save_news_to_db(news_items)
+            saved = await save_news_to_db(news_items)
+            logger.info("Telegram news: %d items scraped, %d saved to DB", len(news_items), saved)
+        else:
+            logger.warning(
+                "No Telegram news collected — channel=%s (set TELEGRAM_NEWS_CHANNEL in .env)",
+                settings.telegram_news_channel or 'NOT SET',
+            )
 
         # 2. Fetch 30-day trade history for learning
         trade_history = await self._get_rolling_trade_history(days=30)
 
         # 3. Fetch recent news from DB (includes today's + recent days)
         recent_news = await get_recent_news(days=2)
+        logger.info("Recent news from DB (last 2 days): %d items", len(recent_news))
 
         # 4. Build analysis prompt
         prompt_data = self._build_prompt_data(

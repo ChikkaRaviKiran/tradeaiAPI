@@ -181,11 +181,16 @@ class TradeLogger:
     def _to_trade(record: TradeRecord) -> Trade:
         from app.core.models import OptionType, StrategyName, TradeStatus
 
+        # Fallback: derive exit_time from updated_at if missing on closed trades
+        exit_time = record.exit_time
+        if not exit_time and record.status == "closed" and record.updated_at:
+            exit_time = record.updated_at.strftime("%H:%M:%S")
+
         return Trade(
             trade_id=record.trade_id,
             date=record.date,
             time=record.time,
-            exit_time=record.exit_time,
+            exit_time=exit_time,
             symbol=record.symbol,
             strike=record.strike,
             option_type=OptionType(record.option_type),
