@@ -73,7 +73,7 @@ NIFTY = InstrumentConfig(
     display_name="NIFTY 50",
     exchange=Exchange.NSE,
     instrument_type=InstrumentType.INDEX,
-    lot_size=50,
+    lot_size=65,
     strike_interval=50,
     token="99926000",
     futures_symbol_prefix="NIFTY",
@@ -86,7 +86,7 @@ BANKNIFTY = InstrumentConfig(
     display_name="Bank Nifty",
     exchange=Exchange.NSE,
     instrument_type=InstrumentType.INDEX,
-    lot_size=15,
+    lot_size=30,
     strike_interval=100,
     token="99926009",
     futures_symbol_prefix="BANKNIFTY",
@@ -99,7 +99,7 @@ FINNIFTY = InstrumentConfig(
     display_name="Fin Nifty",
     exchange=Exchange.NSE,
     instrument_type=InstrumentType.INDEX,
-    lot_size=25,
+    lot_size=60,
     strike_interval=50,
     token="99926037",
     futures_symbol_prefix="FINNIFTY",
@@ -112,17 +112,18 @@ MIDCPNIFTY = InstrumentConfig(
     display_name="Midcap Nifty",
     exchange=Exchange.NSE,
     instrument_type=InstrumentType.INDEX,
-    lot_size=50,
+    lot_size=120,
     strike_interval=25,
     token="99926074",
     futures_symbol_prefix="MIDCPNIFTY",
     option_symbol_prefix="MIDCPNIFTY",
     is_index=True,
+    enabled=False,  # Disabled — focusing on NIFTY, BANKNIFTY, FINNIFTY
 )
 
 # ── Stock definitions (equity options on NSE) ────────────────────────────
 
-def _equity(symbol: str, name: str, token: str, lot_size: int, strike_int: float) -> InstrumentConfig:
+def _equity(symbol: str, name: str, token: str, lot_size: int, strike_int: float, enabled: bool = False) -> InstrumentConfig:
     return InstrumentConfig(
         symbol=symbol,
         display_name=name,
@@ -133,21 +134,22 @@ def _equity(symbol: str, name: str, token: str, lot_size: int, strike_int: float
         token=token,
         option_symbol_prefix=symbol,
         is_index=False,
+        enabled=enabled,
     )
 
 
 # Top traded F&O stocks — tokens from AngelOne instrument master
 # Tokens will be resolved dynamically if empty
-RELIANCE = _equity("RELIANCE", "Reliance Industries", "2885", 250, 20)
-TCS = _equity("TCS", "Tata Consultancy", "11536", 150, 50)
+RELIANCE = _equity("RELIANCE", "Reliance Industries", "2885", 500, 20)
+TCS = _equity("TCS", "Tata Consultancy", "11536", 175, 50)
 HDFCBANK = _equity("HDFCBANK", "HDFC Bank", "1333", 550, 20)
-INFY = _equity("INFY", "Infosys", "1594", 300, 25)
+INFY = _equity("INFY", "Infosys", "1594", 400, 25)
 ICICIBANK = _equity("ICICIBANK", "ICICI Bank", "4963", 700, 20)
 SBIN = _equity("SBIN", "State Bank of India", "3045", 750, 10)
 BHARTIARTL = _equity("BHARTIARTL", "Bharti Airtel", "10604", 475, 20)
 ITC = _equity("ITC", "ITC Ltd", "1660", 1600, 5)
 TATAMOTORS = _equity("TATAMOTORS", "Tata Motors", "3456", 575, 10)
-LT = _equity("LT", "Larsen & Toubro", "11483", 150, 50)
+LT = _equity("LT", "Larsen & Toubro", "11483", 175, 50)
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
@@ -198,4 +200,34 @@ def get_equities() -> list[InstrumentConfig]:
 def register_instrument(config: InstrumentConfig) -> None:
     """Register a new instrument at runtime."""
     _ALL_INSTRUMENTS[config.symbol.upper()] = config
+
+
+def sync_lot_sizes_from_broker(client) -> None:
+    """Update lot sizes for all registered instruments from SmartAPI instrument master.
+
+    Called once at startup after AngelOne authentication. Replaces hardcoded
+    lot sizes with live values from the exchange.
+
+    Args:
+        client: AngelOneClient instance (must have instrument master loaded).
+    """
+    from dataclasses import replace as dc_replace
+
+    updated = 0
+    for symbol, inst in list(_ALL_INSTRUMENTS.items()):
+        live_lot = client.get_lot_size(symbol)
+        if live_lot and live_lot != inst.lot_size:
+            logger.info(
+                "Lot size updated: %s %d → %d (from SmartAPI)",
+                symbol, inst.lot_size, live_lot,
+            )
+            _ALL_INSTRUMENTS[symbol] = dc_replace(inst, lot_size=live_lot)
+            updated += 1
+        elif live_lot:
+            logger.debug("Lot size confirmed: %s = %d", symbol, live_lot)
+
+    if updated:
+        logger.info("Synced %d lot sizes from SmartAPI instrument master", updated)
+    else:
+        logger.info("All lot sizes match SmartAPI — no updates needed")
     logger.info("Registered instrument: %s", config.symbol)

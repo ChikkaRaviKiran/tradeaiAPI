@@ -255,6 +255,29 @@ async def stop_system():
     raise HTTPException(status_code=503, detail="Orchestrator not initialized")
 
 
+@app.post("/api/system/trading-mode")
+async def set_trading_mode(body: dict):
+    """Toggle between paper and live trading at runtime."""
+    mode = body.get("mode", "").lower()
+    if mode not in ("paper", "live"):
+        raise HTTPException(status_code=400, detail="mode must be 'paper' or 'live'")
+
+    orch = _state.get("orchestrator")
+    if orch and getattr(orch, "running", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot switch trading mode while system is running. Stop the system first.",
+        )
+
+    settings.paper_trading = mode == "paper"
+    # Reset auto-pause flag when user explicitly switches to live
+    orch = _state.get("orchestrator")
+    if orch and mode == "live":
+        orch._live_paused_insufficient_margin = False
+    logger.info("Trading mode switched to: %s", mode.upper())
+    return {"paper_trading": settings.paper_trading, "message": f"Switched to {mode.upper()} trading"}
+
+
 # ── History (Snapshots / Alerts / Calendar) ──────────────────────────────
 
 @app.get("/api/history/snapshots/{target_date}")
@@ -313,10 +336,13 @@ async def get_full_day_data(target_date: str):
         snapshot = _state.get("snapshot")
         if snapshot:
             # Build a snapshot dict from live data
+            live_price = snapshot.price or snapshot.nifty_price
             live_snap = {
+                "instrument": snapshot.instrument,
                 "date": today_str,
                 "time": snapshot.timestamp.strftime("%H:%M:%S") if snapshot.timestamp else "",
                 "nifty_price": snapshot.nifty_price,
+                "price": live_price,
                 "vwap": snapshot.vwap,
                 "regime": snapshot.regime.value if snapshot.regime else "unknown",
                 "global_bias": snapshot.global_bias.value if snapshot.global_bias else "unavailable",
@@ -340,15 +366,15 @@ async def get_full_day_data(target_date: str):
             }
             snapshots = [live_snap]
 
-            # Build summary from live snapshot
+            # Build summary from live snapshot — use actual price (not nifty_price which can be 0)
             summary = {
                 "date": today_str,
                 "has_data": True,
                 "total_snapshots": 1,
-                "open_price": snapshot.nifty_price,
-                "close_price": snapshot.nifty_price,
-                "high": snapshot.nifty_price,
-                "low": snapshot.nifty_price,
+                "open_price": live_price,
+                "close_price": live_price,
+                "high": live_price,
+                "low": live_price,
                 "first_time": live_snap["time"],
                 "last_time": live_snap["time"],
                 "avg_rsi": round(snapshot.indicators.rsi, 1) if snapshot.indicators and snapshot.indicators.rsi else 0,

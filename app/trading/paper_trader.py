@@ -181,6 +181,7 @@ class PaperTradingEngine:
             (trade.exit_price - trade.entry_price) * trade.lot_size, 2
         )
         trade.status = TradeStatus.CLOSED
+        trade.reason = reason  # Store exit reason (overrides AI entry reason)
 
         if trade in self.open_trades:
             self.open_trades.remove(trade)

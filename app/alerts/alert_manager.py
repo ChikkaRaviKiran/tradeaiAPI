@@ -44,9 +44,10 @@ alert_store = AlertStore()
 
 
 def _format_signal_message(signal: StrategySignal, decision: AIDecision) -> str:
+    inst = getattr(signal, 'instrument', 'NIFTY')
     return (
         f"Strategy: {signal.strategy.value}\n"
-        f"Instrument: NIFTY {int(signal.strike_price)} {signal.option_type.value}\n"
+        f"Instrument: {inst} {int(signal.strike_price)} {signal.option_type.value}\n"
         f"Entry: {decision.entry_price:.2f}  |  SL: {decision.stoploss:.2f}\n"
         f"T1: {decision.target1:.2f}  |  T2: {decision.target2:.2f}\n"
         f"Confidence: {decision.confidence_score:.0f}%\n"
@@ -130,7 +131,8 @@ class AlertManager:
 
     async def send_signal_alert(self, signal: StrategySignal, decision: AIDecision) -> None:
         msg = _format_signal_message(signal, decision)
-        title = f"TRADE SIGNAL — NIFTY {int(signal.strike_price)} {signal.option_type.value}"
+        inst = getattr(signal, 'instrument', 'NIFTY')
+        title = f"TRADE SIGNAL — {inst} {int(signal.strike_price)} {signal.option_type.value}"
 
         # Always store for UI
         alert = AlertItem(

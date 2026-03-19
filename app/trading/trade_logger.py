@@ -49,6 +49,7 @@ class TradeLogger:
                             exit_time=trade.exit_time,
                             pnl=trade.pnl,
                             status=trade.status.value,
+                            reason=trade.reason,
                         )
                     )
                 else:

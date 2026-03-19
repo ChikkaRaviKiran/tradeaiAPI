@@ -78,7 +78,6 @@ REPORT_TIME = dtime(15, 30)
 GLOBAL_FETCH_TIME = dtime(9, 0)
 LOAD_TIME = dtime(8, 45)
 NO_NEW_ENTRY_AFTER = dtime(14, 30)  # No new trades in last hour — high chop zone
-MIN_CANDLES_FOR_TRADING = 30  # Need at least 30 candles (30 min) before first trade
 
 LOOP_INTERVAL_SECONDS = 60  # 1-minute analysis cycle
 
@@ -196,6 +195,9 @@ class Orchestrator:
         # Backward compat
         self.snapshot: Optional[MarketSnapshot] = None
 
+        # Margin safety — tracks whether live trading was auto-paused
+        self._live_paused_insufficient_margin = False
+
         # Heartbeat tracking
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
@@ -290,6 +292,10 @@ class Orchestrator:
             logger.error("Failed to authenticate. Aborting today.")
             await self.alert_manager.send_info("AUTH FAILED", "AngelOne authentication failed. Check credentials.")
             return
+
+        # Sync lot sizes from SmartAPI instrument master (after auth loads the master)
+        from app.core.instruments import sync_lot_sizes_from_broker
+        sync_lot_sizes_from_broker(self.client)
 
         # Determine weekly/monthly expiry for each active instrument (from SmartAPI)
         for inst in self._active_instruments:
@@ -532,12 +538,16 @@ class Orchestrator:
                     df_5m = self.client.candles_to_dataframe(candles_5m)
                     if not df_5m.empty:
                         htf_bias = self.feature_engine.compute_htf_bias(df_5m)
-                        self._htf_biases[symbol] = htf_bias
-                        logger.debug("[%s] HTF (5-min) trend: %s", symbol, htf_bias)
+                    else:
+                        htf_bias = "neutral"
+                    self._htf_biases[symbol] = htf_bias
+                    logger.debug("[%s] HTF (5-min) trend: %s", symbol, htf_bias)
                 except asyncio.TimeoutError:
                     logger.warning("[%s] 5-min candle fetch timed out", symbol)
-                except Exception:
-                    logger.warning("[%s] 5-min candle fetch failed (non-critical)", symbol)
+                    self._htf_biases.setdefault(symbol, "neutral")
+                except Exception as e:
+                    logger.warning("[%s] 5-min candle fetch failed: %s", symbol, e)
+                    self._htf_biases.setdefault(symbol, "neutral")
 
             # 3. Feature engineering (on full history for proper indicator warmup)
             df = self.feature_engine.compute_indicators(df, today_date=today_str)
@@ -552,6 +562,13 @@ class Orchestrator:
             prev_day_high = float(df_prev["high"].max()) if not df_prev.empty else None
             prev_day_low = float(df_prev["low"].min()) if not df_prev.empty else None
             prev_day_close = float(df_prev.iloc[-1]["close"]) if not df_prev.empty else None
+
+            if df_prev.empty and cycle <= 2:
+                logger.warning(
+                    "[%s] No previous day candle data — prev day levels will be unavailable. "
+                    "API returned %d candles, all from today.",
+                    symbol, len(df),
+                )
 
             indicators = self.feature_engine.get_latest_indicators(df_today)
             spot_price = df_today.iloc[-1]["close"] if not df_today.empty else 0
@@ -577,7 +594,9 @@ class Orchestrator:
             # 6. Build market snapshot (use today's data)
             # Use NIFTY price from existing NIFTY snapshot for non-NIFTY instruments
             nifty_snap = self.snapshots.get("NIFTY")
-            nifty_price = spot_price if symbol == "NIFTY" else (nifty_snap.nifty_price if nifty_snap else 0)
+            # Use NIFTY price if available; fall back to this instrument's price
+            # so snapshots/day summaries aren't blank when NIFTY isn't active
+            nifty_price = spot_price if symbol == "NIFTY" else (nifty_snap.nifty_price if nifty_snap else spot_price)
             # Check if today is expiry day for this instrument (from real SmartAPI data)
             expiry_date = self._expiry_dates.get(symbol)
             is_expiry = (expiry_date == now.date()) if expiry_date else False
@@ -609,12 +628,7 @@ class Orchestrator:
                 logger.debug("[%s][Cycle %d] After %s — no new entries", symbol, cycle, NO_NEW_ENTRY_AFTER)
                 return
 
-            # 8b. Minimum candles check — need 30 min of data for reliable indicators
-            if len(df_today) < MIN_CANDLES_FOR_TRADING:
-                logger.debug("[%s][Cycle %d] Only %d candles — waiting for %d", symbol, cycle, len(df_today), MIN_CANDLES_FOR_TRADING)
-                return
-
-            # 8c. Global risk check
+            # 8b. Global risk check
             if not self.risk_manager.can_trade(
                 self.paper_trader.all_today_trades,
                 open_count=len(self.paper_trader.open_trades),
@@ -776,6 +790,16 @@ class Orchestrator:
 
             # 15b. Place real order if live trading
             if not settings.paper_trading:
+                # Pre-trade margin check
+                margin_ok = await self._check_margin_before_trade(
+                    symbol, trade, nfo_symbol
+                )
+                if not margin_ok:
+                    # Remove from paper tracker — order not placed
+                    if trade in self.paper_trader.open_trades:
+                        self.paper_trader.open_trades.remove(trade)
+                    return
+
                 order_resp = await self._place_live_order(
                     instrument, trade, nfo_symbol, OrderSide.BUY,
                 )
@@ -783,11 +807,18 @@ class Orchestrator:
                     # Remove from paper tracker if live order failed
                     if trade in self.paper_trader.open_trades:
                         self.paper_trader.open_trades.remove(trade)
-                    logger.error("[%s] Live BUY order REJECTED: %s", symbol, order_resp.message if order_resp else "no response")
-                    await self.alert_manager.send_info(
-                        f"ORDER REJECTED — {symbol}",
-                        f"{nfo_symbol}\nError: {order_resp.message if order_resp else 'no response'}",
-                    )
+                    err_msg = order_resp.message if order_resp else "no response"
+                    logger.error("[%s] Live BUY order REJECTED: %s", symbol, err_msg)
+                    # Detect margin/fund related rejections and auto-pause
+                    if err_msg and any(kw in err_msg.lower() for kw in (
+                        "insufficient", "margin", "fund", "balance", "limit exceed",
+                    )):
+                        await self._auto_pause_live_trading(symbol, err_msg)
+                    else:
+                        await self.alert_manager.send_info(
+                            f"ORDER REJECTED — {symbol}",
+                            f"{nfo_symbol}\nError: {err_msg}",
+                        )
                     return
                 logger.info("[%s] Live BUY order placed: %s", symbol, order_resp.order_id)
 
@@ -961,6 +992,75 @@ class Orchestrator:
         except Exception:
             logger.exception("Live order placement failed for %s", nfo_symbol)
             return None
+
+    async def _check_margin_before_trade(
+        self,
+        symbol: str,
+        trade: "Trade",
+        nfo_symbol: str,
+    ) -> bool:
+        """Check broker margin before placing a live order.
+
+        Returns True if margin is sufficient, False otherwise.
+        On insufficient margin, auto-pauses live trading and alerts.
+        """
+        try:
+            margin_data = await asyncio.to_thread(self.broker.get_margin)
+            if not margin_data:
+                logger.warning("[%s] Could not fetch margin data — proceeding with order", symbol)
+                return True  # Don't block if margin API is unavailable
+
+            # AngelOne rmsLimit returns: net, availablecash, availableintradaypayin, etc.
+            available = 0.0
+            for key in ("net", "availablecash", "available_cash"):
+                val = margin_data.get(key)
+                if val is not None:
+                    try:
+                        available = float(val)
+                        break
+                    except (ValueError, TypeError):
+                        continue
+
+            min_required = settings.min_margin_required
+            if available < min_required:
+                logger.warning(
+                    "[%s] Insufficient margin: ₹%.2f available, ₹%.2f required",
+                    symbol, available, min_required,
+                )
+                await self._auto_pause_live_trading(
+                    symbol,
+                    f"Available margin ₹{available:,.2f} is below minimum ₹{min_required:,.2f}",
+                )
+                return False
+
+            # Reset pause flag if margin is healthy again
+            self._live_paused_insufficient_margin = False
+            return True
+
+        except Exception:
+            logger.exception("[%s] Margin check failed — proceeding with order", symbol)
+            return True  # Don't block on margin API errors
+
+    async def _auto_pause_live_trading(self, symbol: str, reason: str) -> None:
+        """Auto-switch to paper trading mode due to insufficient funds."""
+        if self._live_paused_insufficient_margin:
+            # Already paused and alerted — don't spam
+            logger.debug("[%s] Live trading already paused — skipping duplicate alert", symbol)
+            return
+
+        self._live_paused_insufficient_margin = True
+        settings.paper_trading = True
+        logger.warning(
+            "AUTO-PAUSED live trading → paper mode. Reason: %s", reason,
+        )
+        await self.alert_manager.send_info(
+            "⚠️ LIVE TRADING AUTO-PAUSED",
+            f"Switched to PAPER mode automatically.\n\n"
+            f"Reason: {reason}\n"
+            f"Instrument: {symbol}\n\n"
+            f"No real orders will be placed until you manually re-enable live mode.\n"
+            f"Add funds to your AngelOne account and toggle back to LIVE from the dashboard.",
+        )
 
     async def _place_live_exit(
         self,

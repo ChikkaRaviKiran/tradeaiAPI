@@ -42,14 +42,14 @@ class Settings(BaseSettings):
     risk_per_trade_pct: float = Field(default=1.0, alias="RISK_PER_TRADE_PCT")
     max_concurrent_positions: int = Field(default=3, alias="MAX_CONCURRENT_POSITIONS")
     consecutive_loss_limit: int = Field(default=3, alias="CONSECUTIVE_LOSS_LIMIT")
-    nifty_lot_size: int = Field(default=50, alias="NIFTY_LOT_SIZE")
+    nifty_lot_size: int = Field(default=65, alias="NIFTY_LOT_SIZE")
 
     # Instruments
     # If auto_select_instruments is True, the system evaluates ALL registered
     # instruments and picks the best ones automatically each day.
     # Set to False + ACTIVE_INSTRUMENTS to manually override.
     auto_select_instruments: bool = Field(default=True, alias="AUTO_SELECT_INSTRUMENTS")
-    max_active_instruments: int = Field(default=3, alias="MAX_ACTIVE_INSTRUMENTS")
+    max_active_instruments: int = Field(default=3, alias="MAX_ACTIVE_INSTRUMENTS")  # NIFTY, BANKNIFTY, FINNIFTY
     min_composite_score: float = Field(default=35.0, alias="MIN_COMPOSITE_SCORE")
     active_instruments: str = Field(default="", alias="ACTIVE_INSTRUMENTS")
 
@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     # System
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
+    min_margin_required: float = Field(default=5000, alias="MIN_MARGIN_REQUIRED")
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

@@ -68,6 +68,27 @@ class AngelOneClient:
         logger.info("NFO symbol index built: %d entries", len(self._nfo_symbol_index))
         return self._instrument_master
 
+    def get_lot_size(self, symbol_name: str) -> int | None:
+        """Look up the NFO lot size for a given instrument from the instrument master.
+
+        Args:
+            symbol_name: Instrument name (e.g. "NIFTY", "FINNIFTY", "RELIANCE").
+
+        Returns:
+            Lot size as int, or None if not found.
+        """
+        instruments = self._get_instrument_master()
+        for item in instruments:
+            if (
+                item.get("exch_seg") == self.nfo_exchange
+                and item.get("name", "") == symbol_name
+            ):
+                try:
+                    return int(item["lotsize"])
+                except (KeyError, ValueError):
+                    continue
+        return None
+
     # ── Authentication ────────────────────────────────────────────────────
 
     def authenticate(self) -> bool:

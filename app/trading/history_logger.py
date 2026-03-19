@@ -56,9 +56,11 @@ class HistoryLogger:
             await _ensure_tables()
             now = snapshot.timestamp
             record = MarketSnapshotRecord(
+                instrument=snapshot.instrument,
                 date=now.strftime("%Y-%m-%d"),
                 time=now.strftime("%H:%M:%S"),
                 nifty_price=snapshot.nifty_price,
+                price=snapshot.price,
                 vwap=snapshot.vwap,
                 regime=snapshot.regime.value,
                 global_bias=snapshot.global_bias.value,
@@ -110,6 +112,7 @@ class HistoryLogger:
                 trade_id=alert.trade_id,
                 strategy=alert.strategy,
                 pnl=alert.pnl,
+                created_at=alert.timestamp,
             )
             SessionLocal = _get_session_factory()
             async with SessionLocal() as session:
@@ -156,9 +159,33 @@ class HistoryLogger:
         if not snapshots:
             return {"date": target_date, "has_data": False}
 
-        prices = [s["nifty_price"] for s in snapshots]
+        prices = [s.get("price") or s["nifty_price"] for s in snapshots]
         rsi_values = [s["rsi"] for s in snapshots if s["rsi"] is not None]
         adx_values = [s["adx"] for s in snapshots if s["adx"] is not None]
+
+        # Per-instrument summaries
+        by_instrument: dict[str, list] = {}
+        for s in snapshots:
+            inst = s.get("instrument") or "NIFTY"
+            by_instrument.setdefault(inst, []).append(s)
+
+        instrument_summaries = {}
+        for inst, inst_snaps in by_instrument.items():
+            inst_prices = [s.get("price") or s["nifty_price"] for s in inst_snaps]
+            inst_rsi = [s["rsi"] for s in inst_snaps if s["rsi"] is not None]
+            inst_adx = [s["adx"] for s in inst_snaps if s["adx"] is not None]
+            instrument_summaries[inst] = {
+                "open_price": inst_prices[0],
+                "close_price": inst_prices[-1],
+                "high": max(inst_prices),
+                "low": min(inst_prices),
+                "snapshots": len(inst_snaps),
+                "avg_rsi": round(sum(inst_rsi) / len(inst_rsi), 1) if inst_rsi else 0,
+                "avg_adx": round(sum(inst_adx) / len(inst_adx), 1) if inst_adx else 0,
+                "last_pcr": inst_snaps[-1].get("pcr"),
+                "last_regime": inst_snaps[-1].get("regime"),
+            }
+
         return {
             "date": target_date,
             "has_data": True,
@@ -174,6 +201,8 @@ class HistoryLogger:
             "regimes": list(set(s["regime"] for s in snapshots)),
             "last_pcr": snapshots[-1]["pcr"],
             "last_max_pain": snapshots[-1]["max_pain"],
+            "instruments": instrument_summaries,
+            "source": "db",
         }
 
     async def get_calendar_data(self, year: int, month: int) -> list[dict]:
@@ -253,9 +282,11 @@ class HistoryLogger:
 
     def _snapshot_to_dict(self, r: MarketSnapshotRecord) -> dict:
         return {
+            "instrument": r.instrument,
             "date": r.date,
             "time": r.time,
             "nifty_price": r.nifty_price,
+            "price": r.price or r.nifty_price,
             "vwap": r.vwap,
             "regime": r.regime,
             "global_bias": r.global_bias,

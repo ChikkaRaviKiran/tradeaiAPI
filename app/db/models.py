@@ -1,8 +1,10 @@
-"""Database models and session management."""
+﻿"""Database models and session management."""
 
 from __future__ import annotations
 
 from datetime import datetime
+
+import pytz
 
 from sqlalchemy import (
     Column,
@@ -18,6 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.core.config import settings
+
+_IST = pytz.timezone("Asia/Kolkata")
+
+
+def _now_ist():
+    return datetime.now(_IST).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -49,8 +57,8 @@ class TradeRecord(Base):
     status = Column(String(10), nullable=False, default="open")
     lot_size = Column(Integer, default=50)
     reason = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
+    updated_at = Column(DateTime, default=_now_ist, onupdate=_now_ist)
 
 
 class DailyReport(Base):
@@ -66,7 +74,7 @@ class DailyReport(Base):
     total_pnl = Column(Float, default=0.0)
     win_rate = Column(Float, default=0.0)
     max_drawdown = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 class MarketSnapshotRecord(Base):
@@ -104,7 +112,7 @@ class MarketSnapshotRecord(Base):
     put_oi_cluster = Column(Float, nullable=True)
     oi_change = Column(Integer, default=0)
     htf_trend = Column(String(10), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 class AlertRecord(Base):
@@ -120,7 +128,7 @@ class AlertRecord(Base):
     trade_id = Column(String(20), nullable=True)
     strategy = Column(String(30), nullable=True)
     pnl = Column(Float, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 class StockRankingRecord(Base):
@@ -138,7 +146,7 @@ class StockRankingRecord(Base):
     earnings_growth_score = Column(Float, default=0.0)
     sentiment_score = Column(Float, default=0.0)
     composite_score = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 class PredictionRecord(Base):
@@ -153,7 +161,7 @@ class PredictionRecord(Base):
     confidence = Column(Float, default=0.0)
     model = Column(String(30), nullable=False)
     actual_outcome = Column(String(10), nullable=True)  # Filled post-market for accuracy tracking
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 class SignalRecord(Base):
@@ -174,7 +182,7 @@ class SignalRecord(Base):
     ai_decision = Column(String(10), nullable=True)  # "accepted" / "rejected"
     ai_confidence = Column(Float, nullable=True)
     reason = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 class StrategyEvalRecord(Base):
@@ -198,7 +206,7 @@ class StrategyEvalRecord(Base):
     current_regime = Column(String(20), nullable=True)
     signal_frequency = Column(Float, default=0.0)
     eval_days = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 class TelegramNewsRecord(Base):
@@ -215,7 +223,7 @@ class TelegramNewsRecord(Base):
     sentiment = Column(String(20), nullable=True)  # bullish/bearish/neutral
     sentiment_score = Column(Float, default=0.0)  # -1.0 to 1.0
     source = Column(String(50), default="daytradertelugu")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 class DailyAIInsight(Base):
@@ -240,7 +248,7 @@ class DailyAIInsight(Base):
     ai_summary = Column(Text, nullable=True)  # GPT-generated summary
     trading_plan = Column(Text, nullable=True)  # GPT-generated plan
     raw_data = Column(Text, nullable=True)  # JSON dump of all input data
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_now_ist)
 
 
 # Async engine
