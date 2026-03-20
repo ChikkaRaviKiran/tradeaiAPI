@@ -1113,13 +1113,14 @@ class Orchestrator:
         inst_best: dict[str, float] = {}  # symbol -> best composite score
         inst_strats: dict[str, list[str]] = {}  # symbol -> [strategy names]
 
+        # Only these 3 indices are allowed for trading
+        ALLOWED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY"}
+
         for r in recs:
             if r.composite_score < min_score:
                 continue
             sym = r.instrument
-            # Only consider index instruments (NIFTY, BANKNIFTY, FINNIFTY)
-            inst = get_instrument(sym)
-            if not inst or not inst.is_index:
+            if sym not in ALLOWED_INDICES:
                 continue
             if sym not in inst_best:
                 inst_best[sym] = r.composite_score

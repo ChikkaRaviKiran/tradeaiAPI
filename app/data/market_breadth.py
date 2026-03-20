@@ -112,10 +112,17 @@ async def fetch_market_breadth() -> Optional[MarketBreadth]:
                     )
                     if resp.status_code == 200:
                         sector_data = resp.json()
+                        # Try metadata first, then look at the index row in data array
                         metadata = sector_data.get("metadata", {})
                         change = float(metadata.get("percentChange", 0))
+                        if change == 0 and sector_data.get("data"):
+                            # First entry in data array is the index itself
+                            for row in sector_data["data"]:
+                                if row.get("symbol") == sector or row.get("priority") == 0:
+                                    change = float(row.get("pChange", 0))
+                                    break
                         breadth.sectors.append(
-                            SectorData(name=sector, change_pct=change)
+                            SectorData(name=sector, change_pct=round(change, 2))
                         )
                 except Exception:
                     continue

@@ -314,6 +314,52 @@ async def get_recent_news(days: int = 1) -> list[dict]:
                 }
                 for r in records
             ]
+    except RuntimeError as e:
+        if "different loop" in str(e):
+            # Event loop mismatch — fall back to sync query
+            logger.warning("Event loop mismatch in get_recent_news — using sync fallback")
+            return await _get_recent_news_sync(cutoff)
+        logger.exception("Error fetching recent news")
+        return []
     except Exception:
         logger.exception("Error fetching recent news")
+        return []
+
+
+async def _get_recent_news_sync(cutoff: str) -> list[dict]:
+    """Sync fallback for when asyncpg event loop differs from caller."""
+    import asyncio
+    from app.db.models import TelegramNewsRecord
+    from sqlalchemy import create_engine, select as sa_select
+    from sqlalchemy.orm import Session
+    from app.core.config import settings
+
+    try:
+        sync_url = settings.database_url.replace("postgresql+asyncpg", "postgresql+psycopg2").replace("postgresql://", "postgresql+psycopg2://")
+        if "+asyncpg" in sync_url:
+            sync_url = sync_url.replace("+asyncpg", "")
+        engine = create_engine(sync_url)
+        with Session(engine) as session:
+            result = session.execute(
+                sa_select(TelegramNewsRecord)
+                .where(TelegramNewsRecord.date >= cutoff)
+                .order_by(TelegramNewsRecord.created_at.desc())
+            )
+            records = result.scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "date": r.date,
+                    "message_id": r.message_id,
+                    "extracted_text": r.extracted_text,
+                    "symbols": r.symbols,
+                    "sentiment": r.sentiment,
+                    "sentiment_score": r.sentiment_score,
+                    "source": r.source,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in records
+            ]
+    except Exception:
+        logger.exception("Sync fallback for recent news also failed")
         return []
