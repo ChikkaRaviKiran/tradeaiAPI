@@ -1117,6 +1117,10 @@ class Orchestrator:
             if r.composite_score < min_score:
                 continue
             sym = r.instrument
+            # Only consider index instruments (NIFTY, BANKNIFTY, FINNIFTY)
+            inst = get_instrument(sym)
+            if not inst or not inst.is_index:
+                continue
             if sym not in inst_best:
                 inst_best[sym] = r.composite_score
                 inst_strats[sym] = []
