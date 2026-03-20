@@ -544,8 +544,10 @@ class Orchestrator:
         self._log_event("cycle", f"Cycle #{cycle} started", cycle=cycle)
 
         try:
-            # Analyze each active instrument
-            for instrument in self._active_instruments:
+            # Analyze each active instrument (with small delay between to avoid API rate limits)
+            for idx, instrument in enumerate(self._active_instruments):
+                if idx > 0:
+                    await asyncio.sleep(2)  # 2s gap to avoid AngelOne rate limiting
                 await self._analyze_instrument(instrument, cycle, now)
 
             # Update shared state for API (use NIFTY as primary if available)
@@ -694,7 +696,9 @@ class Orchestrator:
                 f"{indicators.adx:.1f}" if indicators.adx is not None else "N/A",
                 f"{indicators.ema200:.1f}" if indicators.ema200 is not None else "N/A",
             )
-            self._log_event("indicators", f"Price={spot_price:.2f} RSI={indicators.rsi:.1f if indicators.rsi else 'N/A'} ADX={indicators.adx:.1f if indicators.adx else 'N/A'}", cycle=cycle, instrument=symbol, data={
+            rsi_str = f"{indicators.rsi:.1f}" if indicators.rsi is not None else "N/A"
+            adx_str = f"{indicators.adx:.1f}" if indicators.adx is not None else "N/A"
+            self._log_event("indicators", f"Price={spot_price:.2f} RSI={rsi_str} ADX={adx_str}", cycle=cycle, instrument=symbol, data={
                 "price": round(spot_price, 2),
                 "rsi": round(indicators.rsi, 1) if indicators.rsi else None,
                 "adx": round(indicators.adx, 1) if indicators.adx else None,

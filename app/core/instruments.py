@@ -230,4 +230,3 @@ def sync_lot_sizes_from_broker(client) -> None:
         logger.info("Synced %d lot sizes from SmartAPI instrument master", updated)
     else:
         logger.info("All lot sizes match SmartAPI — no updates needed")
-    logger.info("Registered instrument: %s", config.symbol)

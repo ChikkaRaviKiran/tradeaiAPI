@@ -182,9 +182,21 @@ class AngelOneClient:
             "todate": to_date,
         }
         try:
-            # Retry up to 3 times — AngelOne occasionally returns AB1004
+            # Retry up to 3 times — AngelOne occasionally returns AB1004 or rate limit errors
             for attempt in range(3):
-                resp = self._smart_api.getCandleData(params)
+                try:
+                    resp = self._smart_api.getCandleData(params)
+                except Exception as api_err:
+                    err_str = str(api_err)
+                    if "exceeding access rate" in err_str.lower() or "rate" in err_str.lower():
+                        wait = 3 + (attempt * 3)  # 3s, 6s, 9s backoff
+                        logger.warning(
+                            "Rate limited on candle fetch attempt %d — waiting %ds: %s",
+                            attempt + 1, wait, err_str[:100],
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise  # Re-raise non-rate-limit errors
                 if resp and resp.get("status") is True:
                     break
                 error_code = resp.get("errorcode", "") if resp else ""
