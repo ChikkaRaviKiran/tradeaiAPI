@@ -43,18 +43,36 @@ class AngelOneClient:
 
         Cached for the lifetime of this client (one trading day).
         Also builds an NFO symbol index for O(1) lookups.
+        Retries up to 3 times with increasing timeout on failure.
         """
         if self._instrument_master is not None:
             return self._instrument_master
 
         import json
         from urllib.request import urlopen
+        from urllib.error import URLError
 
         url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-        logger.info("Downloading AngelOne instrument master (~20MB)...")
-        with urlopen(url, timeout=60) as resp:
-            self._instrument_master = json.loads(resp.read().decode())
-        logger.info("Instrument master loaded: %d instruments", len(self._instrument_master))
+
+        for attempt in range(3):
+            timeout = 60 + (attempt * 30)  # 60s, 90s, 120s
+            try:
+                logger.info(
+                    "Downloading AngelOne instrument master (~20MB) attempt %d/3 (timeout=%ds)...",
+                    attempt + 1, timeout,
+                )
+                with urlopen(url, timeout=timeout) as resp:
+                    self._instrument_master = json.loads(resp.read().decode())
+                logger.info("Instrument master loaded: %d instruments", len(self._instrument_master))
+                break
+            except (URLError, TimeoutError, OSError) as e:
+                logger.warning("Instrument master download attempt %d/3 failed: %s", attempt + 1, e)
+                if attempt < 2:
+                    time.sleep(5)
+        else:
+            logger.error("Failed to download instrument master after 3 attempts")
+            self._instrument_master = []
+            return self._instrument_master
 
         # Build NFO symbol -> token index for fast option lookups
         for item in self._instrument_master:
@@ -121,11 +139,11 @@ class AngelOneClient:
             return False
 
     def ensure_authenticated(self) -> None:
-        """Re-authenticate if token is stale (>6 hours)."""
+        """Re-authenticate if token is stale (>2 hours) or missing."""
         if (
             self._smart_api is None
             or self._last_auth is None
-            or (datetime.now(_IST) - self._last_auth) > timedelta(hours=6)
+            or (datetime.now(_IST) - self._last_auth) > timedelta(hours=2)
         ):
             if not self.authenticate():
                 raise ConnectionError("Failed to authenticate with AngelOne")
@@ -169,10 +187,16 @@ class AngelOneClient:
                 resp = self._smart_api.getCandleData(params)
                 if resp and resp.get("status") is True:
                     break
+                error_code = resp.get("errorcode", "") if resp else ""
                 logger.warning(
                     "Candle data attempt %d failed: %s", attempt + 1, resp
                 )
-                time.sleep(1)
+                # AB1004 often means session expired — force re-auth on 2nd attempt
+                if attempt == 1 and error_code in ("AB1004", "AB1010"):
+                    logger.info("Forcing re-authentication after repeated AB errors...")
+                    self._last_auth = None  # Force ensure_authenticated to re-auth
+                    self.ensure_authenticated()
+                time.sleep(1 + attempt)
             else:
                 logger.error("Failed to fetch candle data after 3 attempts")
                 return []

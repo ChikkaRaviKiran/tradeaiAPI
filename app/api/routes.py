@@ -272,8 +272,14 @@ async def start_system():
     def _run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(orch._run_trading_day())
-    t = threading.Thread(target=_run, daemon=True)
+        try:
+            loop.run_until_complete(orch._run_trading_day())
+        except Exception as e:
+            logger.exception("Trading day thread crashed: %s", e)
+            orch.running = False
+            if hasattr(orch, '_log_event'):
+                orch._log_event("error", f"Trading day crashed: {e}")
+    t = threading.Thread(target=_run, daemon=True, name="trading-day")
     t.start()
     return {"message": "System started"}
 

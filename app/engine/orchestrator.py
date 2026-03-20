@@ -246,6 +246,20 @@ class Orchestrator:
                 await self._run_trading_day()
             except Exception:
                 logger.exception("Unhandled error in trading day loop")
+                self._log_event("error", "Trading day crashed with unhandled error")
+                # If still within market hours, retry after a short delay
+                # instead of sleeping until tomorrow
+                now_ist = datetime.now(IST)
+                if now_ist.time() < MARKET_CLOSE and not is_market_holiday(now_ist.date()):
+                    retry_delay = 120  # 2 minutes
+                    logger.info(
+                        "Still within market hours — retrying in %d seconds...",
+                        retry_delay,
+                    )
+                    self._log_event("system", f"Will retry in {retry_delay}s (still market hours)")
+                    self.running = False
+                    await asyncio.sleep(retry_delay)
+                    continue
 
             # After each day, reset state and wait until next pre-market
             self._reset_for_new_day()
@@ -322,37 +336,56 @@ class Orchestrator:
         else:
             self._active_instruments = self._resolve_instruments()
 
-        # Authenticate with AngelOne
-        if not self.client.authenticate():
-            logger.error("Failed to authenticate. Aborting today.")
-            self._set_source("angelone_auth", "error", "Authentication failed")
-            self._log_event("auth", "AngelOne authentication FAILED")
-            await self.alert_manager.send_info("AUTH FAILED", "AngelOne authentication failed. Check credentials.")
+        # Authenticate with AngelOne (retry up to 3 times)
+        auth_ok = False
+        for auth_attempt in range(3):
+            if self.client.authenticate():
+                auth_ok = True
+                break
+            logger.warning("Auth attempt %d/3 failed — retrying in 10s...", auth_attempt + 1)
+            self._log_event("auth", f"AngelOne auth attempt {auth_attempt + 1}/3 FAILED")
+            await asyncio.sleep(10)
+
+        if not auth_ok:
+            logger.error("Failed to authenticate after 3 attempts. Aborting today.")
+            self._set_source("angelone_auth", "error", "Authentication failed (3 attempts)")
+            self._log_event("auth", "AngelOne authentication FAILED after 3 attempts")
+            await self.alert_manager.send_info("AUTH FAILED", "AngelOne authentication failed after 3 attempts. Check credentials.")
             return
         self._set_source("angelone_auth", "ok", "Authenticated")
         self._log_event("auth", "AngelOne authenticated successfully")
 
         # Sync lot sizes from SmartAPI instrument master (after auth loads the master)
-        from app.core.instruments import sync_lot_sizes_from_broker
-        sync_lot_sizes_from_broker(self.client)
+        try:
+            self._log_event("setup", "Loading instrument master & syncing lot sizes...")
+            from app.core.instruments import sync_lot_sizes_from_broker
+            sync_lot_sizes_from_broker(self.client)
+            self._log_event("setup", "Lot sizes synced from SmartAPI")
+        except Exception:
+            logger.exception("Failed to sync lot sizes — using defaults")
+            self._log_event("setup", "Lot size sync FAILED — using defaults")
 
         # Determine weekly/monthly expiry for each active instrument (from SmartAPI)
-        for inst in self._active_instruments:
-            inst_name = inst.option_symbol_prefix or inst.symbol
-            expiry = self.client.get_nearest_weekly_expiry(instrument_name=inst_name)
-            if expiry:
-                self._expiries[inst.symbol] = expiry
-                # Parse DDMMMYY (e.g. "18MAR26") to actual date for expiry day comparison
-                try:
-                    from datetime import date as date_type
-                    parsed = datetime.strptime(expiry, "%d%b%y").date()
-                    self._expiry_dates[inst.symbol] = parsed
-                    logger.info("Weekly expiry for %s: %s (%s)", inst.symbol, expiry, parsed)
-                except ValueError:
-                    logger.warning("Could not parse expiry date '%s' for %s", expiry, inst.symbol)
-                    logger.info("Weekly expiry for %s: %s", inst.symbol, expiry)
-            else:
-                logger.warning("No expiry found for %s — options data unavailable", inst.symbol)
+        try:
+            self._log_event("setup", "Discovering option expiries...")
+            for inst in self._active_instruments:
+                inst_name = inst.option_symbol_prefix or inst.symbol
+                expiry = self.client.get_nearest_weekly_expiry(instrument_name=inst_name)
+                if expiry:
+                    self._expiries[inst.symbol] = expiry
+                    try:
+                        parsed = datetime.strptime(expiry, "%d%b%y").date()
+                        self._expiry_dates[inst.symbol] = parsed
+                        logger.info("Weekly expiry for %s: %s (%s)", inst.symbol, expiry, parsed)
+                    except ValueError:
+                        logger.warning("Could not parse expiry date '%s' for %s", expiry, inst.symbol)
+                        logger.info("Weekly expiry for %s: %s", inst.symbol, expiry)
+                else:
+                    logger.warning("No expiry found for %s — options data unavailable", inst.symbol)
+            self._log_event("setup", f"Expiries resolved: {dict(self._expiries)}")
+        except Exception:
+            logger.exception("Failed to determine expiries — options data may be unavailable")
+            self._log_event("setup", "Expiry discovery FAILED — continuing without options")
 
         # Update shared state for API
         from app.api.routes import get_state
@@ -366,6 +399,7 @@ class Orchestrator:
             f"Instruments: {', '.join(inst_names)}\n"
             f"Paper trading: {settings.paper_trading}\nCapital: ₹{settings.initial_capital:,.0f}",
         )
+        self._log_event("setup", f"System started: instruments={', '.join(inst_names)}")
 
         # ── Crash recovery: reload open trades from DB ───────────────────
         await self._recover_open_trades()
