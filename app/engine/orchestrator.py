@@ -550,6 +550,9 @@ class Orchestrator:
                     await asyncio.sleep(2)  # 2s gap to avoid AngelOne rate limiting
                 await self._analyze_instrument(instrument, cycle, now)
 
+            # Fetch basic price data for main indices not in active set
+            await self._update_index_snapshots(now)
+
             # Update shared state for API (use NIFTY as primary if available)
             from app.api.routes import get_state
             state = get_state()
@@ -580,6 +583,72 @@ class Orchestrator:
 
         except Exception:
             logger.exception("Error in analysis cycle")
+
+    async def _update_index_snapshots(self, now: datetime) -> None:
+        """Fetch basic price data for NIFTY/BANKNIFTY/FINNIFTY if not already tracked.
+
+        Ensures the dashboard always shows main index prices even when
+        those indices aren't in the active trading instrument set.
+        """
+        from app.core.instruments import NIFTY, BANKNIFTY, FINNIFTY
+
+        index_configs = [NIFTY, BANKNIFTY, FINNIFTY]
+        active_symbols = {i.symbol for i in self._active_instruments}
+
+        for idx_conf in index_configs:
+            if idx_conf.symbol in active_symbols:
+                continue  # Already fully analyzed
+            if idx_conf.symbol in self.snapshots:
+                # Already have a snapshot from this session — just refresh price
+                pass
+
+            try:
+                from_date = now.strftime("%Y-%m-%d 09:15")
+                to_date = now.strftime("%Y-%m-%d %H:%M")
+                candles = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.client.get_candle_data,
+                        idx_conf.token, idx_conf.exchange.value,
+                        "FIVE_MINUTE", from_date, to_date,
+                    ),
+                    timeout=15,
+                )
+                df = self.client.candles_to_dataframe(candles)
+                if df.empty:
+                    continue
+
+                spot_price = float(df.iloc[-1]["close"])
+                prev_close = float(df.iloc[0]["open"]) if len(df) > 1 else None
+                day_high = float(df["high"].max())
+                day_low = float(df["low"].min())
+
+                # Compute basic indicators for display
+                indicators = self.feature_engine.get_latest_indicators(
+                    self.feature_engine.compute_indicators(df, today_date=now.strftime("%Y-%m-%d"))
+                )
+
+                snap = MarketSnapshot(
+                    instrument=idx_conf.symbol,
+                    price=spot_price,
+                    nifty_price=spot_price if idx_conf.symbol == "NIFTY" else (
+                        self.snapshots["NIFTY"].nifty_price if "NIFTY" in self.snapshots else spot_price
+                    ),
+                    vwap=indicators.vwap,
+                    regime=self.regime_detector.detect(df),
+                    global_bias=self.global_bias,
+                    indicators=indicators,
+                    options_metrics=self._options_metrics.get(idx_conf.symbol, OptionsMetrics()),
+                    timestamp=now,
+                    prev_day_high=day_high,
+                    prev_day_low=day_low,
+                    prev_day_close=prev_close,
+                    is_expiry_day=False,
+                    htf_trend=self._htf_biases.get(idx_conf.symbol),
+                )
+                self.snapshots[idx_conf.symbol] = snap
+                logger.debug("[%s] Index snapshot updated: %.2f", idx_conf.symbol, spot_price)
+            except Exception as e:
+                logger.debug("[%s] Index snapshot fetch failed: %s", idx_conf.symbol, e)
 
     async def _analyze_instrument(
         self, instrument: InstrumentConfig, cycle: int, now: datetime
@@ -748,6 +817,14 @@ class Orchestrator:
             )
             self.snapshots[symbol] = snap
             await self.history_logger.save_snapshot(snap)
+
+            # Update shared API state incrementally (so dashboard shows data ASAP)
+            from app.api.routes import get_state
+            state = get_state()
+            if state.get("snapshot") is None:
+                state["snapshot"] = snap
+                self.snapshot = snap
+            state["snapshots"] = self.snapshots
 
             # 7. Check exits on open trades for this instrument
             await self._check_trade_exits_for(instrument, spot_price)

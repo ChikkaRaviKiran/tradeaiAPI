@@ -17,7 +17,10 @@ import pytz
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
 
-NSE_FII_URL = "https://www.nseindia.com/api/fiidiiActivity"
+NSE_FII_URLS = [
+    "https://www.nseindia.com/api/fiidiiTradeReact",
+    "https://www.nseindia.com/api/fiidiiActivity",
+]
 NSE_BASE = "https://www.nseindia.com"
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -68,13 +71,17 @@ async def fetch_fii_dii_data() -> Optional[InstitutionalFlow]:
             # Get session cookie
             await client.get(NSE_BASE, headers=_HEADERS)
 
-            # Fetch FII/DII data
-            resp = await client.get(NSE_FII_URL, headers=_HEADERS)
-            if resp.status_code != 200:
-                logger.warning("NSE FII/DII API returned %d", resp.status_code)
+            # Fetch FII/DII data (try multiple endpoints)
+            data = None
+            for url in NSE_FII_URLS:
+                resp = await client.get(url, headers=_HEADERS)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    break
+                logger.warning("NSE FII/DII API %s returned %d", url, resp.status_code)
+            if data is None:
+                logger.warning("All NSE FII/DII endpoints failed")
                 return None
-
-            data = resp.json()
 
             flow = InstitutionalFlow(
                 date=datetime.now(_IST).strftime("%Y-%m-%d"),
