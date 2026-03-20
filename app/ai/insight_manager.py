@@ -195,6 +195,14 @@ class InsightManager:
             if weak:
                 parts.append(f"Weak sectors: {', '.join(weak[:5])}")
 
+        # Live news sentiment
+        news_sentiment = insight.get("news_sentiment", 0)
+        if isinstance(news_sentiment, dict):
+            news_sentiment = news_sentiment.get("score", 0)
+        if news_sentiment:
+            direction = "bullish" if news_sentiment > 0.2 else "bearish" if news_sentiment < -0.2 else "neutral"
+            parts.append(f"Live news sentiment: {news_sentiment:.2f} ({direction})")
+
         # AI plan
         plan = insight.get("trading_plan", "")
         if plan:
@@ -206,3 +214,27 @@ class InsightManager:
             parts.append(f"Lessons from past trades: {'; '.join(lessons[:3])}")
 
         return "\n".join(parts)
+
+    def get_recent_news_summary(self, recent_news: list[dict]) -> str:
+        """Build a compact news summary for AI decision context.
+
+        Args:
+            recent_news: List of news items from DB (last 2 hours).
+
+        Returns:
+            Formatted string with recent headlines and sentiment.
+        """
+        if not recent_news:
+            return ""
+
+        # Pick the 10 most recent items
+        items = recent_news[:10]
+        lines = ["Recent market news (last 2 hours):"]
+        for item in items:
+            sentiment = item.get("sentiment", "neutral")
+            score = item.get("sentiment_score", 0)
+            text = item.get("extracted_text", "")[:120]
+            source = item.get("source", "unknown")
+            lines.append(f"- [{source}] {text} (sentiment: {sentiment}, score: {score:.1f})")
+
+        return "\n".join(lines)

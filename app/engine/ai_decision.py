@@ -103,8 +103,16 @@ class AIDecisionEngine:
 
             # Append intelligence context if available
             intelligence_context = ""
+            news_context = ""
             if _insight_manager:
                 intelligence_context = _insight_manager.get_ai_context_block()
+                # Fetch recent news for AI context
+                try:
+                    from app.data.telegram_news import get_recent_news
+                    recent_news = await get_recent_news(days=1)
+                    news_context = _insight_manager.get_recent_news_summary(recent_news)
+                except Exception:
+                    pass
 
             client = self._get_client()
 
@@ -113,9 +121,12 @@ class AIDecisionEngine:
                 {"role": "user", "content": prompt},
             ]
             if intelligence_context:
+                ctx = f"Pre-market intelligence:\n{intelligence_context}"
+                if news_context:
+                    ctx += f"\n\n{news_context}"
                 messages.insert(1, {
                     "role": "system",
-                    "content": f"Pre-market intelligence:\n{intelligence_context}",
+                    "content": ctx,
                 })
 
             response = await client.chat.completions.create(

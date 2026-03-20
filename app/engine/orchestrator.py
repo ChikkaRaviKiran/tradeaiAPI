@@ -203,6 +203,9 @@ class Orchestrator:
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
 
+        # RSS news polling (every 30 min during market hours)
+        self._last_rss_fetch: Optional[datetime] = None
+
         # ── Pipeline Activity Log ────────────────────────────────────
         # Ring buffer of pipeline events for dashboard visibility
         self.activity_log: deque[dict] = deque(maxlen=500)
@@ -279,6 +282,7 @@ class Orchestrator:
         self.snapshot = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
+        self._last_rss_fetch = None
         self.paper_trader = PaperTradingEngine()  # Fresh daily paper trader
         self.running = False
         logger.info("Daily state reset complete")
@@ -511,6 +515,9 @@ class Orchestrator:
                     except Exception:
                         logger.exception("Failed to refresh global data")
 
+                # Periodic RSS news fetch (every 30 min)
+                await self._maybe_fetch_rss_news()
+
                 await self._run_analysis_cycle()
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
                 continue
@@ -583,6 +590,63 @@ class Orchestrator:
 
         except Exception:
             logger.exception("Error in analysis cycle")
+
+    async def _maybe_fetch_rss_news(self) -> None:
+        """Fetch RSS news if 30+ minutes since last fetch."""
+        now = datetime.now(IST)
+        if self._last_rss_fetch and (now - self._last_rss_fetch).total_seconds() < 1800:
+            return  # Not time yet
+
+        try:
+            from app.data.rss_news import fetch_and_analyze
+            from app.data.telegram_news import save_news_to_db
+
+            articles = await fetch_and_analyze()
+            if articles:
+                saved = await save_news_to_db(articles)
+                self._log_event("data", f"RSS news: {saved} new articles saved")
+                self._set_source("news", "ok", f"{saved} RSS articles")
+
+                # Update live news sentiment in insight manager
+                await self._update_live_news_sentiment()
+            else:
+                self._log_event("data", "RSS news: no new articles")
+
+            self._last_rss_fetch = now
+        except Exception:
+            logger.exception("RSS news fetch failed (non-critical)")
+            self._last_rss_fetch = now  # Don't retry immediately on failure
+
+    async def _update_live_news_sentiment(self) -> None:
+        """Recalculate news sentiment from recent DB entries and update insight manager."""
+        try:
+            from app.data.telegram_news import get_recent_news
+            recent = await get_recent_news(days=1)
+
+            if not recent:
+                return
+
+            # Weighted average: more recent items get higher weight
+            # Only consider last 2 hours of news for live sentiment
+            now = datetime.now(IST)
+            cutoff = now - timedelta(hours=2)
+            recent_scores = []
+            for item in recent:
+                score = item.get("sentiment_score", 0)
+                if score and isinstance(score, (int, float)):
+                    recent_scores.append(score)
+
+            if recent_scores:
+                avg_sentiment = sum(recent_scores) / len(recent_scores)
+                # Update the insight with live news sentiment
+                if self.pre_market_analyst.latest_insight is not None:
+                    self.pre_market_analyst.latest_insight["news_sentiment"] = avg_sentiment
+                    logger.info(
+                        "Live news sentiment updated: %.2f (from %d items)",
+                        avg_sentiment, len(recent_scores),
+                    )
+        except Exception:
+            logger.warning("Failed to update live news sentiment")
 
     async def _update_index_snapshots(self, now: datetime) -> None:
         """Fetch basic price data for NIFTY/BANKNIFTY/FINNIFTY if not already tracked.
