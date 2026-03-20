@@ -314,31 +314,29 @@ async def get_recent_news(days: int = 1) -> list[dict]:
                 }
                 for r in records
             ]
-    except RuntimeError as e:
-        if "different loop" in str(e):
-            # Event loop mismatch — fall back to sync query
-            logger.warning("Event loop mismatch in get_recent_news — using sync fallback")
-            return await _get_recent_news_sync(cutoff)
-        logger.exception("Error fetching recent news")
-        return []
-    except Exception:
+    except (RuntimeError, Exception) as e:
+        err_msg = str(e)
+        if "different loop" in err_msg or "another operation" in err_msg or "InterfaceError" in type(e).__name__:
+            logger.warning("Async DB error in get_recent_news (%s) — using sync fallback", type(e).__name__)
+            return _get_recent_news_sync(cutoff)
         logger.exception("Error fetching recent news")
         return []
 
 
-async def _get_recent_news_sync(cutoff: str) -> list[dict]:
+def _get_recent_news_sync(cutoff: str) -> list[dict]:
     """Sync fallback for when asyncpg event loop differs from caller."""
-    import asyncio
     from app.db.models import TelegramNewsRecord
     from sqlalchemy import create_engine, select as sa_select
     from sqlalchemy.orm import Session
     from app.core.config import settings
 
     try:
-        sync_url = settings.database_url.replace("postgresql+asyncpg", "postgresql+psycopg2").replace("postgresql://", "postgresql+psycopg2://")
-        if "+asyncpg" in sync_url:
-            sync_url = sync_url.replace("+asyncpg", "")
-        engine = create_engine(sync_url)
+        sync_url = settings.database_url
+        # Normalise to psycopg2 driver
+        sync_url = sync_url.replace("postgresql+asyncpg", "postgresql+psycopg2")
+        if sync_url.startswith("postgresql://"):
+            sync_url = sync_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        engine = create_engine(sync_url, pool_pre_ping=True)
         with Session(engine) as session:
             result = session.execute(
                 sa_select(TelegramNewsRecord)
@@ -346,7 +344,7 @@ async def _get_recent_news_sync(cutoff: str) -> list[dict]:
                 .order_by(TelegramNewsRecord.created_at.desc())
             )
             records = result.scalars().all()
-            return [
+            data = [
                 {
                     "id": r.id,
                     "date": r.date,
@@ -360,6 +358,8 @@ async def _get_recent_news_sync(cutoff: str) -> list[dict]:
                 }
                 for r in records
             ]
+        engine.dispose()
+        return data
     except Exception:
         logger.exception("Sync fallback for recent news also failed")
         return []

@@ -39,6 +39,7 @@ PRE_MARKET_SYSTEM_PROMPT = """You are an expert Indian stock market analyst prep
 You receive comprehensive market data including:
 - FII/DII institutional flows
 - Market breadth (advance/decline, sector performance)
+- NIFTY 50 spot price (previous close, last price, day high/low) — USE THIS for accurate key_levels
 - Recent news from financial channels
 - Rolling 30-day trade performance history
 - Global market indices
@@ -70,6 +71,7 @@ Rules:
 - Past trade patterns: note repeated losses in specific conditions and adjust
 - Be specific about entry/exit conditions in the trading plan
 - Confidence reflects how clear the market direction is (< 40 means uncertain)
+- key_levels MUST be based on actual NIFTY spot price data provided — support should be below and resistance above the current/previous close
 """
 
 
@@ -299,6 +301,17 @@ class PreMarketAnalyst:
             ]
         else:
             data["global_indices"] = "unavailable"
+
+        # NIFTY 50 spot price for accurate key level generation
+        if breadth and breadth.nifty_prev_close:
+            data["nifty_spot"] = {
+                "previous_close": breadth.nifty_prev_close,
+                "last_price": breadth.nifty_last_price,
+                "day_high": breadth.nifty_day_high,
+                "day_low": breadth.nifty_day_low,
+            }
+        else:
+            data["nifty_spot"] = "unavailable"
 
         data["current_date"] = datetime.now(_IST).strftime("%Y-%m-%d")
         data["current_time"] = datetime.now(_IST).strftime("%H:%M IST")

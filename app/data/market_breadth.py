@@ -57,6 +57,11 @@ class MarketBreadth:
     total_unchanged: int = 0
     advance_decline_ratio: float = 1.0
     sectors: list[SectorData] = field(default_factory=list)
+    # NIFTY 50 spot price data (extracted from index fetch)
+    nifty_prev_close: Optional[float] = None
+    nifty_last_price: Optional[float] = None
+    nifty_day_high: Optional[float] = None
+    nifty_day_low: Optional[float] = None
 
     @property
     def breadth_signal(self) -> str:
@@ -143,7 +148,7 @@ async def fetch_market_breadth() -> Optional[MarketBreadth]:
 
 
 def _parse_advance_decline(data: dict, breadth: MarketBreadth) -> None:
-    """Extract advance/decline counts from NSE index data."""
+    """Extract advance/decline counts and NIFTY spot price from NSE index data."""
     advance = data.get("advance", {})
     if isinstance(advance, dict):
         breadth.total_advancing = int(advance.get("advances", 0))
@@ -164,3 +169,14 @@ def _parse_advance_decline(data: dict, breadth: MarketBreadth) -> None:
         breadth.advance_decline_ratio = round(
             breadth.total_advancing / breadth.total_declining, 2
         )
+
+    # Extract NIFTY 50 spot price from the index row (first entry in data array)
+    if isinstance(data.get("data"), list) and data["data"]:
+        idx_row = data["data"][0]
+        try:
+            breadth.nifty_prev_close = float(idx_row.get("previousClose", 0)) or None
+            breadth.nifty_last_price = float(idx_row.get("lastPrice", 0)) or None
+            breadth.nifty_day_high = float(idx_row.get("dayHigh", 0)) or None
+            breadth.nifty_day_low = float(idx_row.get("dayLow", 0)) or None
+        except (ValueError, TypeError):
+            pass

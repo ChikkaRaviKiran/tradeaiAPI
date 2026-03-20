@@ -269,6 +269,12 @@ async def get_db() -> AsyncSession:
 
 async def init_db() -> None:
     """Create all tables and run pending column migrations."""
+    # Use a fresh engine bound to the current event loop to avoid
+    # 'attached to a different loop' errors on container startup.
+    global async_engine, AsyncSessionLocal
+    async_engine = create_async_engine(settings.database_url, echo=False)
+    AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Add columns that may be missing on existing tables (safe migrations)

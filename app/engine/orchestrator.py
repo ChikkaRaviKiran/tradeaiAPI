@@ -1125,7 +1125,8 @@ class Orchestrator:
             if sym not in inst_best:
                 inst_best[sym] = r.composite_score
                 inst_strats[sym] = []
-            inst_strats[sym].append(r.strategy)
+            if r.strategy not in inst_strats[sym]:
+                inst_strats[sym].append(r.strategy)
 
         if not inst_best:
             logger.warning(
