@@ -37,8 +37,14 @@ class DataValidator:
         if len(df) < 2:
             return False
 
-        # Only check the last 10 candles — old gaps don't affect current analysis
-        recent = df.tail(10)
+        # Only check today's candles — overnight/weekend gaps are expected
+        # when previous-day data is included for indicator warmup
+        today = df.index[-1].strftime("%Y-%m-%d")
+        today_df = df[df.index.strftime("%Y-%m-%d") == today]
+        if len(today_df) < 2:
+            return False
+
+        recent = today_df.tail(10)
         timestamps = recent.index.to_series()
         diffs = timestamps.diff().dropna()
         max_gap = diffs.max()
