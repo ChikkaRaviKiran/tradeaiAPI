@@ -77,6 +77,7 @@ Rules:
 - Market breadth A/D ratio > 1.5 is bullish, < 0.7 is bearish
 - Apply lessons from past trade patterns mentioned in the intelligence context
 - If htf_trend is provided ("bullish"/"bearish"/"neutral"), it represents the 5-minute chart EMA trend direction. Signals opposing this trend are lower probability — require extra confirmation.
+- IMPORTANT: Your confidence_score MUST be your OWN independent assessment based on the market data, indicators, and setup quality. Do NOT copy or mirror any pre-computed score. Assess the setup freshly using the technical indicators, market regime, options data, and timing.
 """
 
 
@@ -205,7 +206,6 @@ class AIDecisionEngine:
                     "suggested_stoploss": signal.stoploss,
                     "suggested_target1": signal.target1,
                     "suggested_target2": signal.target2,
-                    "score": score,
                     "details": signal.details,
                 },
                 "volatility_regime": snapshot.regime.value,

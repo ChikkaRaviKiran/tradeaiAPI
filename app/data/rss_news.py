@@ -29,19 +29,29 @@ _HEADERS = {
 # RSS feed sources
 RSS_FEEDS = [
     {
-        "name": "MoneyControl Top News",
-        "url": "https://www.moneycontrol.com/rss/MCtopnews.xml",
-        "source": "moneycontrol",
-    },
-    {
-        "name": "MoneyControl Market Reports",
-        "url": "https://www.moneycontrol.com/rss/marketreports.xml",
-        "source": "moneycontrol",
+        "name": "LiveMint Markets",
+        "url": "https://www.livemint.com/rss/markets",
+        "source": "livemint",
     },
     {
         "name": "Economic Times Markets",
         "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
         "source": "economictimes",
+    },
+    {
+        "name": "Economic Times Stocks",
+        "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
+        "source": "economictimes",
+    },
+    {
+        "name": "NDTV Profit",
+        "url": "https://feeds.feedburner.com/ndtvprofit-latest",
+        "source": "ndtv",
+    },
+    {
+        "name": "Business Standard Markets",
+        "url": "https://www.business-standard.com/rss/markets-106.rss",
+        "source": "businessstandard",
     },
 ]
 

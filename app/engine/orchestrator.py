@@ -592,9 +592,9 @@ class Orchestrator:
             logger.exception("Error in analysis cycle")
 
     async def _maybe_fetch_rss_news(self) -> None:
-        """Fetch RSS news if 30+ minutes since last fetch."""
+        """Fetch RSS news if 15+ minutes since last fetch."""
         now = datetime.now(IST)
-        if self._last_rss_fetch and (now - self._last_rss_fetch).total_seconds() < 1800:
+        if self._last_rss_fetch and (now - self._last_rss_fetch).total_seconds() < 900:
             return  # Not time yet
 
         try:
@@ -761,17 +761,25 @@ class Orchestrator:
                 try:
                     fut_candles = await asyncio.wait_for(
                         asyncio.to_thread(
-                            self.client.get_nifty_futures_candles,
-                            interval="ONE_MINUTE", from_date=from_date, to_date=to_date,
+                            self.client.get_index_futures_candles,
+                            instrument.symbol,  # NIFTY, BANKNIFTY, etc.
+                            "ONE_MINUTE", from_date, to_date,
                         ),
                         timeout=45,
                     )
                 except asyncio.TimeoutError:
                     logger.warning("[%s] Futures candle fetch timed out", symbol)
                     fut_candles = []
+                except Exception:
+                    logger.warning("[%s] Futures candle fetch failed", symbol, exc_info=True)
+                    fut_candles = []
                 if fut_candles:
                     fut_df = self.client.candles_to_dataframe(fut_candles)
                     df = self.feature_engine.merge_futures_volume(df, fut_df)
+                    self._log_event("data", f"Futures volume merged: {fut_df['volume'].sum():,}", cycle=cycle, instrument=symbol)
+                else:
+                    logger.warning("[%s][Cycle %d] No futures volume — VWAP/volume scoring limited", symbol, cycle)
+                    self._log_event("data", "No futures volume available — using ATR/option proxies", cycle=cycle, instrument=symbol)
 
             # 2c. Fetch 5-min candles for multi-timeframe filter (every 5 min)
             if now.minute % 5 == 0 or symbol not in self._htf_biases:

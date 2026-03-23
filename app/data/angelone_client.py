@@ -242,46 +242,48 @@ class AngelOneClient:
             self.nifty_token, self.exchange, interval, from_date, to_date
         )
 
-    def get_nifty_futures_candles(
+    def get_index_futures_candles(
         self,
+        index_name: str = "NIFTY",
         interval: str = "ONE_MINUTE",
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
     ) -> list[Candle]:
-        """Fetch current month NIFTY Futures candle data.
+        """Fetch current month index Futures candle data.
 
-        NIFTY futures have real volume, unlike the spot index (always 0).
+        Index futures have real volume, unlike the spot index (always 0).
         Used to get volume data for VWAP computation and volume analysis.
+        Works for NIFTY, BANKNIFTY, FINNIFTY, etc.
         """
-        token = self._get_nifty_fut_token()
+        token = self._get_index_fut_token(index_name)
         if not token:
-            logger.warning("Could not find NIFTY Futures token — no volume data")
+            logger.warning("Could not find %s Futures token — no volume data", index_name)
             return []
         return self.get_candle_data(token, self.nfo_exchange, interval, from_date, to_date)
 
-    def _get_nifty_fut_token(self) -> Optional[str]:
-        """Find the current month NIFTY futures symbol token.
+    # Keep backward compat
+    def get_nifty_futures_candles(self, **kwargs) -> list[Candle]:
+        return self.get_index_futures_candles("NIFTY", **kwargs)
 
-        Uses the instrument master JSON (same source as expiry discovery)
-        to reliably find the nearest NIFTY futures contract token.
-        searchScrip is unreliable because it returns too many option matches.
+    def _get_index_fut_token(self, index_name: str = "NIFTY") -> Optional[str]:
+        """Find the current month futures symbol token for a given index.
+
+        Uses the instrument master JSON to find the nearest futures contract.
         """
-        if hasattr(self, "_nifty_fut_token_cache") and self._nifty_fut_token_cache:
-            return self._nifty_fut_token_cache
+        cache_attr = f"_fut_token_cache_{index_name}"
+        if hasattr(self, cache_attr) and getattr(self, cache_attr):
+            return getattr(self, cache_attr)
 
         try:
-            import json
-            from urllib.request import urlopen
-
-            url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-            logger.info("Fetching instrument master for NIFTY Futures token...")
-
             instruments = self._get_instrument_master()
 
             today = datetime.now(_IST).date()
             best_token = None
             best_symbol = None
             best_expiry = None
+
+            # Determine instrument type — FUTIDX for indices, FUTSTK for stocks
+            fut_type = "FUTIDX"
 
             for inst in instruments:
                 name = inst.get("name", "")
@@ -290,11 +292,9 @@ class AngelOneClient:
                 expiry_str = inst.get("expiry", "")
                 inst_type = inst.get("instrumenttype", "")
 
-                # Look for NIFTY futures in NFO segment
-                if exch_seg != "NFO" or name != "NIFTY":
+                if exch_seg != "NFO" or name != index_name:
                     continue
-                # FUTIDX = Index Futures
-                if inst_type != "FUTIDX":
+                if inst_type != fut_type:
                     continue
                 if not symbol.endswith("FUT"):
                     continue
@@ -306,27 +306,25 @@ class AngelOneClient:
                 except ValueError:
                     continue
 
-                # Must not be expired
                 if exp_date < today:
                     continue
 
-                # Pick the nearest expiry
                 if best_expiry is None or exp_date < best_expiry:
                     best_expiry = exp_date
                     best_token = inst.get("token", "")
                     best_symbol = symbol
 
             if best_token:
-                self._nifty_fut_token_cache = best_token
+                setattr(self, cache_attr, best_token)
                 logger.info(
-                    "NIFTY Futures token from instrument master: %s (%s, expiry=%s)",
-                    best_token, best_symbol, best_expiry,
+                    "%s Futures token: %s (%s, expiry=%s)",
+                    index_name, best_token, best_symbol, best_expiry,
                 )
-                return self._nifty_fut_token_cache
+                return best_token
 
-            logger.warning("No NIFTY Futures contract found in instrument master")
+            logger.warning("No %s Futures contract found in instrument master", index_name)
         except Exception:
-            logger.exception("Error fetching NIFTY futures token from instrument master")
+            logger.exception("Error fetching %s futures token", index_name)
         return None
 
     # ── LTP / Quote ──────────────────────────────────────────────────────

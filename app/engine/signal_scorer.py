@@ -2,8 +2,8 @@
 
 Scoring factors (max 100) — every point must come from real market data:
   Strategy trigger quality:  22  (RSI confirmation, candle strength, breakout margin)
-  Volume confirmation:       18  (NIFTY futures volume OR options ATM volume)
-  VWAP alignment:            13  (only if VWAP is volume-weighted from futures data)
+  Volume confirmation:       18  (futures volume, ATM option volume, or ATR proxy up to 9)
+  VWAP alignment:            13  (full if volume-weighted, up to 7 without)
   Options OI signal:         13  (PCR, OI change — only if real data present)
   Global bias:                8  (only if real global data fetched)
   Historical pattern:        11  (EMA alignment incl. EMA200, swing structure, ADX)
@@ -166,7 +166,7 @@ class SignalScorer:
         """Score based on strategy trigger quality (0–22).
 
         No free base points. Points earned from:
-          - RSI in directional sweet spot (+7)
+          - RSI in directional sweet spot (+7) or acceptable range (+4)
           - Strong candle body > 60% of range (+5)
           - Breakout margin / sweep depth from details (+5)
           - MACD histogram confirming direction (+5)
@@ -178,15 +178,20 @@ class SignalScorer:
         last = df.iloc[-1]
 
         rsi = last.get("rsi")
-        if rsi is None or (isinstance(rsi, float) and pd.isna(rsi)):
-            return 0  # No RSI = can't evaluate trigger quality
+        has_rsi = rsi is not None and not (isinstance(rsi, float) and pd.isna(rsi))
 
         # RSI directional confirmation (+7)
-        if signal.option_type == OptionType.CALL and 55 <= rsi <= 70:
-            score += 7
-        elif signal.option_type == OptionType.PUT and 30 <= rsi <= 45:
-            score += 7
-        # No partial credit — RSI must be in the sweet spot to earn points
+        if has_rsi:
+            if signal.option_type == OptionType.CALL:
+                if 55 <= rsi <= 70:
+                    score += 7  # Sweet spot
+                elif 50 <= rsi <= 75:
+                    score += 4  # Acceptable range
+            elif signal.option_type == OptionType.PUT:
+                if 30 <= rsi <= 45:
+                    score += 7  # Sweet spot
+                elif 25 <= rsi <= 50:
+                    score += 4  # Acceptable range
 
         # Strong candle body (+5) — at least 50% body required
         open_ = last.get("open", 0)
@@ -276,7 +281,7 @@ class SignalScorer:
             # Below average volume = 0
 
         # Path 2: No futures volume — try ATM option volume from chain
-        elif not is_index and options_metrics.atm_option_volume > 0:
+        elif options_metrics.atm_option_volume > 0:
             atm_vol = options_metrics.atm_option_volume
             # Compare against previous cycle's ATM volume
             if self._prev_atm_volume > 0:
@@ -295,8 +300,8 @@ class SignalScorer:
                     score = 4
 
             self._prev_atm_volume = atm_vol
-        # Path 3: No volume data (or index data) — infer activity from candle range vs ATR
-        # CAPPED at 6pts: ATR proxy is less reliable than real volume
+        # Path 3: No volume data — infer activity from candle range vs ATR
+        # CAPPED at 9pts: ATR proxy is less reliable than real volume
         if score == 0:
             atr = last.get("atr")
             high = last.get("high", 0)
@@ -305,11 +310,11 @@ class SignalScorer:
             if atr and atr > 0 and candle_range > 0:
                 range_ratio = candle_range / atr
                 if range_ratio >= 1.5:
-                    score = 6  # Capped: ATR proxy doesn't confirm real participation
+                    score = 9
                 elif range_ratio >= 1.0:
-                    score = 4
+                    score = 6
                 elif range_ratio >= 0.7:
-                    score = 2
+                    score = 3
 
         return score
 
@@ -334,8 +339,8 @@ class SignalScorer:
         vol_sum = df["volume"].sum() if "volume" in df.columns else 0
         has_real_volume = vol_sum > 0
 
-        # Score multiplier: full credit with real volume, much less without
-        max_pts = 13 if has_real_volume else 4  # Reduced from 7: fake VWAP shouldn't earn much
+        # Score multiplier: full credit with real volume, reduced without
+        max_pts = 13 if has_real_volume else 7  # Non-volume VWAP still has value for price alignment
 
         if signal.option_type == OptionType.CALL and close > vwap:
             pct_above = (close - vwap) / vwap * 100 if vwap > 0 else 0
