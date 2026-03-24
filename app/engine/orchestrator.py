@@ -835,6 +835,7 @@ class Orchestrator:
             prev_day_high = float(df_prev["high"].max()) if not df_prev.empty else None
             prev_day_low = float(df_prev["low"].min()) if not df_prev.empty else None
             prev_day_close = float(df_prev.iloc[-1]["close"]) if not df_prev.empty else None
+            day_open = float(df_today.iloc[0]["open"]) if not df_today.empty else None
 
             if df_prev.empty and cycle <= 2:
                 logger.warning(
@@ -900,6 +901,7 @@ class Orchestrator:
                 prev_day_high=prev_day_high,
                 prev_day_low=prev_day_low,
                 prev_day_close=prev_day_close,
+                day_open=day_open,
                 is_expiry_day=is_expiry,
                 htf_trend=self._htf_biases.get(symbol),
             )
@@ -988,6 +990,7 @@ class Orchestrator:
 
             best_signal = None
             best_score = 0.0
+            best_score_result = None
 
             for signal in signals:
                 score_result = self.signal_scorer.score(
@@ -1027,6 +1030,7 @@ class Orchestrator:
                 if boosted_score >= adaptive_min and boosted_score > best_score:
                     best_signal = signal
                     best_score = boosted_score
+                    best_score_result = score_result
                     signal.score = boosted_score
 
             if best_signal is None:
@@ -1057,7 +1061,7 @@ class Orchestrator:
             best_signal.target2 = round(option_ltp + (3.5 * option_atr), 2)
 
             # 12. AI validation
-            decision = await self.ai_engine.evaluate(best_signal, snap, best_score)
+            decision = await self.ai_engine.evaluate(best_signal, snap, best_score, best_score_result)
 
             if not decision.trade_decision or decision.confidence_score < 70:
                 logger.info(

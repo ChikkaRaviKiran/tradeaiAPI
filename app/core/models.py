@@ -190,6 +190,7 @@ class MarketSnapshot(BaseModel):
     prev_day_high: Optional[float] = None   # Previous day high — key resistance
     prev_day_low: Optional[float] = None    # Previous day low — key support
     prev_day_close: Optional[float] = None  # Previous day close — reference level
+    day_open: Optional[float] = None          # Today's opening price — for gap analysis
     is_expiry_day: bool = False             # True if today is this instrument's options expiry
     htf_trend: Optional[str] = None         # Higher-timeframe (5-min) trend: "bullish", "bearish", "neutral"
 

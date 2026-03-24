@@ -18,6 +18,7 @@ from app.core.models import (
     GlobalBias,
     MarketRegime,
     MarketSnapshot,
+    SignalScore,
     StrategySignal,
     TechnicalIndicators,
     OptionsMetrics,
@@ -69,6 +70,15 @@ Rules:
 - prev_day_high, prev_day_low are key support/resistance levels — price near these levels often reverses
 - If spot is within 0.15% of prev_day_high for CALL or prev_day_low for PUT, be cautious (reversal zone)
 - prev_day_close is the reference — opening gap direction matters (gap up favors CALL momentum, gap down favors PUT)
+- day_open and open_gap_pct show today's opening gap — large gap ups (>0.5%) favor CALL continuation, large gap downs favor PUT
+- signal_score_breakdown shows how the pre-computed signal scored across multiple factors (each factor's max points):
+  strategy_trigger (22): RSI, candle body, breakout margin, MACD confirmation
+  volume_confirmation (18): futures/options volume vs average
+  vwap_alignment (13): price alignment with VWAP (higher if real volume-weighted)
+  options_oi_signal (13): PCR direction + OI change confirmation
+  global_bias_score (8): alignment with global market direction
+  historical_pattern (11): EMA hierarchy, ADX, price structure
+  Use the breakdown to understand WHERE confirmation is strong vs weak — a high total from just strategy_trigger with no volume/options confirmation is fragile
 - Bollinger bands help assess if price is extended — reject if price is at extreme bands without reversal signal
 - Any null indicator means that data point is genuinely unavailable — do not assume a default value
 - Trend strength score: 3=strong uptrend (ema9>20>50>200), 0=strong downtrend
@@ -97,10 +107,11 @@ class AIDecisionEngine:
         signal: StrategySignal,
         snapshot: MarketSnapshot,
         score: float,
+        score_breakdown: Optional[SignalScore] = None,
     ) -> AIDecision:
         """Send signal + market context to AI for validation."""
         try:
-            prompt = self._build_prompt(signal, snapshot, score)
+            prompt = self._build_prompt(signal, snapshot, score, score_breakdown)
 
             # Append intelligence context if available
             intelligence_context = ""
@@ -152,9 +163,30 @@ class AIDecisionEngine:
         signal: StrategySignal,
         snapshot: MarketSnapshot,
         score: float,
+        score_breakdown: Optional[SignalScore] = None,
     ) -> str:
         """Build structured prompt for AI evaluation."""
         now = datetime.now(_IST)
+
+        # Score breakdown tells AI where confirmation is strong vs weak
+        score_detail = {"total": round(score, 1)}
+        if score_breakdown:
+            score_detail.update({
+                "strategy_trigger": round(score_breakdown.strategy_trigger, 1),
+                "volume_confirmation": round(score_breakdown.volume_confirmation, 1),
+                "vwap_alignment": round(score_breakdown.vwap_alignment, 1),
+                "options_oi_signal": round(score_breakdown.options_oi_signal, 1),
+                "global_bias_score": round(score_breakdown.global_bias_score, 1),
+                "historical_pattern": round(score_breakdown.historical_pattern, 1),
+            })
+
+        # Compute today's open gap context
+        open_gap_pct = None
+        if snapshot.day_open and snapshot.prev_day_close and snapshot.prev_day_close > 0:
+            open_gap_pct = round(
+                ((snapshot.day_open - snapshot.prev_day_close) / snapshot.prev_day_close) * 100, 2
+            )
+
         return json.dumps(
             {
                 "market_snapshot": {
@@ -163,6 +195,8 @@ class AIDecisionEngine:
                     "vwap": snapshot.vwap,
                     "vwap_is_volume_weighted": snapshot.indicators.vwap_is_volume_weighted,
                     "timestamp": now.strftime("%H:%M:%S"),
+                    "day_open": snapshot.day_open,
+                    "open_gap_pct": open_gap_pct,
                     "prev_day_high": snapshot.prev_day_high,
                     "prev_day_low": snapshot.prev_day_low,
                     "prev_day_close": snapshot.prev_day_close,
@@ -198,6 +232,7 @@ class AIDecisionEngine:
                 "global_context": {
                     "bias": snapshot.global_bias.value,
                 },
+                "signal_score_breakdown": score_detail,
                 "strategy_signal": {
                     "strategy": signal.strategy.value,
                     "option_type": signal.option_type.value,
@@ -212,7 +247,7 @@ class AIDecisionEngine:
                 "time_context": {
                     "current_time": now.strftime("%H:%M"),
                     "minutes_to_close": max(0, (15 * 60 + 30) - (now.hour * 60 + now.minute)),
-                    "is_expiry_day": snapshot.is_expiry_day,  # from real SmartAPI expiry data
+                    "is_expiry_day": snapshot.is_expiry_day,
                     "day_of_week": now.strftime("%A"),
                 },
             },
