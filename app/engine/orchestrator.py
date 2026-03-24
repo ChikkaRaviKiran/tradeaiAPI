@@ -592,29 +592,43 @@ class Orchestrator:
             logger.exception("Error in analysis cycle")
 
     async def _maybe_fetch_rss_news(self) -> None:
-        """Fetch RSS news if 15+ minutes since last fetch."""
+        """Fetch RSS + Telegram news if 15+ minutes since last fetch."""
         now = datetime.now(IST)
         if self._last_rss_fetch and (now - self._last_rss_fetch).total_seconds() < 900:
             return  # Not time yet
 
         try:
             from app.data.rss_news import fetch_and_analyze
-            from app.data.telegram_news import save_news_to_db
+            from app.data.telegram_news import collect_telegram_news, save_news_to_db
 
+            total_saved = 0
+
+            # Fetch RSS feeds
             articles = await fetch_and_analyze()
             if articles:
                 saved = await save_news_to_db(articles)
+                total_saved += saved
                 self._log_event("data", f"RSS news: {saved} new articles saved")
-                self._set_source("news", "ok", f"{saved} RSS articles")
 
-                # Update live news sentiment in insight manager
+            # Fetch Telegram channel news
+            try:
+                tg_items = await collect_telegram_news()
+                if tg_items:
+                    tg_saved = await save_news_to_db(tg_items)
+                    total_saved += tg_saved
+                    self._log_event("data", f"Telegram news: {tg_saved} new items saved")
+            except Exception:
+                logger.warning("Telegram news fetch failed (non-critical)")
+
+            if total_saved > 0:
+                self._set_source("news", "ok", f"{total_saved} news items")
                 await self._update_live_news_sentiment()
             else:
-                self._log_event("data", "RSS news: no new articles")
+                self._log_event("data", "News: no new articles from RSS or Telegram")
 
             self._last_rss_fetch = now
         except Exception:
-            logger.exception("RSS news fetch failed (non-critical)")
+            logger.exception("News fetch failed (non-critical)")
             self._last_rss_fetch = now  # Don't retry immediately on failure
 
     async def _update_live_news_sentiment(self) -> None:

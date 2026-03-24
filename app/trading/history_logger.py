@@ -104,6 +104,8 @@ class HistoryLogger:
         """Save an alert to the database."""
         try:
             await _ensure_tables()
+            # Strip timezone to store as naive IST (consistent with _now_ist convention)
+            ts_naive = alert.timestamp.replace(tzinfo=None) if alert.timestamp.tzinfo else alert.timestamp
             record = AlertRecord(
                 date=alert.timestamp.strftime("%Y-%m-%d"),
                 alert_type=alert.alert_type,
@@ -112,7 +114,7 @@ class HistoryLogger:
                 trade_id=alert.trade_id,
                 strategy=alert.strategy,
                 pnl=alert.pnl,
-                created_at=alert.timestamp,
+                created_at=ts_naive,
             )
             SessionLocal = _get_session_factory()
             async with SessionLocal() as session:

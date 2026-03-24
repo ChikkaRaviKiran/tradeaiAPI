@@ -149,8 +149,8 @@ async def get_alerts(limit: int = 50, target_date: str | None = None):
         if a.timestamp and a.timestamp.strftime("%Y-%m-%d") == filter_date
     ][:limit]
 
-    # If no in-memory alerts for requested date, try DB
-    if not filtered and target_date:
+    # If no in-memory alerts for requested date, fall back to DB
+    if not filtered:
         db_alerts = await history_logger.get_alerts_by_date(filter_date)
         if db_alerts:
             return db_alerts[:limit]
