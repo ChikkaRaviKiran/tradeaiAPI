@@ -459,12 +459,14 @@ class Orchestrator:
                     self._log_event("data", "Market breadth: NOT available")
 
                 news_count = len(analyst._news_items) if hasattr(analyst, '_news_items') else 0
-                if news_count > 0:
-                    self._set_source("news", "ok", f"{news_count} news items")
-                    self._log_event("data", f"Telegram news: {news_count} items collected")
+                db_news_count = insight.get("news_count", 0)
+                total_news = max(news_count, db_news_count)
+                if total_news > 0:
+                    self._set_source("news", "ok", f"{total_news} news items")
+                    self._log_event("data", f"News: {total_news} items ({news_count} scraped, {db_news_count} in DB)")
                 else:
                     self._set_source("news", "warn", "No news collected")
-                    self._log_event("data", "Telegram news: none collected")
+                    self._log_event("data", "News: none collected")
 
                 # Send Telegram summary
                 summary = insight.get("summary", "Analysis complete")

@@ -132,6 +132,7 @@ class PreMarketAnalyst:
         # Store for orchestrator access
         self._institutional_flow = fii_data
         self._market_breadth = breadth_data
+        self._news_items = news_items if isinstance(news_items, list) else []
 
         # Log data collection results
         logger.info(
