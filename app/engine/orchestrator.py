@@ -99,7 +99,12 @@ _REGIME_STRATEGY_COMPAT: dict[str, set[MarketRegime]] = {
 def _strategy_compatible_with_regime(strategy: BaseStrategy, regime: MarketRegime) -> bool:
     """Check if a strategy should run in the current market regime."""
     if regime == MarketRegime.INSUFFICIENT_DATA:
-        return False  # Never trade without regime data
+        # Allow strategies with their own time/structure filters (ORB, VWAP, LiquiditySweep)
+        # They don't depend on ADX-based regime to function correctly
+        class_name = type(strategy).__name__
+        if class_name in ("ORBStrategy", "VWAPReclaimStrategy", "LiquiditySweepStrategy"):
+            return True
+        return False
     class_name = type(strategy).__name__
     allowed_regimes = _REGIME_STRATEGY_COMPAT.get(class_name)
     if allowed_regimes is None:
@@ -864,10 +869,10 @@ class Orchestrator:
                 "atr": round(indicators.atr, 2) if indicators.atr else None,
             })
 
-            # 4. Options chain (for all instruments with expiry, every 5 min)
+            # 4. Options chain (for all instruments with expiry, every 3 min)
             options_metrics = self._options_metrics.get(symbol, OptionsMetrics())
             expiry = self._expiries.get(symbol)
-            if expiry and (now.minute % 5 == 0 or options_metrics.pcr is None):
+            if expiry and (now.minute % 3 == 0 or options_metrics.pcr is None):
                 options_metrics = await self._update_options_chain_for(instrument, spot_price, expiry)
                 self._options_metrics[symbol] = options_metrics
                 pcr_val = f"{options_metrics.pcr:.2f}" if options_metrics.pcr else "N/A"
@@ -972,6 +977,10 @@ class Orchestrator:
                     self._log_event("filter", f"HTF filter removed {filtered} signal(s) against {htf_bias} trend", cycle=cycle, instrument=symbol)
                 if not signals:
                     self._log_event("filter", "All signals filtered by HTF — skipping", cycle=cycle, instrument=symbol)
+                    await self.alert_manager.send_info(
+                        f"HTF FILTER — {symbol}",
+                        f"All {pre_count} signal(s) removed by 5-min {htf_bias} trend filter",
+                    )
                     return
 
             # 10. Score and filter (with evaluation boost for top-ranked combos)
@@ -991,6 +1000,7 @@ class Orchestrator:
             best_signal = None
             best_score = 0.0
             best_score_result = None
+            all_scored: list[tuple] = []  # (signal, boosted_score) for near-miss alerts
 
             for signal in signals:
                 score_result = self.signal_scorer.score(
@@ -1012,6 +1022,7 @@ class Orchestrator:
                     eval_boost = 5
 
                 boosted_score = min(raw_score + eval_boost, 100)
+                all_scored.append((signal, boosted_score))
 
                 if eval_boost > 0:
                     logger.info(
@@ -1035,6 +1046,17 @@ class Orchestrator:
 
             if best_signal is None:
                 self._log_event("score", f"No signal passed threshold ({adaptive_min})", cycle=cycle, instrument=symbol)
+                # Alert on near-misses (within 5 pts of threshold)
+                near_misses = [(s, sc) for s, sc in all_scored if sc >= adaptive_min - 5]
+                if near_misses:
+                    miss_info = "\n".join(
+                        f"{s.strategy.value} {s.option_type.value}: {sc:.0f}/{adaptive_min}"
+                        for s, sc in near_misses
+                    )
+                    await self.alert_manager.send_info(
+                        f"NEAR MISS — {symbol}",
+                        f"Signal(s) close to threshold but not passed:\n{miss_info}",
+                    )
                 return
 
             # 11. Fetch option premium
@@ -1053,6 +1075,14 @@ class Orchestrator:
             # Set ATR-based SL/targets
             atr = indicators.atr
             if atr is None or atr <= 0:
+                logger.warning("[%s] ATR unavailable — cannot compute SL/targets, skipping", symbol)
+                self._log_event("gate", "ATR unavailable — SL/targets cannot be computed", cycle=cycle, instrument=symbol)
+                await self.alert_manager.send_info(
+                    f"SIGNAL BLOCKED — {symbol} {best_signal.strategy.value}",
+                    f"Reason: ATR not available for position sizing\n"
+                    f"Strike: {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
+                    f"Score: {best_score:.0f}",
+                )
                 return
             option_atr = atr * 0.5
             best_signal.entry_price = option_ltp
@@ -1063,12 +1093,20 @@ class Orchestrator:
             # 12. AI validation
             decision = await self.ai_engine.evaluate(best_signal, snap, best_score, best_score_result)
 
-            if not decision.trade_decision or decision.confidence_score < 70:
+            # Adaptive AI confidence threshold:
+            # High signal scores need less AI confirmation (they have strong data backing)
+            ai_threshold = 70
+            if best_score >= 75:
+                ai_threshold = 60
+            elif best_score >= 65:
+                ai_threshold = 65
+
+            if not decision.trade_decision or decision.confidence_score < ai_threshold:
                 logger.info(
-                    "[%s] AI rejected (confidence=%.0f%%): %s",
-                    symbol, decision.confidence_score, decision.reason,
+                    "[%s] AI rejected (confidence=%.0f%%, threshold=%d): %s",
+                    symbol, decision.confidence_score, ai_threshold, decision.reason,
                 )
-                self._log_event("ai", f"AI REJECTED ({decision.confidence_score:.0f}%): {decision.reason}", cycle=cycle, instrument=symbol, data={
+                self._log_event("ai", f"AI REJECTED ({decision.confidence_score:.0f}%/{ai_threshold}): {decision.reason}", cycle=cycle, instrument=symbol, data={
                     "confidence": decision.confidence_score, "reason": decision.reason,
                     "strategy": best_signal.strategy.value, "score": best_score,
                 })

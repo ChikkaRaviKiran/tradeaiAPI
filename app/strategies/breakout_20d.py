@@ -47,9 +47,9 @@ class Breakout20DStrategy(BaseStrategy):
 
         now = df.index[-1]
         if hasattr(now, "hour"):
-            if now.hour < 9 or (now.hour == 9 and now.minute < 45):
+            if now.hour < 9 or (now.hour == 9 and now.minute < 30):
                 return None
-            if now.hour >= 15 and now.minute > 10:
+            if now.hour >= 15 and now.minute > 15:
                 return None
 
         last = df.iloc[-1]

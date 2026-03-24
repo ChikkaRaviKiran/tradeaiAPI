@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 WINDOW_START = dtime(10, 0)
 WINDOW_END = dtime(15, 0)
-MIN_BELOW_CANDLES = 8  # Reduced from 10 — faster signal generation
+MIN_BELOW_CANDLES = 5  # Reduced from 8 — catch quicker bounces on indices
 
 
 class VWAPReclaimStrategy(BaseStrategy):

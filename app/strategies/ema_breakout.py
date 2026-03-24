@@ -29,7 +29,7 @@ from app.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-WINDOW_START = dtime(9, 45)
+WINDOW_START = dtime(9, 30)  # Relaxed from 09:45 — allow post-ORB breakouts
 WINDOW_END = dtime(15, 0)
 
 

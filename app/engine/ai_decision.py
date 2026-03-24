@@ -50,44 +50,57 @@ You must respond ONLY with a valid JSON object (no markdown, no extra text) in t
     "reason": "brief explanation"
 }
 
-Rules:
-- Only approve trades with confidence >= 70
-- Consider market regime, volatility, and time of day
-- A good setup needs 3+ confirmations — don't approve marginal setups
-- entry_price, stoploss, target1, target2 are all OPTION PREMIUM values (not NIFTY spot)
-- The signal includes ATR-based suggested SL/targets — evaluate whether they are reasonable given the ATR value
-- Use the ATR value to judge if SL is too tight or too wide for current volatility
-- If ATR is null, reject the trade (volatility data unavailable)
-- Consider PCR, OI data, and option volumes for flow confirmation — if PCR is null, options data is unavailable (don't penalize)
-- When PCR or global bias data is missing, focus more on technical indicators (RSI, EMAs, ADX)
-- EMA200 provides long-term trend context — price above EMA200 favors CALL, below favors PUT
-- vwap_is_volume_weighted indicates if VWAP is computed from real futures volume (true) or just price average (false)
-- Consider global market bias — if "unavailable", ignore global context (don't reject because of it)
-- REJECT trades after 14:30 — last hour has highest chop/reversal rate
+=== WHEN TO APPROVE (confidence 70-90) ===
+- Strategy trigger is strong (RSI in sweet spot, clean candle, breakout margin present)
+- Price is aligned with VWAP direction (above VWAP for CALL, below for PUT)
+- Market regime supports the trade — trending or breakout regime matching signal direction
+- EMA hierarchy is aligned (ema9 > ema20 > ema50 for CALL, reverse for PUT)
+- ADX > 20 shows directional momentum
+- HTF trend matches the signal direction
+- 2+ technical confirmations are sufficient when they are STRONG confirmations (e.g., strong RSI + EMA alignment + VWAP support)
+- Missing options/volume data should NOT block a trade if technicals are strong — these are supplementary data sources for Indian indices
+- On gap-up days, CALL signals in the gap direction with trend alignment deserve HIGH confidence
+- On gap-down days, PUT signals in the gap direction with trend alignment deserve HIGH confidence
+
+=== WHEN TO REJECT (confidence < 60) ===
+- REJECT after 14:30 — last hour has highest chop/reversal rate
 - REJECT when regime is "insufficient_data" — not enough market data yet
 - REJECT when price is within 0.1% of previous day high/low — these are reversal zones
-- Be extra cautious on expiry days (is_expiry_day=true) — gamma risk increases sharply, pin risk near ATM strikes
-- prev_day_high, prev_day_low are key support/resistance levels — price near these levels often reverses
-- If spot is within 0.15% of prev_day_high for CALL or prev_day_low for PUT, be cautious (reversal zone)
-- prev_day_close is the reference — opening gap direction matters (gap up favors CALL momentum, gap down favors PUT)
-- day_open and open_gap_pct show today's opening gap — large gap ups (>0.5%) favor CALL continuation, large gap downs favor PUT
-- signal_score_breakdown shows how the pre-computed signal scored across multiple factors (each factor's max points):
-  strategy_trigger (22): RSI, candle body, breakout margin, MACD confirmation
-  volume_confirmation (18): futures/options volume vs average
-  vwap_alignment (13): price alignment with VWAP (higher if real volume-weighted)
-  options_oi_signal (13): PCR direction + OI change confirmation
-  global_bias_score (8): alignment with global market direction
-  historical_pattern (11): EMA hierarchy, ADX, price structure
-  Use the breakdown to understand WHERE confirmation is strong vs weak — a high total from just strategy_trigger with no volume/options confirmation is fragile
-- Bollinger bands help assess if price is extended — reject if price is at extreme bands without reversal signal
-- Any null indicator means that data point is genuinely unavailable — do not assume a default value
-- Trend strength score: 3=strong uptrend (ema9>20>50>200), 0=strong downtrend
-- If pre-market intelligence data is provided, consider FII/DII flows, market breadth, and news sentiment
-- FII selling > 1000cr is bearish; DII buying > 1000cr supports market
-- Market breadth A/D ratio > 1.5 is bullish, < 0.7 is bearish
-- Apply lessons from past trade patterns mentioned in the intelligence context
-- If htf_trend is provided ("bullish"/"bearish"/"neutral"), it represents the 5-minute chart EMA trend direction. Signals opposing this trend are lower probability — require extra confirmation.
-- IMPORTANT: Your confidence_score MUST be your OWN independent assessment based on the market data, indicators, and setup quality. Do NOT copy or mirror any pre-computed score. Assess the setup freshly using the technical indicators, market regime, options data, and timing.
+- REJECT if ATR is null — volatility data unavailable
+- REJECT if signal direction OPPOSES clear EMA hierarchy and HTF trend
+- Bollinger band extremes WITHOUT reversal signal suggest overextension
+
+=== DATA INTERPRETATION ===
+- entry_price, stoploss, target1, target2 are all OPTION PREMIUM values (not spot)
+- The signal includes ATR-based suggested SL/targets — evaluate whether they are reasonable given the ATR
+- EMA200 provides long-term trend context — price above EMA200 favors CALL, below favors PUT
+- vwap_is_volume_weighted: true = real futures volume, false = price-average proxy (still useful, just less reliable)
+- PCR > 1.2 is bullish (more puts written = support), PCR < 0.8 is bearish
+- If PCR or options data is null, it means the data source is unavailable — DO NOT penalize, focus on technical indicators instead
+- If global_bias is "unavailable", ignore global context entirely — many strong trades happen without global data
+- prev_day_high/low are S/R levels — note proximity but don't auto-reject unless price is within 0.1%
+- prev_day_close is the reference for gap calculations
+- day_open/open_gap_pct show today's opening gap direction
+- Trend strength score: 3 = strong uptrend (ema9>20>50>200), 0 = strong downtrend
+- Any null indicator means genuinely unavailable — do not assume a default, just skip that check
+
+=== SCORE BREAKDOWN CONTEXT ===
+- signal_score_breakdown shows how the signal scored across factors — use it to understand WHERE confirmation exists
+- High strategy_trigger with low volume/options scores is NORMAL for Indian indices — volume data is often delayed or unavailable
+- Do NOT reduce confidence just because volume_confirmation or options_oi_signal is low — these data sources are frequently unavailable
+- Focus on: strategy_trigger, vwap_alignment, historical_pattern, global_bias as the core decision factors
+
+=== ADDITIONAL CONTEXT ===
+- On expiry days (is_expiry_day=true), be moderately cautious about gamma risk near ATM strikes but don't auto-reject
+- If htf_trend opposes signal direction, require extra confirmation but don't auto-reject
+- If pre-market intelligence data is provided, consider FII/DII flows and market breadth as supplementary
+- FII selling > 1000cr is mildly bearish; DII buying > 1000cr supports market
+
+=== CRITICAL ===
+- Your confidence_score MUST be your OWN independent assessment based on the technical setup quality
+- Evaluate EACH signal freshly — do not default to the same confidence for every signal
+- A clean technical setup with strong strategy trigger + VWAP alignment + trend support = 75-85 confidence
+- Do NOT anchor your confidence near any pre-computed score number — assess independently
 """
 
 
@@ -144,7 +157,7 @@ class AIDecisionEngine:
             response = await client.chat.completions.create(
                 model=settings.openai_model,
                 messages=messages,
-                temperature=0.2,
+                temperature=0.3,
                 max_tokens=500,
             )
 
@@ -169,16 +182,17 @@ class AIDecisionEngine:
         now = datetime.now(_IST)
 
         # Score breakdown tells AI where confirmation is strong vs weak
-        score_detail = {"total": round(score, 1)}
+        # NOTE: total is intentionally excluded to prevent AI anchoring on it
+        score_detail = {}
         if score_breakdown:
-            score_detail.update({
+            score_detail = {
                 "strategy_trigger": round(score_breakdown.strategy_trigger, 1),
                 "volume_confirmation": round(score_breakdown.volume_confirmation, 1),
                 "vwap_alignment": round(score_breakdown.vwap_alignment, 1),
                 "options_oi_signal": round(score_breakdown.options_oi_signal, 1),
                 "global_bias_score": round(score_breakdown.global_bias_score, 1),
                 "historical_pattern": round(score_breakdown.historical_pattern, 1),
-            })
+            }
 
         # Compute today's open gap context
         open_gap_pct = None
@@ -220,15 +234,17 @@ class AIDecisionEngine:
                     "htf_trend": snapshot.htf_trend,
                 },
                 "options_data": {
-                    "pcr": snapshot.options_metrics.pcr,
-                    "max_pain": snapshot.options_metrics.max_pain,
-                    "call_oi_cluster": snapshot.options_metrics.call_oi_cluster,
-                    "put_oi_cluster": snapshot.options_metrics.put_oi_cluster,
-                    "oi_change": snapshot.options_metrics.oi_change,
-                    "total_call_volume": snapshot.options_metrics.total_call_volume,
-                    "total_put_volume": snapshot.options_metrics.total_put_volume,
-                    "atm_option_volume": snapshot.options_metrics.atm_option_volume,
-                },
+                    k: v for k, v in {
+                        "pcr": snapshot.options_metrics.pcr,
+                        "max_pain": snapshot.options_metrics.max_pain,
+                        "call_oi_cluster": snapshot.options_metrics.call_oi_cluster,
+                        "put_oi_cluster": snapshot.options_metrics.put_oi_cluster,
+                        "oi_change": snapshot.options_metrics.oi_change,
+                        "total_call_volume": snapshot.options_metrics.total_call_volume,
+                        "total_put_volume": snapshot.options_metrics.total_put_volume,
+                        "atm_option_volume": snapshot.options_metrics.atm_option_volume,
+                    }.items() if v is not None
+                } or {"status": "unavailable"},
                 "global_context": {
                     "bias": snapshot.global_bias.value,
                 },

@@ -41,7 +41,7 @@ def set_insight_manager(manager) -> None:
     global _insight_manager
     _insight_manager = manager
 
-MIN_SCORE = 60  # Raised from 55 — require stronger confirmation
+MIN_SCORE = 55  # Lowered from 60 — indices lack volume/options data by design
 
 # Session-locked threshold: computed once per day, not per-cycle
 _session_min_score: int | None = None
@@ -301,7 +301,8 @@ class SignalScorer:
 
             self._prev_atm_volume = atm_vol
         # Path 3: No volume data — infer activity from candle range vs ATR
-        # CAPPED at 9pts: ATR proxy is less reliable than real volume
+        # For indices, futures volume is often unavailable; ATR proxy should
+        # not be capped too low or indices are systematically penalised.
         if score == 0:
             atr = last.get("atr")
             high = last.get("high", 0)
@@ -309,12 +310,14 @@ class SignalScorer:
             candle_range = high - low
             if atr and atr > 0 and candle_range > 0:
                 range_ratio = candle_range / atr
-                if range_ratio >= 1.5:
-                    score = 9
+                if range_ratio >= 2.0:
+                    score = 14
+                elif range_ratio >= 1.5:
+                    score = 11
                 elif range_ratio >= 1.0:
-                    score = 6
+                    score = 7
                 elif range_ratio >= 0.7:
-                    score = 3
+                    score = 4
 
         return score
 
