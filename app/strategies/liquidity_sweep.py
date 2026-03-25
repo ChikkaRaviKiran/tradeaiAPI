@@ -1,13 +1,20 @@
 """Strategy 4 — Liquidity Sweep.
 
-CALL:
-  - Price breaks previous swing low by ≥0.03%
-  - Reversal candle closes bullish
-  - Volume spike ≥1.4× avg
+Book references:
+  - ICT/Smart Money Concepts — liquidity grab below swing lows/above swing highs
+  - Nison, *Japanese Candlestick Charting* — wick rejection patterns
+    (hammer for CALL, shooting star for PUT)
+  - Wyckoff — spring (false break below support) / upthrust (false break above)
 
-PUT:
-  - Price breaks swing high
-  - Bearish rejection candle (upper wick ≥50%)
+CALL (Wyckoff Spring):
+  - Price breaks previous swing low by ≥0.03% (sweep the liquidity)
+  - Reversal candle: bullish close, lower wick ≥ 40% (Nison: hammer)
+  - Volume spike ≥ 1.4× avg (Wyckoff: volume on spring confirms)
+
+PUT (Wyckoff Upthrust):
+  - Price breaks swing high by ≥0.03%
+  - Bearish rejection candle: upper wick ≥ 50% (Nison: shooting star)
+  - Volume spike ≥ 1.4× avg
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ class LiquiditySweepStrategy(BaseStrategy):
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
+        daily_levels: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < SWING_LOOKBACK + 2:
             return None
@@ -59,11 +67,15 @@ class LiquiditySweepStrategy(BaseStrategy):
         candle_range = high - low
 
         # CALL: sweep of swing low + bullish reversal
+        # ICT/Smart Money: bullish sweep must show prominent lower wick
         sweep_threshold_low = swing_low * (1 - 0.0003)  # 0.03%
+        lower_wick = min(close, open_) - low
+        lower_wick_pct = (lower_wick / candle_range * 100) if candle_range > 0 else 0
         if (
             low <= sweep_threshold_low
             and close > open_  # bullish close
             and close > swing_low  # reclaim above swing low
+            and lower_wick_pct >= 40  # sweep candle must show wick rejection
             and (is_index or volume >= 1.4 * avg_vol)
         ):
             return StrategySignal(

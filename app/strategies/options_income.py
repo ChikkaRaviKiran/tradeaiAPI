@@ -54,7 +54,8 @@ class OptionsIncomeStrategy:
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
-        regime: MarketRegime,
+        daily_levels: Optional[dict] = None,
+        regime: MarketRegime = MarketRegime.RANGE_BOUND,
         strike_interval: float = 50,
     ) -> Optional[OptionsIncomeSignal]:
         """Evaluate whether an options income strategy is appropriate.

@@ -197,6 +197,9 @@ class Orchestrator:
         self._expiry_dates: dict[str, object] = {}
         # Per-instrument higher-timeframe trend bias
         self._htf_biases: dict[str, str] = {}
+        # Per-instrument 20-day Donchian levels from daily candles
+        # {symbol: {"high_20d": float, "low_20d": float}}
+        self._daily_levels: dict[str, dict] = {}
         # Backward compat
         # Backward compat
         self.snapshot: Optional[MarketSnapshot] = None
@@ -517,12 +520,23 @@ class Orchestrator:
             self._set_source("ai_insight", "error", "Analysis failed")
             self._log_event("intelligence", "Pre-market AI analysis FAILED (exception)")
 
+        # ── Fetch daily candles for 20-day Donchian levels ───────────────
+        try:
+            self._log_event("setup", "Fetching daily candles for Donchian levels...")
+            await self._fetch_daily_levels()
+        except Exception:
+            logger.exception("Failed to fetch daily Donchian levels (non-critical)")
+            self._log_event("setup", "Daily candle fetch FAILED — Breakout20D will be inactive")
+
         # Lock the adaptive threshold for the entire session
         # Based on what data sources are actually available right now
+        analyst = self.pre_market_analyst
         session_threshold = lock_session_threshold(
-            options_available=bool(self._expiries),  # Have expiry = can fetch options
+            options_available=bool(self._expiries),
             global_available=(self.global_bias != GlobalBias.UNAVAILABLE),
-            intelligence_available=self.insight_manager.has_insight,
+            fii_dii_available=(analyst.institutional_flow is not None),
+            breadth_available=(analyst.market_breadth is not None),
+            news_available=(self.insight_manager.has_insight and bool(analyst._news_items if hasattr(analyst, '_news_items') else False)),
         )
         logger.info("Session threshold locked at: %d", session_threshold)
 
@@ -764,6 +778,66 @@ class Orchestrator:
             except Exception as e:
                 logger.debug("[%s] Index snapshot fetch failed: %s", idx_conf.symbol, e)
 
+    async def _fetch_daily_levels(self) -> None:
+        """Fetch daily candles for each active instrument and compute 20-day Donchian levels.
+
+        Called once per trading day during setup. The levels are cached in
+        self._daily_levels and passed to strategies that need them (e.g. Breakout20D).
+
+        Book reference: Donchian (1960s), Curtis Faith *Way of the Turtle* —
+        20-day high/low breakout channel.
+        """
+        for instrument in self._active_instruments:
+            symbol = instrument.symbol
+            try:
+                daily_candles = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.client.get_daily_candles,
+                        instrument.token, instrument.exchange.value,
+                        days=30,  # ~20 trading days
+                    ),
+                    timeout=30,
+                )
+                if not daily_candles or len(daily_candles) < 15:
+                    logger.warning(
+                        "[%s] Insufficient daily candles (%d) for Donchian — need ≥15 trading days",
+                        symbol, len(daily_candles) if daily_candles else 0,
+                    )
+                    continue
+
+                df_daily = self.client.candles_to_dataframe(daily_candles)
+                # Exclude today's (partial) candle — use only completed days
+                today_str = datetime.now(IST).strftime("%Y-%m-%d")
+                df_daily = df_daily[df_daily.index.strftime("%Y-%m-%d") != today_str]
+
+                if len(df_daily) < 15:
+                    logger.warning("[%s] Only %d completed daily candles — skipping Donchian", symbol, len(df_daily))
+                    continue
+
+                # Use last 20 completed days (or all if fewer)
+                lookback = df_daily.tail(20)
+                high_20d = float(lookback["high"].max())
+                low_20d = float(lookback["low"].min())
+
+                self._daily_levels[symbol] = {
+                    "high_20d": high_20d,
+                    "low_20d": low_20d,
+                    "days_used": len(lookback),
+                }
+                logger.info(
+                    "[%s] Donchian 20-day levels: high=%.2f, low=%.2f (%d days)",
+                    symbol, high_20d, low_20d, len(lookback),
+                )
+                self._log_event(
+                    "data",
+                    f"Donchian daily levels: high={high_20d:.2f}, low={low_20d:.2f} ({len(lookback)} days)",
+                    instrument=symbol,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Daily candle fetch timed out", symbol)
+            except Exception:
+                logger.exception("[%s] Failed to fetch daily candles for Donchian", symbol)
+
     async def _analyze_instrument(
         self, instrument: InstrumentConfig, cycle: int, now: datetime
     ) -> None:
@@ -970,12 +1044,13 @@ class Orchestrator:
 
             # 9. Run strategies — filtered by market regime
             strategies_to_run = self._instrument_strategies.get(symbol, self.strategies)
+            daily_levels = self._daily_levels.get(symbol)
             signals: list[StrategySignal] = []
             for strategy in strategies_to_run:
                 # Regime-strategy filtering: skip strategies that don't fit current regime
                 if not _strategy_compatible_with_regime(strategy, regime):
                     continue
-                signal = strategy.evaluate(df_today, options_metrics, spot_price)
+                signal = strategy.evaluate(df_today, options_metrics, spot_price, daily_levels=daily_levels)
                 if signal:
                     signal.instrument = symbol
                     signals.append(signal)
@@ -1084,20 +1159,43 @@ class Orchestrator:
                     best_score_result = score_result
                     signal.score = boosted_score
 
+            # If no signal passed the threshold, check if AI can override
+            # a marginal signal (score 40+ but below threshold)
             if best_signal is None:
-                self._log_event("score", f"No signal passed threshold ({adaptive_min})", cycle=cycle, instrument=symbol)
-                # Alert on near-misses (within 5 pts of threshold)
-                near_misses = [(s, sc) for s, sc in all_scored if sc >= adaptive_min - 5]
-                if near_misses:
-                    miss_info = "\n".join(
-                        f"{s.strategy.value} {s.option_type.value}: {sc:.0f}/{adaptive_min}"
-                        for s, sc in near_misses
+                # AI override path: let AI rescue marginal signals (score >= 40)
+                ai_override_candidates = [
+                    (s, sc) for s, sc in all_scored if sc >= 40
+                ]
+                if ai_override_candidates:
+                    # Pick the highest-scoring marginal signal
+                    ai_override_candidates.sort(key=lambda x: x[1], reverse=True)
+                    best_signal = ai_override_candidates[0][0]
+                    best_score = ai_override_candidates[0][1]
+                    best_score_result = self.signal_scorer.score(
+                        best_signal, df, options_metrics, self.global_bias
                     )
-                    await self.alert_manager.send_info(
-                        f"NEAR MISS — {symbol}",
-                        f"Signal(s) close to threshold but not passed:\n{miss_info}",
+                    best_signal.score = best_score
+                    # Mark as AI-override path so we require high AI confidence
+                    best_signal.details["ai_override_path"] = True
+                    logger.info(
+                        "[%s][Cycle %d] Score %d < threshold %d — sending to AI for override decision",
+                        symbol, cycle, int(best_score), adaptive_min,
                     )
-                return
+                    self._log_event("score", f"Below threshold ({best_score:.0f}/{adaptive_min}) — AI override path", cycle=cycle, instrument=symbol)
+                else:
+                    self._log_event("score", f"No signal passed threshold ({adaptive_min})", cycle=cycle, instrument=symbol)
+                    # Alert on near-misses (within 5 pts of threshold)
+                    near_misses = [(s, sc) for s, sc in all_scored if sc >= adaptive_min - 5]
+                    if near_misses:
+                        miss_info = "\n".join(
+                            f"{s.strategy.value} {s.option_type.value}: {sc:.0f}/{adaptive_min}"
+                            for s, sc in near_misses
+                        )
+                        await self.alert_manager.send_info(
+                            f"NEAR MISS — {symbol}",
+                            f"Signal(s) close to threshold but not passed:\n{miss_info}",
+                        )
+                    return
 
             # 11. Fetch option premium
             option_ltp = await self._fetch_option_ltp_for(instrument, best_signal, expiry)
@@ -1124,63 +1222,96 @@ class Orchestrator:
                     f"Score: {best_score:.0f}",
                 )
                 return
-            option_atr = atr * 0.5
+            # ATR-based SL/targets (Wilder: 2×ATR stop, Tharp: 2R+ reward)
+            option_atr = atr * 0.5  # ATM delta ~0.5 scales spot ATR to option premium
             best_signal.entry_price = option_ltp
-            best_signal.stoploss = round(max(option_ltp - (1.5 * option_atr), option_ltp * 0.70), 2)
+            best_signal.stoploss = round(max(option_ltp - (2.0 * option_atr), option_ltp * 0.70), 2)
             best_signal.target1 = round(option_ltp + (2.0 * option_atr), 2)
             best_signal.target2 = round(option_ltp + (3.5 * option_atr), 2)
 
-            # 12. AI validation
-            decision = await self.ai_engine.evaluate(best_signal, snap, best_score, best_score_result)
+            # 12. AI validation — OR logic:
+            #   - Score >= 65: HIGH conviction → skip AI entirely (saves API cost)
+            #   - Score 48-64: NORMAL flow → ask AI with adaptive threshold
+            #   - Score 40-47: AI OVERRIDE path → ask AI, need confidence >= 80
+            is_ai_override = best_signal.details.get("ai_override_path", False)
 
-            # Adaptive AI confidence threshold:
-            # High signal scores need less AI confirmation (they have strong data backing)
-            ai_threshold = 70
-            if best_score >= 75:
-                ai_threshold = 60
-            elif best_score >= 65:
-                ai_threshold = 65
+            if best_score >= 65 and not is_ai_override:
+                # HIGH CONVICTION — skip AI gate, system score is strong enough
+                logger.info(
+                    "[%s][Cycle %d] Score %.0f >= 65 — HIGH CONVICTION, skipping AI gate",
+                    symbol, cycle, best_score,
+                )
+                self._log_event("ai", f"AI BYPASSED — score {best_score:.0f} >= 65 (high conviction)", cycle=cycle, instrument=symbol)
+                # Create a synthetic decision for downstream compatibility
+                from app.core.models import AIDecision
+                decision = AIDecision(
+                    trade_decision=True,
+                    confidence_score=best_score,  # Use system score as proxy
+                    entry_price=option_ltp,
+                    stoploss=best_signal.stoploss,
+                    target1=best_signal.target1,
+                    target2=best_signal.target2,
+                    reason=f"High conviction bypass (score={best_score:.0f})",
+                )
+                await self._save_signal_record(
+                    best_signal, best_score, "accepted",
+                    decision.confidence_score, decision.reason,
+                )
+            else:
+                # Ask AI for validation
+                decision = await self.ai_engine.evaluate(best_signal, snap, best_score, best_score_result)
 
-            if not decision.trade_decision or decision.confidence_score < ai_threshold:
-                # Override: if AI gave confidence >= threshold but trade_decision=False,
-                # trust the confidence score (AI sometimes contradicts itself)
-                if decision.confidence_score >= ai_threshold and not decision.trade_decision:
-                    logger.info(
-                        "[%s] AI override: confidence %.0f%% >= %d but trade_decision=False — approving",
-                        symbol, decision.confidence_score, ai_threshold,
-                    )
-                    decision.trade_decision = True
-                    self._log_event("ai", f"AI OVERRIDE: confidence {decision.confidence_score:.0f}% >= {ai_threshold} — approving despite trade_decision=False", cycle=cycle, instrument=symbol)
+                # Adaptive AI confidence threshold:
+                # - AI override path (score < threshold): need high AI confidence (80)
+                # - Normal path: adaptive based on score
+                if is_ai_override:
+                    ai_threshold = 80  # AI must be very confident to rescue a low score
+                elif best_score >= 55:
+                    ai_threshold = 60
                 else:
-                    logger.info(
-                        "[%s] AI rejected (confidence=%.0f%%, threshold=%d): %s",
-                        symbol, decision.confidence_score, ai_threshold, decision.reason,
-                    )
-                    self._log_event("ai", f"AI REJECTED ({decision.confidence_score:.0f}%/{ai_threshold}): {decision.reason}", cycle=cycle, instrument=symbol, data={
-                        "confidence": decision.confidence_score, "reason": decision.reason,
-                        "strategy": best_signal.strategy.value, "score": best_score,
-                    })
-                    await self.alert_manager.send_info(
-                        f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
-                        f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
-                        f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
-                        f"Reason: {decision.reason}",
-                    )
-                    await self._save_signal_record(
-                        best_signal, best_score, "rejected",
-                        decision.confidence_score, decision.reason,
-                    )
-                    return
+                    ai_threshold = 65
 
-            self._log_event("ai", f"AI APPROVED ({decision.confidence_score:.0f}%): {best_signal.strategy.value} {best_signal.option_type.value}", cycle=cycle, instrument=symbol, data={
-                "confidence": decision.confidence_score, "strategy": best_signal.strategy.value,
-                "strike": best_signal.strike_price, "option_type": best_signal.option_type.value,
-                "entry": decision.entry_price, "sl": decision.stoploss, "target": decision.target,
-            })
-            await self._save_signal_record(
-                best_signal, best_score, "accepted",
-                decision.confidence_score, decision.reason,
-            )
+                if not decision.trade_decision or decision.confidence_score < ai_threshold:
+                    # Override: if AI gave confidence >= threshold but trade_decision=False,
+                    # trust the confidence score (AI sometimes contradicts itself)
+                    if decision.confidence_score >= ai_threshold and not decision.trade_decision:
+                        logger.info(
+                            "[%s] AI override: confidence %.0f%% >= %d but trade_decision=False — approving",
+                            symbol, decision.confidence_score, ai_threshold,
+                        )
+                        decision.trade_decision = True
+                        self._log_event("ai", f"AI OVERRIDE: confidence {decision.confidence_score:.0f}% >= {ai_threshold} — approving despite trade_decision=False", cycle=cycle, instrument=symbol)
+                    else:
+                        path_label = "AI-OVERRIDE" if is_ai_override else "NORMAL"
+                        logger.info(
+                            "[%s] AI rejected [%s path] (confidence=%.0f%%, threshold=%d): %s",
+                            symbol, path_label, decision.confidence_score, ai_threshold, decision.reason,
+                        )
+                        self._log_event("ai", f"AI REJECTED [{path_label}] ({decision.confidence_score:.0f}%/{ai_threshold}): {decision.reason}", cycle=cycle, instrument=symbol, data={
+                            "confidence": decision.confidence_score, "reason": decision.reason,
+                            "strategy": best_signal.strategy.value, "score": best_score,
+                        })
+                        await self.alert_manager.send_info(
+                            f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
+                            f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
+                            f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
+                            f"Reason: {decision.reason}",
+                        )
+                        await self._save_signal_record(
+                            best_signal, best_score, "rejected",
+                            decision.confidence_score, decision.reason,
+                        )
+                        return
+
+                self._log_event("ai", f"AI APPROVED ({decision.confidence_score:.0f}%): {best_signal.strategy.value} {best_signal.option_type.value}", cycle=cycle, instrument=symbol, data={
+                    "confidence": decision.confidence_score, "strategy": best_signal.strategy.value,
+                    "strike": best_signal.strike_price, "option_type": best_signal.option_type.value,
+                    "entry": decision.entry_price, "sl": decision.stoploss, "target1": decision.target1,
+                })
+                await self._save_signal_record(
+                    best_signal, best_score, "accepted",
+                    decision.confidence_score, decision.reason,
+                )
 
             # 13. Build NFO trading symbol
             nfo_symbol = instrument.build_option_symbol(
@@ -1240,7 +1371,7 @@ class Orchestrator:
             await self.alert_manager.send_signal_alert(best_signal, decision)
             self._log_event("trade", f"TRADE ENTERED: {nfo_symbol} x{num_lots} lots @ ₹{decision.entry_price:.2f}", cycle=cycle, instrument=symbol, data={
                 "symbol": nfo_symbol, "lots": num_lots, "entry": decision.entry_price,
-                "sl": decision.stoploss, "target": decision.target,
+                "sl": decision.stoploss, "target1": decision.target1,
                 "live": not settings.paper_trading,
             })
 

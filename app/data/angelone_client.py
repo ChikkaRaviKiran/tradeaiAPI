@@ -261,6 +261,29 @@ class AngelOneClient:
             return []
         return self.get_candle_data(token, self.nfo_exchange, interval, from_date, to_date)
 
+    def get_daily_candles(
+        self,
+        symbol_token: str,
+        exchange: str,
+        days: int = 25,
+    ) -> list[Candle]:
+        """Fetch daily OHLCV candles for Donchian channel computation.
+
+        Args:
+            symbol_token: AngelOne symbol token.
+            exchange: Exchange (NSE, NFO).
+            days: Number of calendar days to look back (default 25 covers ~20 trading days).
+
+        Returns:
+            List of daily Candle objects.
+        """
+        now = datetime.now(_IST)
+        from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
+        to_date = now.strftime("%Y-%m-%d 15:30")
+        return self.get_candle_data(
+            symbol_token, exchange, "ONE_DAY", from_date, to_date,
+        )
+
     # Keep backward compat
     def get_nifty_futures_candles(self, **kwargs) -> list[Candle]:
         return self.get_index_futures_candles("NIFTY", **kwargs)
@@ -540,4 +563,9 @@ class AngelOneClient:
         df = pd.DataFrame(data)
         df.set_index("timestamp", inplace=True)
         df.sort_index(inplace=True)
+        # Remove duplicate timestamps (keep first occurrence)
+        if df.index.has_duplicates:
+            n_dups = df.index.duplicated().sum()
+            logger.warning("Dropping %d duplicate timestamp candles", n_dups)
+            df = df[~df.index.duplicated(keep="first")]
         return df

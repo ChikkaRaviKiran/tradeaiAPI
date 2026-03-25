@@ -1,22 +1,27 @@
 """Strategy 6 — Momentum Breakout.
 
-Catches strong directional moves with sustained momentum.
-Designed for scenarios where price breaks out sharply from a consolidation zone.
+Book references:
+  - Minervini, *Trade Like a Stock Market Wizard* — SEPA breakout criteria
+  - O'Neil, *How to Make Money in Stocks* — volume ≥ 50% above avg on breakout
+  - Donchian Channel (20-period high/low breakout)
+  - Wilder, *New Concepts in Technical Trading* — ADX > 25 for trending
 
 Time window: 09:45–15:00
 
 CALL:
-  - Price breaks above 20-candle high
-  - RSI > 60 (strong momentum)
-  - EMA9 > EMA20 (short-term trend aligned)
-  - ADX > 20 or ADX rising (directional strength)
-  - Current candle body > 50% of range (strong close)
+  - Price breaks above 20-candle high (Donchian)
+  - Volume ≥ 1.5× avg (O'Neil: 40-50% above average minimum)
+  - RSI > 60 (strong momentum, Wilder centerline + 10)
+  - EMA9 > EMA20 (short-term trend aligned, Elder Triple Screen)
+  - ADX > 25 or ADX rising (Wilder: > 25 = trending)
+  - Current candle body > 50% of range (Nison, Japanese Candlestick Charting)
 
 PUT:
   - Price breaks below 20-candle low
+  - Volume ≥ 1.5× avg
   - RSI < 40
   - EMA9 < EMA20
-  - ADX > 20 or ADX rising
+  - ADX > 25 or ADX rising
   - Current candle body > 50% of range
 """
 
@@ -46,6 +51,7 @@ class MomentumBreakoutStrategy(BaseStrategy):
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
+        daily_levels: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < LOOKBACK + 2:
             return None
@@ -66,10 +72,18 @@ class MomentumBreakoutStrategy(BaseStrategy):
         ema9 = last.get("ema9")
         ema20 = last.get("ema20")
         adx = last.get("adx")
+        volume = last.get("volume", 0)
+        avg_vol = last.get("avg_volume_10", volume)
 
         # Require real indicator data
         if any(v is None or (isinstance(v, float) and v != v) for v in [rsi, ema9, ema20, adx]):
             return None
+
+        if avg_vol is None or avg_vol == 0:
+            avg_vol = volume
+
+        # For index data (volume=0), skip volume filter
+        is_index = volume == 0 and avg_vol == 0
 
         # Candle body strength check
         candle_range = high - low
@@ -92,12 +106,14 @@ class MomentumBreakoutStrategy(BaseStrategy):
         )
 
         # CALL: breakout above 20-candle high with momentum
+        # O'Neil: volume ≥ 50% above avg; Wilder: ADX > 25 = trending
         if (
             close > lookback_high
-            and close > open_  # bullish candle
-            and rsi > 60
-            and ema9 > ema20
-            and (adx > 20 or adx_rising)
+            and close > open_  # bullish candle (Nison)
+            and (is_index or volume >= 1.5 * avg_vol)  # O'Neil minimum
+            and rsi > 60  # Wilder: above centerline + momentum
+            and ema9 > ema20  # Elder: short-term trend aligned
+            and (adx > 25 or adx_rising)  # Wilder: ADX > 25 = trending
         ):
             return StrategySignal(
                 strategy=StrategyName.MOMENTUM_BREAKOUT,
@@ -114,10 +130,11 @@ class MomentumBreakoutStrategy(BaseStrategy):
         # PUT: breakdown below 20-candle low with momentum
         if (
             close < lookback_low
-            and close < open_  # bearish candle
-            and rsi < 40
-            and ema9 < ema20
-            and (adx > 20 or adx_rising)
+            and close < open_  # bearish candle (Nison)
+            and (is_index or volume >= 1.5 * avg_vol)  # O'Neil minimum
+            and rsi < 40  # Wilder: below centerline − momentum
+            and ema9 < ema20  # Elder: short-term trend aligned
+            and (adx > 25 or adx_rising)  # Wilder: ADX > 25 = trending
         ):
             return StrategySignal(
                 strategy=StrategyName.MOMENTUM_BREAKOUT,

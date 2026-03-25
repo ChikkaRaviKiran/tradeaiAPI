@@ -1,12 +1,21 @@
 """Strategy 1 — Opening Range Breakout (ORB).
 
+Book references:
+  - Crabel, *Day Trading with Short-Term Price Patterns* — ORB concept
+  - Fisher, *The Logical Trader* — ACD opening range method
+  - O'Neil — volume ≥ 50% above avg on breakout
+  - Shannon, *Technical Analysis Using Multiple Timeframes* — VWAP alignment
+  - Elder — EMA9 vs EMA20 for short-term trend
+  - Wilder — RSI ≥ 55 for bullish bias (above centerline)
+  - Nison, *Japanese Candlestick Charting* — wick ratio invalidation
+
 Opening range: 09:15–09:30
 ORH = highest high, ORL = lowest low in that window.
 
-CALL: Close > ORH + 0.05%, Volume > 1.5× avg, Price > VWAP, EMA9 > EMA20, RSI ≥ 50
-PUT:  Close < ORL − 0.05%, Volume > 1.5× avg, Price < VWAP, EMA9 < EMA20, RSI ≤ 50
+CALL: Close > ORH + 0.05%, Volume > 1.5× avg, Price > VWAP, EMA9 > EMA20, RSI ≥ 55
+PUT:  Close < ORL − 0.05%, Volume > 1.5× avg, Price < VWAP, EMA9 < EMA20, RSI ≤ 45
 
-Invalidation: breakout candle wick > 60%, or next candle closes inside range.
+Invalidation: breakout candle wick > 60% (Nison), or next candle closes inside range.
 """
 
 from __future__ import annotations
@@ -34,6 +43,7 @@ class ORBStrategy(BaseStrategy):
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
+        daily_levels: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < 16:  # Need at least 15-min ORB window + 1 candle
             return None
@@ -102,7 +112,7 @@ class ORBStrategy(BaseStrategy):
             and (is_index or volume > 1.5 * avg_vol)
             and close > vwap
             and ema9 > ema20
-            and rsi >= 50
+            and rsi >= 55  # Wilder: above centerline with directional bias
         ):
             # Check next candle doesn't close inside range (if available)
             if len(post_orb) >= 2:
@@ -129,7 +139,7 @@ class ORBStrategy(BaseStrategy):
             and (is_index or volume > 1.5 * avg_vol)
             and close < vwap
             and ema9 < ema20
-            and rsi <= 50
+            and rsi <= 45  # Wilder: below centerline with directional bias
         ):
             if len(post_orb) >= 2:
                 next_candle = post_orb.iloc[-1]

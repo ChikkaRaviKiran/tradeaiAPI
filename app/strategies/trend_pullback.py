@@ -1,18 +1,30 @@
-"""Strategy 3 — Trend Pullback (SRS Strategy 1).
+"""Strategy 3 — Trend Pullback.
+
+Book references:
+  - Raschke & Connors, *Street Smarts* — "Holy Grail" pattern:
+    ADX > 30 on daily (> 20 adjusted for 1-min), pullback to EMA in trending market
+  - Elder, *Trading for a Living* — buy pullbacks in uptrend using EMA alignment
+  - Raschke — RSI 40-60 is the pullback sweet spot (not overbought, trend still intact)
+  - Weinstein — EMA200 as long-term trend stage filter
+  - Wyckoff — volume confirmation on bounce
 
 CALL:
-  - Price > EMA200 (long-term trend context, if available)
-  - EMA20 > EMA50 AND price > VWAP (uptrend)
-  - Price pullback to EMA20 or EMA50
-  - RSI 40–55
-  - Bullish candle confirmation
+  - ADX > 20 (Raschke Holy Grail, adjusted from 30 for 1-min timeframe)
+  - Price > EMA200 (Weinstein Stage 2, if available)
+  - EMA20 > EMA50 AND price > VWAP (uptrend, Elder)
+  - Price pullback to within 0.40% of EMA20 or EMA50
+  - RSI 38–60 (Raschke: pullback sweet spot)
+  - Bullish candle confirmation (Nison)
+  - Volume > 1.2× avg (Wyckoff: bounce needs participation)
 
 PUT:
-  - Price < EMA200 (if available)
+  - ADX > 20
+  - Price < EMA200 (Weinstein Stage 4, if available)
   - EMA20 < EMA50 (downtrend)
-  - Price pullback to EMA20 or EMA50
-  - RSI 40–62
+  - Price pullback to within 0.40% of EMA20 or EMA50
+  - RSI 40–62 (Raschke: pullback sweet spot)
   - Bearish candle confirmation
+  - Volume > 1.2× avg
 """
 
 from __future__ import annotations
@@ -38,6 +50,7 @@ class TrendPullbackStrategy(BaseStrategy):
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
+        daily_levels: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < 20:
             return None
@@ -50,6 +63,7 @@ class TrendPullbackStrategy(BaseStrategy):
         ema50 = last.get("ema50")
         ema200 = last.get("ema200")
         rsi = last.get("rsi")
+        adx = last.get("adx")
         volume = last["volume"]
         avg_vol = last.get("avg_volume_10", volume)
 
@@ -73,6 +87,12 @@ class TrendPullbackStrategy(BaseStrategy):
 
         # Use the closer of EMA20/EMA50 for pullback
         pullback_distance_pct = min(pullback_to_ema20, pullback_to_ema50)
+
+        # ADX trend strength — Raschke/Connors "Holy Grail": pullback must
+        # be in a trending market (ADX > 30 on daily; relaxed to > 20 for 1-min)
+        has_adx = adx is not None and not (isinstance(adx, float) and adx != adx)
+        if not has_adx or adx < 20:
+            return None
 
         # EMA200 availability check
         has_ema200 = ema200 is not None and not (isinstance(ema200, float) and ema200 != ema200)

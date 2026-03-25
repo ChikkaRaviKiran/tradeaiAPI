@@ -1,16 +1,23 @@
-"""Strategy 7 — EMA Breakout (SRS Strategy 2).
+"""Strategy 7 — EMA Breakout.
+
+Book references:
+  - Elder, *Trading for a Living* — Triple Screen: price crossing intermediate EMA
+  - Cooper, *Hit and Run Trading* — EMA breakout methods
+  - Wilder — RSI 50-70 (above centerline, not overbought)
+  - Nison — candle body ≥ 40% for genuine breakout
+  - Weinstein, *Secrets for Profiting* — EMA200 as Stage 2 filter
 
 Conditions for CALL:
-  - Price > EMA200 (long-term uptrend confirmed)
-  - Price breaks above EMA50 from below (intermediate breakout)
-  - RSI 50–70 (momentum without being overbought)
-  - EMA9 > EMA20 (short-term aligned)
-  - Volume confirmation via candle range vs ATR (since NIFTY index has no volume)
+  - Price > EMA200 (Weinstein Stage 2 filter)
+  - Price breaks above EMA50 from below (Elder: intermediate trend breakout)
+  - RSI 50–70 (Wilder: momentum without being overbought)
+  - EMA9 > EMA20 (Elder: short-term aligned)
+  - Candle body ≥ 40% (Nison: reject doji at breakout)
 
 Conditions for PUT:
-  - Price < EMA200
+  - Price < EMA200 (Weinstein Stage 4)
   - Price breaks below EMA50 from above
-  - RSI 30–50
+  - RSI 30–50 (Wilder: below centerline)
   - EMA9 < EMA20
 
 Time window: 09:45–15:00
@@ -29,7 +36,7 @@ from app.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-WINDOW_START = dtime(9, 30)  # Relaxed from 09:45 — allow post-ORB breakouts
+WINDOW_START = dtime(9, 45)  # After ORB window settles (Fisher ACD: avoid first 15 min noise)
 WINDOW_END = dtime(15, 0)
 
 
@@ -41,6 +48,7 @@ class EMABreakoutStrategy(BaseStrategy):
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
+        daily_levels: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < 20:
             return None

@@ -19,6 +19,7 @@ class BaseStrategy(ABC):
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
+        daily_levels: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         """Evaluate the strategy and return a signal if conditions are met.
 
@@ -26,6 +27,8 @@ class BaseStrategy(ABC):
             df: OHLCV DataFrame with technical indicators.
             options_metrics: Current options chain metrics.
             spot_price: Current NIFTY spot price.
+            daily_levels: Optional dict with pre-computed daily levels
+                          (e.g. {'high_20d': ..., 'low_20d': ..., 'avg_volume_20d': ...}).
 
         Returns:
             StrategySignal if conditions met, else None.

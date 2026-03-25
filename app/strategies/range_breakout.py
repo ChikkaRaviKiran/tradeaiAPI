@@ -1,11 +1,20 @@
 """Strategy 5 — Range Breakout.
 
+Book references:
+  - Bollinger, *Bollinger on Bollinger Bands* — volatility squeeze → breakout
+  - Wilder, *New Concepts in Technical Trading* — ADX < 20 = no trend (range)
+  - O'Neil — volume ≥ 50% above avg on breakout
+  - Bulkowski, *Encyclopedia of Chart Patterns* — body strength filter
+  - Wilder — RSI > 50 for bullish bias
+
 Range condition:
-  ADX < 22, price range < 0.5% for 60 minutes
+  ADX < 20 (Wilder: < 20 = no trend)
+  Price range < 0.80% for 30 candles
 
 Breakout:
-  Volume ≥ 1.5× avg
-  RSI ≥ 55 (CALL), RSI ≤ 45 (PUT)
+  Volume ≥ 1.5× avg (O'Neil)
+  RSI ≥ 55 (CALL), RSI ≤ 45 (PUT) — Wilder centerline + directional bias
+  Candle body ≥ 40% (Bulkowski: reject doji/spinning tops)
 """
 
 from __future__ import annotations
@@ -20,9 +29,9 @@ from app.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-RANGE_LOOKBACK = 30  # Was 60 — 30 min range is sufficient
-ADX_THRESHOLD = 25  # Was 22 — realistic range days often have ADX 20-25
-RANGE_PCT_THRESHOLD = 0.80  # Was 0.65% — allow wider consolidation before breakout
+RANGE_LOOKBACK = 30  # Bollinger: squeeze measured over recent consolidation
+ADX_THRESHOLD = 20  # Wilder: ADX < 20 = no trend (ranging market)
+RANGE_PCT_THRESHOLD = 0.80  # Bollinger: tight range before breakout
 
 
 class RangeBreakoutStrategy(BaseStrategy):
@@ -33,6 +42,7 @@ class RangeBreakoutStrategy(BaseStrategy):
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
+        daily_levels: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < RANGE_LOOKBACK + 1:
             return None
@@ -63,12 +73,22 @@ class RangeBreakoutStrategy(BaseStrategy):
         range_low = range_window["low"].min()
         range_pct = (range_high - range_low) / range_low * 100 if range_low > 0 else 999
 
-        # Must be in a range (ADX < 22, range < 0.5%)
+        # Must be in a range (ADX < threshold, range < threshold)
         if adx is None or adx >= ADX_THRESHOLD or range_pct >= RANGE_PCT_THRESHOLD:
             logger.debug(
                 "RangeBreakout skip: ADX=%.1f (need <%.0f) range=%.2f%% (need <%.1f%%)",
                 adx, ADX_THRESHOLD, range_pct, RANGE_PCT_THRESHOLD,
             )
+            return None
+
+        # Candle body strength — Bulkowski: breakout candles with weak bodies
+        # (doji, spinning tops) have 2-3x higher failure rates
+        open_ = last.get("open", close)
+        high = last.get("high", close)
+        low = last.get("low", close)
+        candle_range = high - low
+        body = abs(close - open_)
+        if candle_range > 0 and (body / candle_range) < 0.40:
             return None
 
         logger.debug(

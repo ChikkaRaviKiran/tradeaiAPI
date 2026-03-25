@@ -1,9 +1,17 @@
 """Strategy 2 — VWAP Reclaim.
 
-Time window: 10:00–15:00 (widened from 10:30–14:30)
+Book references:
+  - Shannon, *Technical Analysis Using Multiple Timeframes* — VWAP as
+    institutional anchor; price reclaiming VWAP = institutional buying
+  - Elder, *Trading for a Living* — EMA cross for momentum confirmation
+  - Wilder — RSI > 50 = bullish centerline bias
 
-CALL: Price below VWAP for ≥8 min, closes above VWAP, RSI > 50, EMA9 crosses EMA20
-PUT:  Price above VWAP for ≥8 min, closes below VWAP, RSI < 50, EMA9 crosses below EMA20
+Time window: 10:00–15:00
+
+CALL: Price below VWAP for ≥5 candles, closes above VWAP, RSI > 50,
+      EMA9 crosses above EMA20 within 10 candles (Elder)
+PUT:  Price above VWAP for ≥5 candles, closes below VWAP, RSI < 50,
+      EMA9 crosses below EMA20 within 10 candles
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ class VWAPReclaimStrategy(BaseStrategy):
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         spot_price: float,
+        daily_levels: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < 15:
             return None
