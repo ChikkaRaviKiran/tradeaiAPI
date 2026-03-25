@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -17,6 +18,17 @@ import pytz
 from openai import AsyncOpenAI
 
 from app.core.config import settings
+from app.db.models import create_new_async_session_factory
+
+# Thread-local session factory so each event loop gets its own DB engine
+_thread_local = threading.local()
+
+
+def _get_session_factory():
+    """Return a session factory bound to the current thread's event loop."""
+    if not hasattr(_thread_local, 'session_factory'):
+        _thread_local.session_factory, _thread_local.engine = create_new_async_session_factory()
+    return _thread_local.session_factory
 
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
@@ -258,11 +270,12 @@ async def save_news_to_db(news_items: list[dict]) -> int:
     if not news_items:
         return 0
 
-    from app.db.models import TelegramNewsRecord, AsyncSessionLocal
+    from app.db.models import TelegramNewsRecord
 
+    SessionLocal = _get_session_factory()
     saved = 0
     try:
-        async with AsyncSessionLocal() as session:
+        async with SessionLocal() as session:
             for item in news_items:
                 record = TelegramNewsRecord(
                     date=item.get("date", ""),
@@ -286,14 +299,15 @@ async def save_news_to_db(news_items: list[dict]) -> int:
 
 async def get_recent_news(days: int = 1) -> list[dict]:
     """Fetch recent news from DB for the last N days."""
-    from app.db.models import TelegramNewsRecord, AsyncSessionLocal
+    from app.db.models import TelegramNewsRecord
     from sqlalchemy import select
     from datetime import timedelta
 
     cutoff = (datetime.now(_IST) - timedelta(days=days)).strftime("%Y-%m-%d")
 
+    SessionLocal = _get_session_factory()
     try:
-        async with AsyncSessionLocal() as session:
+        async with SessionLocal() as session:
             result = await session.execute(
                 select(TelegramNewsRecord)
                 .where(TelegramNewsRecord.date >= cutoff)
