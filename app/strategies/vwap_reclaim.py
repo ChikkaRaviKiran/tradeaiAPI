@@ -99,10 +99,10 @@ class VWAPReclaimStrategy(BaseStrategy):
 
 
 def _ema_cross_up(df: pd.DataFrame, fast: str, slow: str) -> bool:
-    """Check if fast EMA crossed above slow EMA in last 5 candles."""
-    if len(df) < 5:
+    """Check if fast EMA crossed above slow EMA in last 10 candles."""
+    if len(df) < 10:
         return False
-    recent = df.tail(5)
+    recent = df.tail(10)
     for i in range(1, len(recent)):
         prev = recent.iloc[i - 1]
         curr = recent.iloc[i]
@@ -112,10 +112,10 @@ def _ema_cross_up(df: pd.DataFrame, fast: str, slow: str) -> bool:
 
 
 def _ema_cross_down(df: pd.DataFrame, fast: str, slow: str) -> bool:
-    """Check if fast EMA crossed below slow EMA in last 5 candles."""
-    if len(df) < 5:
+    """Check if fast EMA crossed below slow EMA in last 10 candles."""
+    if len(df) < 10:
         return False
-    recent = df.tail(5)
+    recent = df.tail(10)
     for i in range(1, len(recent)):
         prev = recent.iloc[i - 1]
         curr = recent.iloc[i]

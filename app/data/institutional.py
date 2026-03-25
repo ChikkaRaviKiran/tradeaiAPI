@@ -61,59 +61,72 @@ class InstitutionalFlow:
         return "neutral"
 
 
-async def fetch_fii_dii_data() -> Optional[InstitutionalFlow]:
+async def fetch_fii_dii_data(max_retries: int = 3) -> Optional[InstitutionalFlow]:
     """Fetch today's FII/DII data from NSE website.
 
     NSE requires a session cookie, so we first hit the homepage.
+    Retries up to max_retries times on failure (NSE API is unreliable).
     """
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            # Get session cookie
-            await client.get(NSE_BASE, headers=_HEADERS)
+    import asyncio
 
-            # Fetch FII/DII data (try multiple endpoints)
-            data = None
-            for url in NSE_FII_URLS:
-                resp = await client.get(url, headers=_HEADERS)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    break
-                logger.warning("NSE FII/DII API %s returned %d", url, resp.status_code)
-            if data is None:
-                logger.warning("All NSE FII/DII endpoints failed")
-                return None
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                # Get session cookie
+                await client.get(NSE_BASE, headers=_HEADERS)
 
-            flow = InstitutionalFlow(
-                date=datetime.now(_IST).strftime("%Y-%m-%d"),
-            )
+                # Fetch FII/DII data (try multiple endpoints)
+                data = None
+                for url in NSE_FII_URLS:
+                    resp = await client.get(url, headers=_HEADERS)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        break
+                    logger.warning("NSE FII/DII API %s returned %d", url, resp.status_code)
+                if data is None:
+                    if attempt < max_retries:
+                        logger.warning("FII/DII attempt %d/%d failed — retrying in %ds", attempt, max_retries, attempt * 5)
+                        await asyncio.sleep(attempt * 5)
+                        continue
+                    logger.warning("All NSE FII/DII endpoints failed after %d attempts", max_retries)
+                    return None
 
-            # Parse FII and DII entries
-            for entry in data:
-                category = entry.get("category", "").upper()
-                buy_val = _parse_crore(entry.get("buyValue", "0"))
-                sell_val = _parse_crore(entry.get("sellValue", "0"))
-                net_val = _parse_crore(entry.get("netValue", "0"))
+                flow = InstitutionalFlow(
+                    date=datetime.now(_IST).strftime("%Y-%m-%d"),
+                )
 
-                if "FII" in category or "FPI" in category:
-                    flow.fii_buy = buy_val
-                    flow.fii_sell = sell_val
-                    flow.fii_net = net_val
-                elif "DII" in category:
-                    flow.dii_buy = buy_val
-                    flow.dii_sell = sell_val
-                    flow.dii_net = net_val
+                # Parse FII and DII entries
+                for entry in data:
+                    category = entry.get("category", "").upper()
+                    buy_val = _parse_crore(entry.get("buyValue", "0"))
+                    sell_val = _parse_crore(entry.get("sellValue", "0"))
+                    net_val = _parse_crore(entry.get("netValue", "0"))
 
-            logger.info(
-                "FII/DII: FII_net=%.0f cr, DII_net=%.0f cr, Signal=%s",
-                flow.fii_net,
-                flow.dii_net,
-                flow.signal,
-            )
-            return flow
+                    if "FII" in category or "FPI" in category:
+                        flow.fii_buy = buy_val
+                        flow.fii_sell = sell_val
+                        flow.fii_net = net_val
+                    elif "DII" in category:
+                        flow.dii_buy = buy_val
+                        flow.dii_sell = sell_val
+                        flow.dii_net = net_val
 
-    except Exception:
-        logger.exception("Error fetching FII/DII data")
-        return None
+                logger.info(
+                    "FII/DII: FII_net=%.0f cr, DII_net=%.0f cr, Signal=%s",
+                    flow.fii_net,
+                    flow.dii_net,
+                    flow.signal,
+                )
+                return flow
+
+        except Exception:
+            if attempt < max_retries:
+                logger.warning("FII/DII attempt %d/%d error — retrying in %ds", attempt, max_retries, attempt * 5)
+                await asyncio.sleep(attempt * 5)
+            else:
+                logger.exception("Error fetching FII/DII data after %d attempts", max_retries)
+
+    return None
 
 
 def _parse_crore(value: str) -> float:

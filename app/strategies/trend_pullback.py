@@ -87,7 +87,7 @@ class TrendPullbackStrategy(BaseStrategy):
             ema20 > ema50
             and close > vwap
             and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
-            and 40 <= rsi <= 55
+            and 38 <= rsi <= 60
             and close > open_  # bullish candle
             and (is_index or volume > 1.2 * avg_vol)
             and (not has_ema200 or close > ema200)  # above EMA200 if available

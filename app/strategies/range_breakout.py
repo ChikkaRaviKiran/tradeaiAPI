@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 RANGE_LOOKBACK = 30  # Was 60 — 30 min range is sufficient
 ADX_THRESHOLD = 25  # Was 22 — realistic range days often have ADX 20-25
-RANGE_PCT_THRESHOLD = 0.65  # Was 0.50% — NIFTY ranges can be slightly wider
+RANGE_PCT_THRESHOLD = 0.80  # Was 0.65% — allow wider consolidation before breakout
 
 
 class RangeBreakoutStrategy(BaseStrategy):

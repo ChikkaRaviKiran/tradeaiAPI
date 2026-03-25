@@ -88,63 +88,79 @@ class MarketBreadth:
         return [s.name for s in self.sectors if s.change_pct < -1.0]
 
 
-async def fetch_market_breadth() -> Optional[MarketBreadth]:
+async def fetch_market_breadth(max_retries: int = 3) -> Optional[MarketBreadth]:
     """Fetch market breadth from NSE.
 
     Gets advance/decline data and sector performance.
+    Retries up to max_retries times on failure (NSE API is unreliable).
     """
-    try:
-        breadth = MarketBreadth()
+    import asyncio
 
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            # Session cookie
-            await client.get(NSE_BASE, headers=_HEADERS)
+    for attempt in range(1, max_retries + 1):
+        try:
+            breadth = MarketBreadth()
 
-            # Fetch NIFTY 50 index data for A/D
-            resp = await client.get(
-                f"{NSE_SECTOR_URL}NIFTY%2050", headers=_HEADERS
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                _parse_advance_decline(data, breadth)
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                # Session cookie
+                await client.get(NSE_BASE, headers=_HEADERS)
 
-            # Fetch sector indices
-            for sector in SECTORS:
-                try:
-                    encoded = sector.replace(" ", "%20")
-                    resp = await client.get(
-                        f"{NSE_SECTOR_URL}{encoded}", headers=_HEADERS
-                    )
-                    if resp.status_code == 200:
-                        sector_data = resp.json()
-                        # Try metadata first, then look at the index row in data array
-                        metadata = sector_data.get("metadata", {})
-                        change = float(metadata.get("percentChange", 0))
-                        if change == 0 and sector_data.get("data"):
-                            # First entry in data array is the index itself
-                            for row in sector_data["data"]:
-                                if row.get("symbol") == sector or row.get("priority") == 0:
-                                    change = float(row.get("pChange", 0))
-                                    break
-                        breadth.sectors.append(
-                            SectorData(name=sector, change_pct=round(change, 2))
-                        )
-                except Exception:
+                # Fetch NIFTY 50 index data for A/D
+                resp = await client.get(
+                    f"{NSE_SECTOR_URL}NIFTY%2050", headers=_HEADERS
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    _parse_advance_decline(data, breadth)
+                elif attempt < max_retries:
+                    logger.warning("Breadth attempt %d/%d failed (status=%d) — retrying in %ds", attempt, max_retries, resp.status_code, attempt * 5)
+                    await asyncio.sleep(attempt * 5)
                     continue
+                else:
+                    logger.warning("Breadth NIFTY50 fetch failed after %d attempts", max_retries)
+                    return None
 
-        logger.info(
-            "Market breadth: A/D=%d/%d (%.2f), Strong=%s, Weak=%s",
-            breadth.total_advancing,
-            breadth.total_declining,
-            breadth.advance_decline_ratio,
-            breadth.strong_sectors[:3],
-            breadth.weak_sectors[:3],
-        )
-        return breadth
+                # Fetch sector indices
+                for sector in SECTORS:
+                    try:
+                        encoded = sector.replace(" ", "%20")
+                        resp = await client.get(
+                            f"{NSE_SECTOR_URL}{encoded}", headers=_HEADERS
+                        )
+                        if resp.status_code == 200:
+                            sector_data = resp.json()
+                            # Try metadata first, then look at the index row in data array
+                            metadata = sector_data.get("metadata", {})
+                            change = float(metadata.get("percentChange", 0))
+                            if change == 0 and sector_data.get("data"):
+                                # First entry in data array is the index itself
+                                for row in sector_data["data"]:
+                                    if row.get("symbol") == sector or row.get("priority") == 0:
+                                        change = float(row.get("pChange", 0))
+                                        break
+                            breadth.sectors.append(
+                                SectorData(name=sector, change_pct=round(change, 2))
+                            )
+                    except Exception:
+                        continue
 
-    except Exception:
-        logger.exception("Error fetching market breadth")
-        return None
+            logger.info(
+                "Market breadth: A/D=%d/%d (%.2f), Strong=%s, Weak=%s",
+                breadth.total_advancing,
+                breadth.total_declining,
+                breadth.advance_decline_ratio,
+                breadth.strong_sectors[:3],
+                breadth.weak_sectors[:3],
+            )
+            return breadth
+
+        except Exception:
+            if attempt < max_retries:
+                logger.warning("Breadth attempt %d/%d error — retrying in %ds", attempt, max_retries, attempt * 5)
+                await asyncio.sleep(attempt * 5)
+            else:
+                logger.exception("Error fetching market breadth after %d attempts", max_retries)
+
+    return None
 
 
 def _parse_advance_decline(data: dict, breadth: MarketBreadth) -> None:
