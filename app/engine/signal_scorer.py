@@ -129,7 +129,7 @@ class SignalScorer:
         breadth_score = 0.0
         news_score = 0.0
         if _insight_manager and _insight_manager.has_insight:
-            fii_score = _insight_manager.get_fii_dii_score()
+            fii_score = _insight_manager.get_fii_dii_score(is_call)
             breadth_score = _insight_manager.get_breadth_score(is_call)
             news_score = _insight_manager.get_news_sentiment_score(is_call)
 
@@ -181,17 +181,33 @@ class SignalScorer:
         has_rsi = rsi is not None and not (isinstance(rsi, float) and pd.isna(rsi))
 
         # RSI directional confirmation (+7)
+        # Pullback strategies (TrendPullback, VWAPReclaim) have different RSI
+        # sweet spots — pullback entries occur at intermediate RSI by design
+        # (Linda Raschke, Street Smarts).
+        is_pullback = signal.strategy.value in ("TREND_PULLBACK", "VWAP_RECLAIM")
         if has_rsi:
             if signal.option_type == OptionType.CALL:
-                if 55 <= rsi <= 70:
-                    score += 7  # Sweet spot
-                elif 50 <= rsi <= 75:
-                    score += 4  # Acceptable range
+                if is_pullback:
+                    if 40 <= rsi <= 55:
+                        score += 7  # Pullback sweet spot
+                    elif 35 <= rsi <= 60:
+                        score += 4
+                else:
+                    if 55 <= rsi <= 70:
+                        score += 7  # Momentum sweet spot
+                    elif 50 <= rsi <= 75:
+                        score += 4
             elif signal.option_type == OptionType.PUT:
-                if 30 <= rsi <= 45:
-                    score += 7  # Sweet spot
-                elif 25 <= rsi <= 50:
-                    score += 4  # Acceptable range
+                if is_pullback:
+                    if 45 <= rsi <= 60:
+                        score += 7  # Pullback sweet spot
+                    elif 40 <= rsi <= 65:
+                        score += 4
+                else:
+                    if 30 <= rsi <= 45:
+                        score += 7  # Momentum sweet spot
+                    elif 25 <= rsi <= 50:
+                        score += 4
 
         # Strong candle body (+5) — at least 50% body required
         open_ = last.get("open", 0)
@@ -407,11 +423,12 @@ class SignalScorer:
             return 8
         if signal.option_type == OptionType.PUT and bias == GlobalBias.BEARISH:
             return 8
-        # Signal direction opposes global bias — this is a negative signal
+        # Signal direction opposes global bias — mild penalty (breadth + FII
+        # already reduce score for opposing direction; avoid triple-penalizing)
         if signal.option_type == OptionType.CALL and bias == GlobalBias.BEARISH:
-            return -3  # Penalty for trading against global trend
+            return -1
         if signal.option_type == OptionType.PUT and bias == GlobalBias.BULLISH:
-            return -3
+            return -1
         return 0
 
     def _score_historical(self, signal: StrategySignal, df: pd.DataFrame) -> float:

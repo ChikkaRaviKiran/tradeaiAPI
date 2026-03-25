@@ -72,25 +72,37 @@ class InsightManager:
             return "normal"
         return self.insight.get("risk_advice", "normal")
 
-    def get_fii_dii_score(self) -> float:
+    def get_fii_dii_score(self, is_call: bool = True) -> float:
         """Score FII/DII data for signal scoring (0-6 pts).
 
-        Points based on institutional flow signal strength.
+        Directional: institutional buying supports CALL, selling supports PUT.
         """
         flow = self.institutional_flow
         if not flow:
             return 0.0
 
         signal = flow.signal
-        if signal == "strong_buy":
-            return 6.0
-        elif signal == "buy":
-            return 4.0
-        elif signal == "sell":
-            return 1.0
-        elif signal == "strong_sell":
-            return 0.0
-        return 3.0  # neutral
+        if is_call:
+            if signal == "strong_buy":
+                return 6.0
+            elif signal == "buy":
+                return 4.0
+            elif signal == "sell":
+                return 1.0
+            elif signal == "strong_sell":
+                return 0.0
+            return 3.0  # neutral
+        else:
+            # PUT: institutional selling supports bearish trades
+            if signal == "strong_sell":
+                return 6.0
+            elif signal == "sell":
+                return 4.0
+            elif signal == "buy":
+                return 1.0
+            elif signal == "strong_buy":
+                return 0.0
+            return 3.0  # neutral
 
     def get_breadth_score(self, is_call: bool) -> float:
         """Score market breadth for signal scoring (0-5 pts).

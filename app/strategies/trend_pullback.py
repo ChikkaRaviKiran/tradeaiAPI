@@ -11,7 +11,7 @@ PUT:
   - Price < EMA200 (if available)
   - EMA20 < EMA50 (downtrend)
   - Price pullback to EMA20 or EMA50
-  - RSI 45–60
+  - RSI 40–62
   - Bearish candle confirmation
 """
 
@@ -109,7 +109,7 @@ class TrendPullbackStrategy(BaseStrategy):
         if (
             ema20 < ema50
             and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
-            and 45 <= rsi <= 60
+            and 40 <= rsi <= 62
             and close < open_  # bearish candle
             and (is_index or volume > 1.2 * avg_vol)
             and (not has_ema200 or close < ema200)  # below EMA200 if available

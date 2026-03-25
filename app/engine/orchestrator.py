@@ -311,6 +311,35 @@ class Orchestrator:
             "detail": detail,
         }
 
+    async def _save_signal_record(
+        self, signal: StrategySignal, score: float,
+        ai_decision_str: str, ai_confidence: float, reason: str,
+    ) -> None:
+        """Persist signal to DB for audit trail."""
+        try:
+            from app.db.models import SignalRecord
+            from app.trading.history_logger import _get_session_factory
+            now = datetime.now(IST)
+            SessionLocal = _get_session_factory()
+            async with SessionLocal() as session:
+                async with session.begin():
+                    session.add(SignalRecord(
+                        date=now.strftime("%Y-%m-%d"),
+                        time=now.strftime("%H:%M:%S"),
+                        instrument=getattr(signal, "instrument", "NIFTY"),
+                        strategy=signal.strategy.value,
+                        option_type=signal.option_type.value,
+                        score=score,
+                        confidence=score,
+                        strike_price=signal.strike_price,
+                        entry_price=signal.entry_price,
+                        ai_decision=ai_decision_str,
+                        ai_confidence=ai_confidence,
+                        reason=reason[:500] if reason else None,
+                    ))
+        except Exception:
+            logger.debug("Failed to save signal record (non-critical)")
+
     async def _sleep_until_premarket(self) -> None:
         """Sleep until next trading day's pre-market (08:45 IST)."""
         now = datetime.now(IST)
@@ -960,8 +989,19 @@ class Orchestrator:
                 self._log_event("signal", f"{len(signals)} signal(s): {', '.join(s.strategy.value for s in signals)}", cycle=cycle, instrument=symbol)
 
             # 9b. Multi-timeframe filter: skip signals against 5-min trend
+            # Override: if 1-min RSI is extreme (≤30 or ≥70), momentum is clearly
+            # directional — bypass HTF filter (Elder Triple Screen: use momentum,
+            # not lagging EMA cross, when price is moving decisively).
             htf_bias = self._htf_biases.get(symbol, "neutral")
-            if htf_bias != "neutral" and signals:
+            current_rsi = snap.indicators.rsi if snap and snap.indicators else None
+            htf_rsi_override = current_rsi is not None and (current_rsi <= 30 or current_rsi >= 70)
+            if htf_rsi_override and htf_bias != "neutral":
+                logger.info(
+                    "[%s][Cycle %d] HTF filter bypassed — RSI %.1f is extreme (momentum override)",
+                    symbol, cycle, current_rsi,
+                )
+                self._log_event("filter", f"HTF filter bypassed — RSI {current_rsi:.1f} extreme momentum override", cycle=cycle, instrument=symbol)
+            elif htf_bias != "neutral" and signals:
                 pre_count = len(signals)
                 signals = [
                     s for s in signals
@@ -1126,6 +1166,10 @@ class Orchestrator:
                         f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
                         f"Reason: {decision.reason}",
                     )
+                    await self._save_signal_record(
+                        best_signal, best_score, "rejected",
+                        decision.confidence_score, decision.reason,
+                    )
                     return
 
             self._log_event("ai", f"AI APPROVED ({decision.confidence_score:.0f}%): {best_signal.strategy.value} {best_signal.option_type.value}", cycle=cycle, instrument=symbol, data={
@@ -1133,6 +1177,10 @@ class Orchestrator:
                 "strike": best_signal.strike_price, "option_type": best_signal.option_type.value,
                 "entry": decision.entry_price, "sl": decision.stoploss, "target": decision.target,
             })
+            await self._save_signal_record(
+                best_signal, best_score, "accepted",
+                decision.confidence_score, decision.reason,
+            )
 
             # 13. Build NFO trading symbol
             nfo_symbol = instrument.build_option_symbol(
@@ -1610,14 +1658,16 @@ class Orchestrator:
                     current_prices[trade.symbol] = ltp
 
         # Failed breakout detection: exit early if spot reverses through breakout level
+        # Require 0.15% buffer past breakout level to avoid wick-trigger exits
         for trade in list(inst_trades):
             if trade.breakout_level is None:
                 continue
             if trade.symbol not in current_prices:
                 continue
             is_call = trade.option_type == OptionType.CALL
-            failed = (is_call and spot_price < trade.breakout_level) or \
-                     (not is_call and spot_price > trade.breakout_level)
+            buffer = trade.breakout_level * 0.0015  # 0.15% buffer
+            failed = (is_call and spot_price < trade.breakout_level - buffer) or \
+                     (not is_call and spot_price > trade.breakout_level + buffer)
             if failed:
                 trade.exit_price = current_prices[trade.symbol]
                 self.paper_trader._close_trade(trade, "failed_breakout")
