@@ -1102,21 +1102,31 @@ class Orchestrator:
                 ai_threshold = 65
 
             if not decision.trade_decision or decision.confidence_score < ai_threshold:
-                logger.info(
-                    "[%s] AI rejected (confidence=%.0f%%, threshold=%d): %s",
-                    symbol, decision.confidence_score, ai_threshold, decision.reason,
-                )
-                self._log_event("ai", f"AI REJECTED ({decision.confidence_score:.0f}%/{ai_threshold}): {decision.reason}", cycle=cycle, instrument=symbol, data={
-                    "confidence": decision.confidence_score, "reason": decision.reason,
-                    "strategy": best_signal.strategy.value, "score": best_score,
-                })
-                await self.alert_manager.send_info(
-                    f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
-                    f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
-                    f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
-                    f"Reason: {decision.reason}",
-                )
-                return
+                # Override: if AI gave confidence >= threshold but trade_decision=False,
+                # trust the confidence score (AI sometimes contradicts itself)
+                if decision.confidence_score >= ai_threshold and not decision.trade_decision:
+                    logger.info(
+                        "[%s] AI override: confidence %.0f%% >= %d but trade_decision=False — approving",
+                        symbol, decision.confidence_score, ai_threshold,
+                    )
+                    decision.trade_decision = True
+                    self._log_event("ai", f"AI OVERRIDE: confidence {decision.confidence_score:.0f}% >= {ai_threshold} — approving despite trade_decision=False", cycle=cycle, instrument=symbol)
+                else:
+                    logger.info(
+                        "[%s] AI rejected (confidence=%.0f%%, threshold=%d): %s",
+                        symbol, decision.confidence_score, ai_threshold, decision.reason,
+                    )
+                    self._log_event("ai", f"AI REJECTED ({decision.confidence_score:.0f}%/{ai_threshold}): {decision.reason}", cycle=cycle, instrument=symbol, data={
+                        "confidence": decision.confidence_score, "reason": decision.reason,
+                        "strategy": best_signal.strategy.value, "score": best_score,
+                    })
+                    await self.alert_manager.send_info(
+                        f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
+                        f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
+                        f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
+                        f"Reason: {decision.reason}",
+                    )
+                    return
 
             self._log_event("ai", f"AI APPROVED ({decision.confidence_score:.0f}%): {best_signal.strategy.value} {best_signal.option_type.value}", cycle=cycle, instrument=symbol, data={
                 "confidence": decision.confidence_score, "strategy": best_signal.strategy.value,

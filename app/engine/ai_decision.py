@@ -61,6 +61,8 @@ You must respond ONLY with a valid JSON object (no markdown, no extra text) in t
 - Missing options/volume data should NOT block a trade if technicals are strong — these are supplementary data sources for Indian indices
 - On gap-up days, CALL signals in the gap direction with trend alignment deserve HIGH confidence
 - On gap-down days, PUT signals in the gap direction with trend alignment deserve HIGH confidence
+- For RANGE_BREAKOUT signals, LOW ADX is EXPECTED before the breakout — the strategy specifically waits for consolidation (low ADX) followed by a price breakout. Do NOT penalize low ADX for range breakouts.
+- For breakout strategies (RANGE_BREAKOUT, MOMENTUM_BREAKOUT, EMA_BREAKOUT, BREAKOUT_20D), the breakout itself is the catalyst — ADX will rise AFTER the breakout, not before.
 
 === WHEN TO REJECT (confidence < 60) ===
 - REJECT after 14:30 — last hour has highest chop/reversal rate
