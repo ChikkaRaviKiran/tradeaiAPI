@@ -1246,17 +1246,46 @@ class Orchestrator:
                         )
                     return
 
-            # 11. Fetch option premium
-            option_ltp = await self._fetch_option_ltp_for(instrument, best_signal, expiry)
-            if option_ltp is None or option_ltp <= 0:
+            # 11. Fetch option premium (with bid-ask spread)
+            option_quote = await self._fetch_option_quote_for(instrument, best_signal, expiry)
+            if option_quote is None or option_quote["ltp"] <= 0:
                 logger.warning("[%s] Could not fetch option LTP — skipping trade", symbol)
                 self._log_event("option_ltp", "Option LTP fetch FAILED — skipping", cycle=cycle, instrument=symbol)
                 return
 
+            option_ltp = option_quote["ltp"]
+            best_bid = option_quote["best_bid"]
+            best_ask = option_quote["best_ask"]
+            spread_pct = option_quote["spread_pct"]
+
+            # 11a. Liquidity gate — skip illiquid strikes with wide bid-ask spread
+            if spread_pct > settings.max_spread_pct and best_bid > 0:
+                logger.warning(
+                    "[%s] Bid-ask spread %.1f%% > %.1f%% threshold — skipping (bid=%.2f ask=%.2f)",
+                    symbol, spread_pct, settings.max_spread_pct, best_bid, best_ask,
+                )
+                self._log_event(
+                    "gate",
+                    f"LIQUIDITY GATE: spread {spread_pct:.1f}% > {settings.max_spread_pct:.1f}% "
+                    f"(bid={best_bid:.2f} ask={best_ask:.2f})",
+                    cycle=cycle, instrument=symbol,
+                )
+                await self.alert_manager.send_info(
+                    f"SIGNAL BLOCKED — {symbol} {best_signal.strategy.value}",
+                    f"Reason: Bid-ask spread too wide ({spread_pct:.1f}%)\n"
+                    f"Bid: {best_bid:.2f} | Ask: {best_ask:.2f} | LTP: {option_ltp:.2f}\n"
+                    f"Strike: {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
+                    f"Score: {best_score:.0f}",
+                )
+                return
+
+            # Use ask price for entry (realistic fill) when available, else LTP
+            entry_price = best_ask if best_ask > 0 else option_ltp
+
             logger.info(
-                "[%s] Option LTP fetched: %s %.0f%s = ₹%.2f",
+                "[%s] Option quote: %s %.0f%s = ₹%.2f (bid=%.2f ask=%.2f spread=%.1f%%)",
                 symbol, instrument.symbol, best_signal.strike_price,
-                best_signal.option_type.value, option_ltp,
+                best_signal.option_type.value, option_ltp, best_bid, best_ask, spread_pct,
             )
 
             # Set ATR-based SL/targets
@@ -1273,10 +1302,10 @@ class Orchestrator:
                 return
             # ATR-based SL/targets (Wilder: 2×ATR stop, Tharp: 2R+ reward)
             option_atr = atr * 0.5  # ATM delta ~0.5 scales spot ATR to option premium
-            best_signal.entry_price = option_ltp
-            best_signal.stoploss = round(max(option_ltp - (2.0 * option_atr), option_ltp * 0.70), 2)
-            best_signal.target1 = round(option_ltp + (2.0 * option_atr), 2)
-            best_signal.target2 = round(option_ltp + (3.5 * option_atr), 2)
+            best_signal.entry_price = entry_price
+            best_signal.stoploss = round(max(entry_price - (2.0 * option_atr), entry_price * 0.70), 2)
+            best_signal.target1 = round(entry_price + (2.0 * option_atr), 2)
+            best_signal.target2 = round(entry_price + (3.5 * option_atr), 2)
 
             # 12. AI validation — OR logic:
             #   - Score >= 65: HIGH conviction → skip AI entirely (saves API cost)
@@ -1418,10 +1447,11 @@ class Orchestrator:
 
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_signal_alert(best_signal, decision)
-            self._log_event("trade", f"TRADE ENTERED: {nfo_symbol} x{num_lots} lots @ ₹{decision.entry_price:.2f}", cycle=cycle, instrument=symbol, data={
+            self._log_event("trade", f"TRADE ENTERED: {nfo_symbol} x{num_lots} lots @ ₹{decision.entry_price:.2f} (bid={best_bid:.2f} ask={best_ask:.2f} spread={spread_pct:.1f}%)", cycle=cycle, instrument=symbol, data={
                 "symbol": nfo_symbol, "lots": num_lots, "entry": decision.entry_price,
                 "sl": decision.stoploss, "target1": decision.target1,
                 "live": not settings.paper_trading,
+                "best_bid": best_bid, "best_ask": best_ask, "spread_pct": spread_pct,
             })
 
         except Exception:
@@ -1746,6 +1776,21 @@ class Orchestrator:
         expiry: Optional[str],
     ) -> Optional[float]:
         """Fetch the real LTP for a specific option contract from AngelOne."""
+        quote = await self._fetch_option_quote_for(instrument, signal, expiry)
+        return quote["ltp"] if quote else None
+
+    async def _fetch_option_quote_for(
+        self,
+        instrument: InstrumentConfig,
+        signal: StrategySignal,
+        expiry: Optional[str],
+    ) -> Optional[dict]:
+        """Fetch full quote (ltp, bid, ask, spread) for a specific option contract.
+
+        Returns:
+            dict with keys: ltp, best_bid, best_ask, spread, spread_pct
+            or None if fetch fails.
+        """
         if not expiry:
             return None
         symbol = instrument.build_option_symbol(
@@ -1756,9 +1801,9 @@ class Orchestrator:
             logger.warning("Token not found for %s", symbol)
             return None
         try:
-            ltp = await asyncio.wait_for(
+            quote = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.client.get_ltp,
+                    self.client.get_option_quote,
                     "NFO",
                     token_info.get("tradingsymbol", ""),
                     token_info.get("symboltoken", ""),
@@ -1766,9 +1811,9 @@ class Orchestrator:
                 timeout=15,
             )
         except asyncio.TimeoutError:
-            logger.warning("LTP fetch timed out for %s", symbol)
+            logger.warning("Quote fetch timed out for %s", symbol)
             return None
-        return ltp
+        return quote
 
     async def _update_options_chain_for(
         self,
@@ -1824,9 +1869,9 @@ class Orchestrator:
             token_info = self.client._search_symbol(trade.symbol)
             if token_info:
                 try:
-                    ltp = await asyncio.wait_for(
+                    quote = await asyncio.wait_for(
                         asyncio.to_thread(
-                            self.client.get_ltp,
+                            self.client.get_option_quote,
                             "NFO",
                             token_info.get("tradingsymbol", ""),
                             token_info.get("symboltoken", ""),
@@ -1834,10 +1879,12 @@ class Orchestrator:
                         timeout=15,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning("LTP fetch timed out for %s", trade.symbol)
-                    ltp = None
-                if ltp:
-                    current_prices[trade.symbol] = ltp
+                    logger.warning("Quote fetch timed out for %s", trade.symbol)
+                    quote = None
+                if quote and quote["ltp"] > 0:
+                    # Use bid price for exit (realistic sell fill), fall back to LTP
+                    exit_price = quote["best_bid"] if quote["best_bid"] > 0 else quote["ltp"]
+                    current_prices[trade.symbol] = exit_price
 
         # Failed breakout detection: exit early if spot reverses through breakout level
         # Require 0.15% buffer past breakout level to avoid wick-trigger exits
@@ -2084,24 +2131,42 @@ class Orchestrator:
                 cycle=cycle, instrument=symbol,
             )
 
-            # Fetch option premium
+            # Fetch option premium (with bid-ask spread)
             expiry = self._expiries.get(symbol, "")
-            option_ltp = await self._fetch_option_ltp_for(instrument, best_signal, expiry)
-            if option_ltp is None or option_ltp <= 0:
+            option_quote = await self._fetch_option_quote_for(instrument, best_signal, expiry)
+            if option_quote is None or option_quote["ltp"] <= 0:
                 self._log_event("v2_ltp", "V2 option LTP fetch failed", cycle=cycle, instrument=symbol)
                 return
+
+            option_ltp = option_quote["ltp"]
+            best_bid = option_quote["best_bid"]
+            best_ask = option_quote["best_ask"]
+            spread_pct = option_quote["spread_pct"]
+
+            # Liquidity gate — skip illiquid strikes
+            if spread_pct > settings.max_spread_pct and best_bid > 0:
+                self._log_event(
+                    "v2_gate",
+                    f"V2 LIQUIDITY GATE: spread {spread_pct:.1f}% > {settings.max_spread_pct:.1f}% "
+                    f"(bid={best_bid:.2f} ask={best_ask:.2f})",
+                    cycle=cycle, instrument=symbol,
+                )
+                return
+
+            # Use ask price for entry (realistic fill) when available, else LTP
+            entry_price = best_ask if best_ask > 0 else option_ltp
 
             # V2 SL/targets: tighter and more conservative
             atr = snap.indicators.atr
             if atr is None or atr <= 0:
                 return
-            best_signal.entry_price = option_ltp
+            best_signal.entry_price = entry_price
             best_signal.stoploss = round(max(
-                option_ltp - (settings.v2_stoploss_pct / 100 * option_ltp),
-                option_ltp * 0.70,
+                entry_price - (settings.v2_stoploss_pct / 100 * entry_price),
+                entry_price * 0.70,
             ), 2)
-            best_signal.target1 = round(option_ltp + (settings.v2_quick_target_pct / 100 * option_ltp), 2)
-            best_signal.target2 = round(option_ltp + (settings.v2_quick_target_pct * 1.5 / 100 * option_ltp), 2)
+            best_signal.target1 = round(entry_price + (settings.v2_quick_target_pct / 100 * entry_price), 2)
+            best_signal.target2 = round(entry_price + (settings.v2_quick_target_pct * 1.5 / 100 * entry_price), 2)
 
             # AI validation (V2 uses configured model)
             decision = await self.ai_engine.evaluate(best_signal, snap, best_score, best_score_result)
@@ -2115,10 +2180,11 @@ class Orchestrator:
 
             # Enter V2 paper trade
             logger.info(
-                "[V2][%s] ENTERING: %s %s %.0f%s | Entry=%.2f SL=%.2f T1=%.2f",
+                "[V2][%s] ENTERING: %s %s %.0f%s | Entry=%.2f SL=%.2f T1=%.2f (bid=%.2f ask=%.2f spread=%.1f%%)",
                 symbol, best_signal.strategy.value, symbol,
                 best_signal.strike_price, best_signal.option_type.value,
-                option_ltp, best_signal.stoploss, best_signal.target1,
+                entry_price, best_signal.stoploss, best_signal.target1,
+                best_bid, best_ask, spread_pct,
             )
 
             nfo_symbol = instrument.build_option_symbol(
@@ -2142,7 +2208,8 @@ class Orchestrator:
             self._log_event(
                 "v2_trade",
                 f"V2 TRADE: {trade.symbol} {best_signal.strategy.value} | "
-                f"Entry={option_ltp:.2f} SL={trade.stoploss:.2f} T1={trade.target1:.2f}",
+                f"Entry={entry_price:.2f} SL={trade.stoploss:.2f} T1={trade.target1:.2f} "
+                f"(bid={best_bid:.2f} ask={best_ask:.2f} spread={spread_pct:.1f}%)",
                 cycle=cycle, instrument=symbol,
             )
 
@@ -2165,9 +2232,9 @@ class Orchestrator:
             token_info = self.client._search_symbol(trade.symbol)
             if token_info:
                 try:
-                    ltp = await asyncio.wait_for(
+                    quote = await asyncio.wait_for(
                         asyncio.to_thread(
-                            self.client.get_ltp,
+                            self.client.get_option_quote,
                             "NFO",
                             token_info.get("tradingsymbol", ""),
                             token_info.get("symboltoken", ""),
@@ -2175,9 +2242,11 @@ class Orchestrator:
                         timeout=15,
                     )
                 except asyncio.TimeoutError:
-                    ltp = None
-                if ltp:
-                    current_prices[trade.symbol] = ltp
+                    quote = None
+                if quote and quote["ltp"] > 0:
+                    # Use bid price for exit (realistic sell fill), fall back to LTP
+                    exit_price = quote["best_bid"] if quote["best_bid"] > 0 else quote["ltp"]
+                    current_prices[trade.symbol] = exit_price
 
         spot_price = snap.price or snap.nifty_price
 
@@ -2230,13 +2299,15 @@ class Orchestrator:
             for trade in trader.open_trades:
                 token_info = self.client._search_symbol(trade.symbol)
                 if token_info:
-                    ltp = self.client.get_ltp(
+                    quote = self.client.get_option_quote(
                         "NFO",
                         token_info.get("tradingsymbol", ""),
                         token_info.get("symboltoken", ""),
                     )
-                    if ltp:
-                        current_prices[trade.symbol] = ltp
+                    if quote and quote["ltp"] > 0:
+                        # Use bid for EOD exit (realistic sell fill)
+                        exit_price = quote["best_bid"] if quote["best_bid"] > 0 else quote["ltp"]
+                        current_prices[trade.symbol] = exit_price
 
             closed = trader.close_all_open(current_prices)
             for trade in closed:

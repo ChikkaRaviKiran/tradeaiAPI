@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     v2_skip_unclear_days: bool = Field(default=True, alias="V2_SKIP_UNCLEAR_DAYS")
     v2_openai_model: str = Field(default="gpt-4o-mini", alias="V2_OPENAI_MODEL")
 
+    # Bid-Ask / Liquidity
+    max_spread_pct: float = Field(default=3.0, alias="MAX_SPREAD_PCT")  # Skip if bid-ask spread > this %
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_active_instrument_list(self) -> list[str]:

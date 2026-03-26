@@ -363,6 +363,56 @@ class AngelOneClient:
             logger.exception("Error fetching LTP for %s", symbol)
         return None
 
+    def get_option_quote(
+        self, exchange: str, symbol: str, token: str
+    ) -> Optional[dict]:
+        """Get full quote with bid/ask/ltp for an option contract.
+
+        Uses getMarketData(FULL) which returns depth data including
+        best bid/ask prices. Falls back to ltpData if FULL fails.
+
+        Returns:
+            dict with keys: ltp, best_bid, best_ask, spread, spread_pct
+            or None if fetch fails.
+        """
+        self.ensure_authenticated()
+        try:
+            exchange_tokens = {exchange: [token]}
+            data = self._smart_api.getMarketData("FULL", exchange_tokens)
+            if data and data.get("status") and data.get("data"):
+                fetched = data["data"].get("fetched", [])
+                if fetched:
+                    item = fetched[0]
+                    ltp = float(item.get("ltp", 0))
+                    # Extract best bid/ask from depth data
+                    depth = item.get("depth", {})
+                    buy_depth = depth.get("buy", [])
+                    sell_depth = depth.get("sell", [])
+                    best_bid = float(buy_depth[0].get("price", 0)) if buy_depth else 0.0
+                    best_ask = float(sell_depth[0].get("price", 0)) if sell_depth else 0.0
+                    # Compute spread
+                    spread = best_ask - best_bid if best_bid > 0 and best_ask > 0 else 0.0
+                    mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else ltp
+                    spread_pct = (spread / mid * 100) if mid > 0 else 0.0
+                    return {
+                        "ltp": ltp,
+                        "best_bid": best_bid,
+                        "best_ask": best_ask,
+                        "spread": round(spread, 2),
+                        "spread_pct": round(spread_pct, 2),
+                    }
+        except Exception:
+            logger.warning("getMarketData(FULL) failed for %s, falling back to ltpData", symbol)
+        # Fallback: ltpData (no bid/ask available)
+        try:
+            data = self._smart_api.ltpData(exchange, symbol, token)
+            if data and data.get("status"):
+                ltp = float(data["data"]["ltp"])
+                return {"ltp": ltp, "best_bid": 0.0, "best_ask": 0.0, "spread": 0.0, "spread_pct": 0.0}
+        except Exception:
+            logger.exception("Error fetching quote for %s", symbol)
+        return None
+
     # ── Options Chain ────────────────────────────────────────────────────
 
     def get_option_chain(
