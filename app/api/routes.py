@@ -114,6 +114,53 @@ async def get_trades_by_date(target_date: str):
     return await trade_logger.get_trades_by_date(target_date)
 
 
+# ── V2 Engine ────────────────────────────────────────────────────────────
+
+@app.get("/api/v2/active", response_model=list[Trade])
+async def get_v2_active_trades():
+    """Get V2 engine's currently open trades."""
+    return _state.get("v2_open_trades", [])
+
+
+@app.get("/api/v2/today", response_model=list[Trade])
+async def get_v2_today_trades():
+    """Get all V2 trades for today."""
+    today_trades = await trade_logger.get_today_trades()
+    return [t for t in today_trades if t.engine == "v2"]
+
+
+@app.get("/api/v2/status")
+async def get_v2_status():
+    """V2 engine status: day type, trade counts, enabled flag."""
+    orch = _state.get("orchestrator")
+    v2_day_type = _state.get("v2_day_type", "pending")
+    v2_active = _state.get("v2_open_trades", [])
+    today_trades = await trade_logger.get_today_trades()
+    v2_today = [t for t in today_trades if t.engine == "v2"]
+    v2_closed = [t for t in v2_today if t.status.value == "closed"]
+    v2_wins = [t for t in v2_closed if (t.pnl or 0) > 0]
+    return {
+        "enabled": settings.v2_enabled,
+        "day_type": v2_day_type,
+        "active_count": len(v2_active),
+        "today_total": len(v2_today),
+        "today_closed": len(v2_closed),
+        "today_wins": len(v2_wins),
+        "today_pnl": round(sum(t.pnl or 0 for t in v2_closed), 2),
+    }
+
+
+@app.get("/api/performance/comparison")
+async def get_performance_comparison():
+    """Side-by-side V1 vs V2 performance metrics."""
+    all_trades = await trade_logger.get_today_trades()
+    v1_trades = [t for t in all_trades if (t.engine or "v1") == "v1"]
+    v2_trades = [t for t in all_trades if t.engine == "v2"]
+    v1_metrics = await trade_logger.compute_performance(v1_trades)
+    v2_metrics = await trade_logger.compute_performance(v2_trades)
+    return {"v1": v1_metrics, "v2": v2_metrics}
+
+
 # ── Performance ──────────────────────────────────────────────────────────
 
 @app.get("/api/performance", response_model=PerformanceMetrics)

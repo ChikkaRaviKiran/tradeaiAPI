@@ -129,10 +129,11 @@ class AlertManager:
             self._history_logger = HistoryLogger()
         return self._history_logger
 
-    async def send_signal_alert(self, signal: StrategySignal, decision: AIDecision) -> None:
+    async def send_signal_alert(self, signal: StrategySignal, decision: AIDecision, engine: str = "v1") -> None:
         msg = _format_signal_message(signal, decision)
         inst = getattr(signal, 'instrument', 'NIFTY')
-        title = f"TRADE SIGNAL — {inst} {int(signal.strike_price)} {signal.option_type.value}"
+        tag = f"[{engine.upper()}] " if engine == "v2" else ""
+        title = f"{tag}TRADE SIGNAL — {inst} {int(signal.strike_price)} {signal.option_type.value}"
 
         # Always store for UI
         alert = AlertItem(
@@ -142,6 +143,7 @@ class AlertManager:
             message=msg,
             timestamp=datetime.now(_IST),
             strategy=signal.strategy.value,
+            engine=engine,
         )
         self.store.add(alert)
         await self._get_history_logger().save_alert(alert)
@@ -154,7 +156,9 @@ class AlertManager:
     async def send_exit_alert(self, trade: Trade) -> None:
         msg = _format_exit_message(trade)
         is_win = (trade.pnl or 0) > 0
-        title = f"TRADE {'WIN' if is_win else 'LOSS'} — {trade.symbol}"
+        engine = getattr(trade, 'engine', 'v1') or 'v1'
+        tag = f"[{engine.upper()}] " if engine == "v2" else ""
+        title = f"{tag}TRADE {'WIN' if is_win else 'LOSS'} — {trade.symbol}"
 
         alert = AlertItem(
             id=str(uuid.uuid4())[:8],
@@ -165,12 +169,42 @@ class AlertManager:
             trade_id=trade.trade_id,
             strategy=trade.strategy.value,
             pnl=trade.pnl,
+            engine=engine,
         )
         self.store.add(alert)
         await self._get_history_logger().save_alert(alert)
         logger.info("Alert: %s (PnL=%.2f)", title, trade.pnl or 0)
 
         await self.telegram.send(f"{'✅' if is_win else '❌'} {title}\n{msg}")
+        await self.email.send(f"TradeAI: {title}", msg)
+
+    async def send_entry_alert(self, trade: Trade, score: float = 0) -> None:
+        """V2 entry alert — from Trade object (no StrategySignal/AIDecision)."""
+        engine = getattr(trade, 'engine', 'v2') or 'v2'
+        msg = (
+            f"Strategy: {trade.strategy.value}\n"
+            f"Symbol: {trade.symbol}\n"
+            f"Entry: {trade.entry_price:.2f}  |  SL: {trade.stoploss:.2f}\n"
+            f"T1: {trade.target1:.2f}  |  T2: {(trade.target2 or 0):.2f}\n"
+            f"Score: {score:.0f}%\n"
+            f"Day Type: {getattr(trade, 'day_type', 'N/A')}"
+        )
+        title = f"[{engine.upper()}] TRADE ENTRY — {trade.symbol}"
+
+        alert = AlertItem(
+            id=str(uuid.uuid4())[:8],
+            alert_type="signal",
+            title=title,
+            message=msg,
+            timestamp=datetime.now(_IST),
+            strategy=trade.strategy.value,
+            engine=engine,
+        )
+        self.store.add(alert)
+        await self._get_history_logger().save_alert(alert)
+        logger.info("Alert: %s", title)
+
+        await self.telegram.send(f"🔔 {title}\n{msg}")
         await self.email.send(f"TradeAI: {title}", msg)
 
     async def send_daily_report(self, report: str) -> None:

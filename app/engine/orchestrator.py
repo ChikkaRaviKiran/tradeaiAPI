@@ -23,6 +23,7 @@ from collections import deque
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional
 
+import pandas as pd
 import pytz
 
 from app.alerts.alert_manager import AlertManager
@@ -40,6 +41,7 @@ from app.core.models import (
     OptionsMetrics,
     StrategySignal,
     TechnicalIndicators,
+    DayType,
 )
 from app.data.angelone_client import AngelOneClient
 from app.data.global_markets import compute_global_bias, fetch_global_indices
@@ -57,14 +59,20 @@ from app.strategies.range_breakout import RangeBreakoutStrategy
 from app.strategies.trend_pullback import TrendPullbackStrategy
 from app.strategies.vwap_reclaim import VWAPReclaimStrategy
 from app.strategies.breakout_20d import Breakout20DStrategy
+from app.strategies.gex_bounce import GEXBounceStrategy
+from app.strategies.rsi_extreme import RSIExtremeStrategy
+from app.strategies.vwap_pullback import VWAPPullbackStrategy
 from app.trading.history_logger import HistoryLogger
 from app.trading.paper_trader import PaperTradingEngine
 from app.trading.risk_manager import RiskManager
+from app.trading.smart_exit import SmartExitEngine
 from app.trading.trade_logger import TradeLogger
 from app.backtest.scheduler import EvaluationScheduler
 from app.ai.pre_market_analyst import PreMarketAnalyst
 from app.ai.insight_manager import InsightManager
 from app.engine.ai_decision import set_ai_insight_manager
+from app.engine.day_classifier import DayClassifier
+from app.engine.gex_calculator import GEXCalculator
 from app.execution.angelone_broker import AngelOneBroker
 from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
 
@@ -161,7 +169,7 @@ class Orchestrator:
         set_insight_manager(self.insight_manager)
         set_ai_insight_manager(self.insight_manager)
 
-        # Strategies (applied to every instrument)
+        # Strategies (applied to every instrument) — V1 Engine
         self.strategies: list[BaseStrategy] = [
             ORBStrategy(),
             VWAPReclaimStrategy(),
@@ -172,6 +180,27 @@ class Orchestrator:
             EMABreakoutStrategy(),
             Breakout20DStrategy(),
         ]
+
+        # ── V2 Engine components ─────────────────────────────────────────
+        self.v2_paper_trader = PaperTradingEngine()
+        self.v2_risk_manager = RiskManager(
+            max_trades=settings.v2_max_trades_per_day,
+            max_concurrent=settings.v2_max_concurrent_positions,
+            risk_pct=settings.v2_risk_per_trade_pct,
+            consecutive_limit=settings.v2_consecutive_loss_limit,
+        )
+        self.v2_signal_scorer = SignalScorer()
+        self.v2_smart_exit = SmartExitEngine()
+        self.v2_day_classifier = DayClassifier()
+        self.v2_gex_calculator = GEXCalculator()
+        self.v2_gex_bounce = GEXBounceStrategy()
+        self.v2_strategies: list[BaseStrategy] = [
+            VWAPPullbackStrategy(),
+            RSIExtremeStrategy(),
+            self.v2_gex_bounce,
+        ]
+        self.v2_day_type: DayType = DayType.PENDING
+        self.v2_day_classified = False
 
         # Active instruments — resolved from evaluation or config
         self._active_instruments: list[InstrumentConfig] = []
@@ -189,12 +218,15 @@ class Orchestrator:
         self.global_indices: list = []
         # Per-instrument snapshots  {symbol: MarketSnapshot}
         self.snapshots: dict[str, MarketSnapshot] = {}
+        # Per-instrument today DataFrames  {symbol: pd.DataFrame} — shared V1→V2
+        self._df_today_cache: dict[str, pd.DataFrame] = {}
         # Per-instrument options metrics  {symbol: OptionsMetrics}
         self._options_metrics: dict[str, OptionsMetrics] = {}
         # Per-instrument expiry  {symbol: str}
         self._expiries: dict[str, str] = {}
         # Per-instrument expiry dates (parsed from SmartAPI)  {symbol: date}
         self._expiry_dates: dict[str, object] = {}
+        self._last_option_chain: dict[str, list] = {}
         # Per-instrument higher-timeframe trend bias
         self._htf_biases: dict[str, str] = {}
         # Per-instrument 20-day Donchian levels from daily candles
@@ -283,15 +315,21 @@ class Orchestrator:
         self.global_bias = GlobalBias.UNAVAILABLE
         self.global_indices = []
         self.snapshots = {}
+        self._df_today_cache = {}
         self._options_metrics = {}
         self._expiries = {}
         self._expiry_dates = {}
+        self._last_option_chain = {}
         self._htf_biases = {}
         self.snapshot = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
         self._last_rss_fetch = None
         self.paper_trader = PaperTradingEngine()  # Fresh daily paper trader
+        # V2 reset
+        self.v2_paper_trader = PaperTradingEngine()
+        self.v2_day_type = DayType.PENDING
+        self.v2_day_classified = False
         self.running = False
         logger.info("Daily state reset complete")
 
@@ -605,7 +643,12 @@ class Orchestrator:
             for idx, instrument in enumerate(self._active_instruments):
                 if idx > 0:
                     await asyncio.sleep(2)  # 2s gap to avoid AngelOne rate limiting
-                await self._analyze_instrument(instrument, cycle, now)
+                if settings.v1_enabled:
+                    await self._analyze_instrument(instrument, cycle, now)
+
+                # V2 engine: runs on the same data, independent trade book
+                if settings.v2_enabled:
+                    await self._v2_analyze_instrument(instrument, cycle, now)
 
             # Fetch basic price data for main indices not in active set
             await self._update_index_snapshots(now)
@@ -625,6 +668,9 @@ class Orchestrator:
             state["snapshots"] = self.snapshots  # All instrument snapshots
             state["intelligence"] = self.pre_market_analyst.latest_insight
             state["pre_market_analyst"] = self.pre_market_analyst
+            # V2 state
+            state["v2_open_trades"] = self.v2_paper_trader.open_trades
+            state["v2_day_type"] = self.v2_day_type.value if self.v2_day_type else "pending"
 
             # Heartbeat alert every 15 cycles
             if self._consecutive_no_signal > 0 and cycle - self._last_heartbeat_cycle >= 15:
@@ -937,6 +983,9 @@ class Orchestrator:
             if df_today.empty:
                 logger.warning("[%s][Cycle %d] No today candles after filtering", symbol, cycle)
                 return
+
+            # Cache for V2 reuse
+            self._df_today_cache[symbol] = df_today
 
             # 3b. Compute previous day high/low/close for support/resistance context
             df_prev = df[df.index.strftime("%Y-%m-%d") != today_str]
@@ -1739,6 +1788,8 @@ class Orchestrator:
                 ),
                 timeout=60,
             )
+            # Cache chain for V2 GEX calculation
+            self._last_option_chain[instrument.symbol] = chain
             metrics = self.feature_engine.compute_options_metrics(chain, spot_price)
             logger.info(
                 "[%s] Options: PCR=%s MaxPain=%s",
@@ -1907,31 +1958,295 @@ class Orchestrator:
             await self.trade_logger.log_trade(trade)
             await self.alert_manager.send_exit_alert(trade)
 
-    async def _close_all_trades(self) -> None:
-        """Close all open trades at 15:20."""
-        if not self.paper_trader.open_trades:
+    # ── V2 Engine ─────────────────────────────────────────────────────────
+
+    async def _v2_analyze_instrument(
+        self, instrument: InstrumentConfig, cycle: int, now: datetime
+    ) -> None:
+        """V2 engine analysis — day-classified strategy execution.
+
+        Uses shared data (snapshots, df_today, options) computed by V1.
+        Runs V2 strategies gated by day type, with independent paper trader.
+        """
+        symbol = instrument.symbol
+        snap = self.snapshots.get(symbol)
+        df_today = self._df_today_cache.get(symbol)
+        if not snap or df_today is None or df_today.empty:
+            return
+
+        try:
+            # Day classification at 10:00 (once per day)
+            if not self.v2_day_classified and now.time() >= dtime(10, 0):
+                vix_val = None
+                for idx_data in self.global_indices:
+                    if hasattr(idx_data, 'symbol') and 'VIX' in idx_data.symbol:
+                        vix_val = idx_data.last_price
+                        break
+                self.v2_day_type = self.v2_day_classifier.classify(df_today, snap, vix_val)
+                self.v2_day_classified = True
+                self._log_event(
+                    "v2_classify",
+                    f"V2 Day classified: {self.v2_day_type.value}",
+                    cycle=cycle, instrument=symbol,
+                )
+                logger.info("[V2][%s] Day classified as: %s", symbol, self.v2_day_type.value)
+
+            # Skip if day is UNCLEAR or not yet classified
+            if self.v2_day_type == DayType.PENDING:
+                return
+            if self.v2_day_type == DayType.UNCLEAR and settings.v2_skip_unclear_days:
+                return
+
+            # Check V2 exits on open trades
+            await self._v2_check_exits(instrument, snap)
+
+            # Time gate: no new entries after 14:00 (V2 is more conservative)
+            if now.time() >= dtime(14, 0):
+                return
+
+            # Risk check (V2 independent limits)
+            if not self.v2_risk_manager.can_trade(
+                self.v2_paper_trader.all_today_trades,
+                open_count=len(self.v2_paper_trader.open_trades),
+            ):
+                return
+
+            # ── V2 Strategy execution ──────────────────────────────────────
+            # Gate strategies by day type:
+            #   TREND    → VWAP_PULLBACK
+            #   RANGE    → GEX_BOUNCE
+            #   VOLATILE → RSI_EXTREME
+            options_metrics = self._options_metrics.get(symbol, OptionsMetrics())
+            spot_price = snap.price or snap.nifty_price
+            daily_levels = self._daily_levels.get(symbol)
+
+            # Compute GEX for RANGE days (feed to GEX Bounce strategy)
+            if self.v2_day_type == DayType.RANGE:
+                chain = self._last_option_chain.get(symbol, [])
+                if chain:
+                    expiry_dt = self._expiry_dates.get(symbol)
+                    gex_result = self.v2_gex_calculator.compute(chain, spot_price, expiry_dt)
+                    self.v2_gex_bounce.set_gex_result(gex_result)
+            else:
+                self.v2_gex_bounce.set_gex_result(None)
+
+            v2_signals: list[StrategySignal] = []
+            for strategy in self.v2_strategies:
+                # Day-type gating
+                strat_name = type(strategy).__name__
+                if self.v2_day_type == DayType.TREND and strat_name != "VWAPPullbackStrategy":
+                    continue
+                if self.v2_day_type == DayType.VOLATILE and strat_name != "RSIExtremeStrategy":
+                    continue
+                if self.v2_day_type == DayType.RANGE and strat_name != "GEXBounceStrategy":
+                    continue
+
+                signal = strategy.evaluate(df_today, options_metrics, spot_price, daily_levels=daily_levels)
+                if signal:
+                    signal.instrument = symbol
+                    v2_signals.append(signal)
+
+            if not v2_signals:
+                if cycle % 15 == 1:
+                    self._log_event(
+                        "v2_status",
+                        f"V2 active: day={self.v2_day_type.value}, no signals, "
+                        f"trades={len(self.v2_paper_trader.all_today_trades)}",
+                        cycle=cycle, instrument=symbol,
+                    )
+                return
+
+            # Score V2 signals (reuse V1 scorer)
+            best_signal = None
+            best_score = 0.0
+            best_score_result = None
+            for signal in v2_signals:
+                score_result = self.v2_signal_scorer.score(
+                    signal, df_today, options_metrics, self.global_bias
+                )
+                if score_result.total > best_score:
+                    best_score = score_result.total
+                    best_signal = signal
+                    best_score_result = score_result
+                    signal.score = score_result.total
+
+            if best_signal is None or best_score < 40:
+                self._log_event(
+                    "v2_score",
+                    f"V2 signal below threshold: {best_score:.0f}/40",
+                    cycle=cycle, instrument=symbol,
+                )
+                return
+
+            self._log_event(
+                "v2_signal",
+                f"V2 {best_signal.strategy.value} {best_signal.option_type.value}: score={best_score:.0f}",
+                cycle=cycle, instrument=symbol,
+            )
+
+            # Fetch option premium
+            expiry = self._expiries.get(symbol, "")
+            option_ltp = await self._fetch_option_ltp_for(instrument, best_signal, expiry)
+            if option_ltp is None or option_ltp <= 0:
+                self._log_event("v2_ltp", "V2 option LTP fetch failed", cycle=cycle, instrument=symbol)
+                return
+
+            # V2 SL/targets: tighter and more conservative
+            atr = snap.indicators.atr
+            if atr is None or atr <= 0:
+                return
+            best_signal.entry_price = option_ltp
+            best_signal.stoploss = round(max(
+                option_ltp - (settings.v2_stoploss_pct / 100 * option_ltp),
+                option_ltp * 0.70,
+            ), 2)
+            best_signal.target1 = round(option_ltp + (settings.v2_quick_target_pct / 100 * option_ltp), 2)
+            best_signal.target2 = round(option_ltp + (settings.v2_quick_target_pct * 1.5 / 100 * option_ltp), 2)
+
+            # AI validation (V2 uses configured model)
+            decision = await self.ai_engine.evaluate(best_signal, snap, best_score, best_score_result)
+            if not decision.trade_decision or decision.confidence_score < 60:
+                self._log_event(
+                    "v2_ai",
+                    f"V2 AI rejected: {decision.confidence_score:.0f}% — {decision.reason}",
+                    cycle=cycle, instrument=symbol,
+                )
+                return
+
+            # Enter V2 paper trade
+            logger.info(
+                "[V2][%s] ENTERING: %s %s %.0f%s | Entry=%.2f SL=%.2f T1=%.2f",
+                symbol, best_signal.strategy.value, symbol,
+                best_signal.strike_price, best_signal.option_type.value,
+                option_ltp, best_signal.stoploss, best_signal.target1,
+            )
+
+            nfo_symbol = instrument.build_option_symbol(
+                expiry or "", best_signal.strike_price, best_signal.option_type.value
+            )
+            trade = self.v2_paper_trader.enter_trade(
+                best_signal, decision,
+                nfo_symbol=nfo_symbol,
+                instrument_lot_size=instrument.lot_size,
+            )
+            trade.breakout_level = _extract_breakout_level(best_signal)
+            # Stamp V2 fields
+            trade.engine = "v2"
+            trade.instrument = symbol
+            trade.entry_datetime = datetime.now(IST)
+            trade.max_hold_minutes = settings.v2_max_hold_minutes
+            trade.day_type = self.v2_day_type.value
+
+            await self.trade_logger.log_trade(trade)
+            await self.alert_manager.send_entry_alert(trade, best_score)
+            self._log_event(
+                "v2_trade",
+                f"V2 TRADE: {trade.symbol} {best_signal.strategy.value} | "
+                f"Entry={option_ltp:.2f} SL={trade.stoploss:.2f} T1={trade.target1:.2f}",
+                cycle=cycle, instrument=symbol,
+            )
+
+        except Exception:
+            logger.exception("[V2][%s] Error in V2 analysis", symbol)
+
+    async def _v2_check_exits(
+        self, instrument: InstrumentConfig, snap: MarketSnapshot
+    ) -> None:
+        """Check V2 open trades for exits using SmartExitEngine."""
+        v2_trades = [
+            t for t in self.v2_paper_trader.open_trades
+            if getattr(t, "instrument", "NIFTY") == instrument.symbol
+        ]
+        if not v2_trades:
             return
 
         current_prices: dict[str, float] = {}
-        for trade in self.paper_trader.open_trades:
+        for trade in v2_trades:
             token_info = self.client._search_symbol(trade.symbol)
             if token_info:
-                ltp = self.client.get_ltp(
-                    "NFO",
-                    token_info.get("tradingsymbol", ""),
-                    token_info.get("symboltoken", ""),
-                )
+                try:
+                    ltp = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.client.get_ltp,
+                            "NFO",
+                            token_info.get("tradingsymbol", ""),
+                            token_info.get("symboltoken", ""),
+                        ),
+                        timeout=15,
+                    )
+                except asyncio.TimeoutError:
+                    ltp = None
                 if ltp:
                     current_prices[trade.symbol] = ltp
 
-        closed = self.paper_trader.close_all_open(current_prices)
-        for trade in closed:
-            if not settings.paper_trading:
-                await self._place_live_exit(None, trade)
-            await self.trade_logger.log_trade(trade)
-            await self.alert_manager.send_exit_alert(trade)
+        spot_price = snap.price or snap.nifty_price
 
-        logger.info("All trades closed for EOD. Count: %d", len(closed))
+        for trade in list(v2_trades):
+            ltp = current_prices.get(trade.symbol)
+            if ltp is None:
+                continue
+
+            result = self.v2_smart_exit.evaluate(
+                trade=trade,
+                current_ltp=ltp,
+                snap=snap,
+                day_type=self.v2_day_type,
+                spot_price=spot_price,
+            )
+
+            # Update trailing SL (even if not exiting)
+            if result.new_stoploss is not None and not result.should_exit:
+                if result.new_stoploss > trade.stoploss:
+                    logger.debug(
+                        "[V2] SL UPDATE: %s | Old=%.2f → New=%.2f | %s",
+                        trade.symbol, trade.stoploss, result.new_stoploss, result.reason,
+                    )
+                    trade.stoploss = result.new_stoploss
+
+            if result.should_exit:
+                trade.exit_price = result.exit_price
+                trade.exit_type = result.exit_type
+                self.v2_paper_trader._close_trade(trade, result.exit_type)
+                await self.trade_logger.log_trade(trade)
+                await self.alert_manager.send_exit_alert(trade)
+                logger.info(
+                    "[V2] EXIT [%s]: %s | PnL=%.2f | %s",
+                    result.exit_type, trade.symbol, trade.pnl or 0, result.reason,
+                )
+                self._log_event(
+                    "v2_exit",
+                    f"{result.exit_type}: {trade.symbol}, PnL={trade.pnl or 0:.2f} — {result.reason}",
+                    instrument=instrument.symbol,
+                )
+
+    async def _close_all_trades(self) -> None:
+        """Close all open trades at 15:20 (both V1 and V2)."""
+        all_traders = [("v1", self.paper_trader), ("v2", self.v2_paper_trader)]
+        for engine_label, trader in all_traders:
+            if not trader.open_trades:
+                continue
+
+            current_prices: dict[str, float] = {}
+            for trade in trader.open_trades:
+                token_info = self.client._search_symbol(trade.symbol)
+                if token_info:
+                    ltp = self.client.get_ltp(
+                        "NFO",
+                        token_info.get("tradingsymbol", ""),
+                        token_info.get("symboltoken", ""),
+                    )
+                    if ltp:
+                        current_prices[trade.symbol] = ltp
+
+            closed = trader.close_all_open(current_prices)
+            for trade in closed:
+                trade.exit_type = "eod"
+                if not settings.paper_trading and engine_label == "v1":
+                    await self._place_live_exit(None, trade)
+                await self.trade_logger.log_trade(trade)
+                await self.alert_manager.send_exit_alert(trade)
+
+            logger.info("[%s] All trades closed for EOD. Count: %d", engine_label.upper(), len(closed))
 
     async def _generate_daily_report(self) -> None:
         """Generate and send daily performance report."""

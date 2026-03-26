@@ -114,6 +114,7 @@ class HistoryLogger:
                 trade_id=alert.trade_id,
                 strategy=alert.strategy,
                 pnl=alert.pnl,
+                engine=getattr(alert, 'engine', 'v1') or 'v1',
                 created_at=ts_naive,
             )
             SessionLocal = _get_session_factory()
@@ -327,5 +328,7 @@ class HistoryLogger:
             "trade_id": r.trade_id,
             "strategy": r.strategy,
             "pnl": r.pnl,
+            "engine": getattr(r, 'engine', 'v1') or 'v1',
             "created_at": created_str,
+            "timestamp": created_str,
         }

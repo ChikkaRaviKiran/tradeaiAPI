@@ -37,6 +37,15 @@ class GlobalBias(str, enum.Enum):
     UNAVAILABLE = "unavailable"
 
 
+class DayType(str, enum.Enum):
+    """Day classification for V2 engine."""
+    TREND = "trend"
+    RANGE = "range"
+    VOLATILE = "volatile"
+    UNCLEAR = "unclear"
+    PENDING = "pending"  # Not yet classified (before 10:00)
+
+
 class StrategyName(str, enum.Enum):
     ORB = "ORB"
     VWAP_RECLAIM = "VWAP_RECLAIM"
@@ -47,6 +56,10 @@ class StrategyName(str, enum.Enum):
     EMA_BREAKOUT = "EMA_BREAKOUT"
     BREAKOUT_20D = "BREAKOUT_20D"          # SRS Strategy 2: 20-day high breakout
     OPTIONS_INCOME = "OPTIONS_INCOME"      # SRS Strategy 3: Iron Condor / range
+    # V2 strategies
+    VWAP_PULLBACK = "VWAP_PULLBACK"        # V2: VWAP pullback on trend days
+    GEX_BOUNCE = "GEX_BOUNCE"              # V2: GEX level bounce on range days
+    RSI_EXTREME = "RSI_EXTREME"            # V2: RSI extreme reversal on volatile days
 
 
 # ── Market Data Models ─────────────────────────────────────────────────────────
@@ -155,6 +168,7 @@ class AIDecision(BaseModel):
 class Trade(BaseModel):
     trade_id: Optional[str] = None
     instrument: str = "NIFTY"  # Underlying instrument
+    engine: str = "v1"  # "v1" (current) or "v2" (new system)
     date: str = ""
     time: str = ""
     exit_time: Optional[str] = None
@@ -173,6 +187,11 @@ class Trade(BaseModel):
     lot_size: int = 50
     reason: str = ""
     breakout_level: Optional[float] = None  # Spot level that triggered breakout entry
+    # V2 exit tracking
+    entry_datetime: Optional[datetime] = None  # For time-based exits
+    max_hold_minutes: int = 0  # 0 = no time limit (V1), >0 = V2 time exit
+    exit_type: Optional[str] = None  # stoploss/target/time_exit/thesis_break/trailing/eod
+    day_type: Optional[str] = None  # Day classification when trade was taken
 
 
 # ── Market Snapshot ───────────────────────────────────────────────────────────
@@ -206,6 +225,7 @@ class AlertItem(BaseModel):
     trade_id: Optional[str] = None
     strategy: Optional[str] = None
     pnl: Optional[float] = None
+    engine: str = "v1"  # "v1" or "v2"
 
 
 # ── Sentiment & Stock Ranking (SRS Modules 3.3 / 3.4) ────────────────────────

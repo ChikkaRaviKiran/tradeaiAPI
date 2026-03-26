@@ -206,4 +206,7 @@ class TradeLogger:
             lot_size=record.lot_size,
             reason=record.reason,
             instrument=record.instrument,
+            engine=getattr(record, "engine", "v1") or "v1",
+            exit_type=getattr(record, "exit_type", None),
+            day_type=getattr(record, "day_type", None),
         )

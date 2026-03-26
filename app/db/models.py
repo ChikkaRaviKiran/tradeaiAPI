@@ -40,6 +40,7 @@ class TradeRecord(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     trade_id = Column(String(20), unique=True, nullable=False, index=True)
     instrument = Column(String(20), nullable=False, default="NIFTY", index=True)
+    engine = Column(String(4), nullable=False, default="v1", index=True)  # "v1" or "v2"
     date = Column(String(10), nullable=False, index=True)
     time = Column(String(8), nullable=False)
     exit_time = Column(String(8), nullable=True)
@@ -57,6 +58,8 @@ class TradeRecord(Base):
     status = Column(String(10), nullable=False, default="open")
     lot_size = Column(Integer, default=50)
     reason = Column(Text, nullable=True)
+    exit_type = Column(String(20), nullable=True)  # V2: stoploss/target/time_exit/thesis_break/trailing/eod
+    day_type = Column(String(10), nullable=True)  # V2: trend/range/volatile/unclear
     created_at = Column(DateTime, default=_now_ist)
     updated_at = Column(DateTime, default=_now_ist, onupdate=_now_ist)
 
@@ -67,13 +70,15 @@ class DailyReport(Base):
     __tablename__ = "daily_reports"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    date = Column(String(10), unique=True, nullable=False, index=True)
+    date = Column(String(10), nullable=False, index=True)
+    engine = Column(String(4), nullable=False, default="v1", index=True)  # "v1" or "v2"
     total_trades = Column(Integer, default=0)
     winning_trades = Column(Integer, default=0)
     losing_trades = Column(Integer, default=0)
     total_pnl = Column(Float, default=0.0)
     win_rate = Column(Float, default=0.0)
     max_drawdown = Column(Float, default=0.0)
+    day_type = Column(String(10), nullable=True)  # V2: day classification
     created_at = Column(DateTime, default=_now_ist)
 
 
@@ -128,6 +133,7 @@ class AlertRecord(Base):
     trade_id = Column(String(20), nullable=True)
     strategy = Column(String(30), nullable=True)
     pnl = Column(Float, nullable=True)
+    engine = Column(String(4), nullable=True, default="v1")  # v1 or v2
     created_at = Column(DateTime, default=_now_ist)
 
 
@@ -287,6 +293,16 @@ async def init_db() -> None:
             "ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS htf_trend VARCHAR(10)",
             "CREATE INDEX IF NOT EXISTS ix_telegram_news_date ON telegram_news (date)",
             "CREATE INDEX IF NOT EXISTS ix_daily_ai_insights_date ON daily_ai_insights (date)",
+            # V2 dual-engine columns
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS engine VARCHAR(4) DEFAULT 'v1'",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_type VARCHAR(20)",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS day_type VARCHAR(10)",
+            "CREATE INDEX IF NOT EXISTS ix_trades_engine ON trades (engine)",
+            "ALTER TABLE daily_reports ADD COLUMN IF NOT EXISTS engine VARCHAR(4) DEFAULT 'v1'",
+            "ALTER TABLE daily_reports ADD COLUMN IF NOT EXISTS day_type VARCHAR(10)",
+            "CREATE INDEX IF NOT EXISTS ix_daily_reports_engine ON daily_reports (engine)",
+            # V2 alert engine column
+            "ALTER TABLE alert_records ADD COLUMN IF NOT EXISTS engine VARCHAR(4) DEFAULT 'v1'",
         ]
         for sql in migrations:
             try:

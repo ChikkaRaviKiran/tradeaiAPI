@@ -35,13 +35,19 @@ class RiskManager:
         Consecutive loss limit: 3
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_trades: int = 0,
+        max_concurrent: int = 0,
+        risk_pct: float = 0,
+        consecutive_limit: int = 0,
+    ) -> None:
         self.capital = settings.initial_capital
-        self.max_trades = settings.max_trades_per_day
+        self.max_trades = max_trades or settings.max_trades_per_day
         self.max_daily_loss_pct = settings.max_daily_loss_pct
-        self.risk_per_trade_pct = settings.risk_per_trade_pct
-        self.max_concurrent = settings.max_concurrent_positions
-        self.consecutive_loss_limit = settings.consecutive_loss_limit
+        self.risk_per_trade_pct = risk_pct or settings.risk_per_trade_pct
+        self.max_concurrent = max_concurrent or settings.max_concurrent_positions
+        self.consecutive_loss_limit = consecutive_limit or settings.consecutive_loss_limit
 
     def can_trade(self, today_trades: list[Trade], open_count: int = 0) -> bool:
         """Check if a new trade is allowed based on risk rules."""
