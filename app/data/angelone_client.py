@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import pandas as pd
 import pyotp
@@ -16,6 +16,9 @@ _IST = pytz.timezone("Asia/Kolkata")
 
 from app.core.config import settings
 from app.core.models import Candle, OptionsChainRow
+
+if TYPE_CHECKING:
+    from app.data.angelone_ws import AngelOneWebSocket
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,9 @@ class AngelOneClient:
         self.exchange = "NSE"
         self.nfo_exchange = "NFO"
         self._nfo_symbol_index: dict[str, dict] = {}  # symbol -> {tradingsymbol, symboltoken}
+        # WebSocket streaming (initialised via start_websocket)
+        self.ws: Optional[AngelOneWebSocket] = None
+        self._ws_bootstrapped: set[str] = set()  # tokens already bootstrapped
 
     # ── Instrument Master Cache ─────────────────────────────────────────
 
@@ -619,3 +625,98 @@ class AngelOneClient:
             logger.warning("Dropping %d duplicate timestamp candles", n_dups)
             df = df[~df.index.duplicated(keep="first")]
         return df
+
+    # ── WebSocket Streaming ──────────────────────────────────────────────
+
+    def start_websocket(self) -> bool:
+        """Create and connect WebSocket using current auth credentials.
+
+        Call after authenticate() succeeds.  Returns True if connected.
+        """
+        if not self._auth_token or not self._feed_token:
+            logger.error("Cannot start WebSocket — not authenticated")
+            return False
+
+        from app.data.angelone_ws import AngelOneWebSocket
+
+        self.ws = AngelOneWebSocket(
+            auth_token=self._auth_token,
+            api_key=settings.angelone_api_key,
+            client_code=settings.angelone_client_id,
+            feed_token=self._feed_token,
+        )
+        ok = self.ws.connect()
+        if ok:
+            logger.info("WebSocket streaming started")
+        else:
+            logger.warning("WebSocket connection failed — will use API polling fallback")
+            self.ws = None
+        return ok
+
+    def stop_websocket(self) -> None:
+        if self.ws:
+            self.ws.disconnect()
+            self.ws = None
+
+    def subscribe_instrument(
+        self, spot_token: str, spot_exchange: str, futures_token: Optional[str] = None,
+    ) -> None:
+        """Subscribe to spot (and optionally futures) tokens for streaming.
+
+        Tokens are subscribed in Quote mode so we get LTP + volume for
+        candle aggregation.
+        """
+        if not self.ws or not self.ws.is_connected:
+            return
+        from app.data.angelone_ws import AngelOneWebSocket
+
+        self.ws.subscribe(spot_exchange, [spot_token], AngelOneWebSocket.MODE_QUOTE)
+
+        if futures_token:
+            self.ws.subscribe(self.nfo_exchange, [futures_token], AngelOneWebSocket.MODE_QUOTE)
+
+    def bootstrap_ws_candles(
+        self, token: str, exchange: str, from_date: str, to_date: str,
+    ) -> None:
+        """Fetch historical candles via API and seed the WebSocket CandleBuilder.
+
+        Called once per token at the start of the trading day so the
+        builder already contains previous-day data needed for indicator
+        warmup (EMA200, etc.).
+        """
+        if not self.ws:
+            return
+
+        cache_key = f"{exchange}:{token}"
+        if cache_key in self._ws_bootstrapped:
+            return
+
+        candles = self.get_candle_data(token, exchange, "ONE_MINUTE", from_date, to_date)
+        df = self.candles_to_dataframe(candles)
+        if not df.empty:
+            self.ws.bootstrap_candles(exchange, token, df)
+            self._ws_bootstrapped.add(cache_key)
+
+    def get_live_candles(self, token: str, exchange: str) -> pd.DataFrame:
+        """Get 1-min candle DataFrame from WebSocket if available.
+
+        Falls through to empty DataFrame when WebSocket is not connected
+        or token is not subscribed, allowing the caller to use the API
+        fallback.
+        """
+        if self.ws and self.ws.is_connected:
+            df = self.ws.get_candles_df(exchange, token)
+            if not df.empty:
+                return df
+        return pd.DataFrame()
+
+    def get_live_futures_candles(self, index_name: str) -> pd.DataFrame:
+        """Get 1-min futures candle DataFrame from WebSocket."""
+        if not self.ws or not self.ws.is_connected:
+            return pd.DataFrame()
+
+        token = self._get_index_fut_token(index_name)
+        if not token:
+            return pd.DataFrame()
+
+        return self.ws.get_candles_df(self.nfo_exchange, token)

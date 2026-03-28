@@ -140,9 +140,12 @@ class PaperTradingEngine:
 
             exit_reason = None
 
-            # Check stoploss
+            # Check stoploss — distinguish trailing SL from raw SL
             if current_ltp <= trade.stoploss:
-                exit_reason = "stoploss"
+                if trade.stoploss > trade.entry_price:
+                    exit_reason = "trailing_stoploss"
+                else:
+                    exit_reason = "stoploss"
                 trade.exit_price = current_ltp
 
             # Check target 2 first (full exit)

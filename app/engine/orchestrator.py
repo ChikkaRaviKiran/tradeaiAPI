@@ -466,6 +466,18 @@ class Orchestrator:
             logger.exception("Failed to determine expiries — options data may be unavailable")
             self._log_event("setup", "Expiry discovery FAILED — continuing without options")
 
+        # ── Start WebSocket for real-time streaming ──────────────────────
+        try:
+            self._log_event("setup", "Starting WebSocket streaming...")
+            if self.client.start_websocket():
+                await self._bootstrap_websocket()
+                self._log_event("setup", "WebSocket streaming active — API polling disabled for candles")
+            else:
+                self._log_event("setup", "WebSocket unavailable — using API polling fallback")
+        except Exception:
+            logger.exception("WebSocket startup failed (non-critical)")
+            self._log_event("setup", "WebSocket startup FAILED — using API polling fallback")
+
         # Update shared state for API
         from app.api.routes import get_state
         state = get_state()
@@ -884,6 +896,54 @@ class Orchestrator:
             except Exception:
                 logger.exception("[%s] Failed to fetch daily candles for Donchian", symbol)
 
+    async def _bootstrap_websocket(self) -> None:
+        """Subscribe instruments to WebSocket and seed CandleBuilders with history.
+
+        Called once after WebSocket connects.  Fetches previous-day +
+        today's candles via API (one-time cost), seeds the builder, then
+        subscribes the token so subsequent ticks are aggregated in
+        real-time — eliminating repeated getCandleData polling.
+        """
+        now = datetime.now(IST)
+        prev_day = previous_trading_date(now.date())
+        from_date = prev_day.strftime("%Y-%m-%d 09:15")
+        to_date = now.strftime("%Y-%m-%d %H:%M")
+
+        for inst in self._active_instruments:
+            token = inst.token
+            exchange = inst.exchange.value
+            futures_token = None
+
+            # Bootstrap spot candles
+            try:
+                await asyncio.to_thread(
+                    self.client.bootstrap_ws_candles,
+                    token, exchange, from_date, to_date,
+                )
+            except Exception:
+                logger.warning("[%s] WS bootstrap (spot) failed", inst.symbol)
+
+            # Bootstrap futures candles (for volume)
+            if inst.is_index:
+                futures_token = self.client._get_index_fut_token(inst.symbol)
+                if futures_token:
+                    try:
+                        await asyncio.to_thread(
+                            self.client.bootstrap_ws_candles,
+                            futures_token, self.client.nfo_exchange,
+                            from_date, to_date,
+                        )
+                    except Exception:
+                        logger.warning("[%s] WS bootstrap (futures) failed", inst.symbol)
+
+            # Subscribe to spot + futures tokens
+            self.client.subscribe_instrument(token, exchange, futures_token)
+
+        logger.info(
+            "WebSocket bootstrapped for %d instruments",
+            len(self._active_instruments),
+        )
+
     async def _analyze_instrument(
         self, instrument: InstrumentConfig, cycle: int, now: datetime
     ) -> None:
@@ -896,20 +956,44 @@ class Orchestrator:
             to_date = now.strftime("%Y-%m-%d %H:%M")
             today_str = now.strftime("%Y-%m-%d")
 
-            try:
-                candles = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.client.get_candle_data,
-                        instrument.token, instrument.exchange.value,
-                        "ONE_MINUTE", from_date, to_date,
-                    ),
-                    timeout=45,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("[%s][Cycle %d] Candle data fetch timed out", symbol, cycle)
-                self._log_event("candle", "Candle fetch TIMED OUT", cycle=cycle, instrument=symbol)
-                return
-            df = self.client.candles_to_dataframe(candles)
+            # Try WebSocket first — zero API calls when connected
+            df = self.client.get_live_candles(instrument.token, instrument.exchange.value)
+            if not df.empty:
+                # If WS data has gaps (e.g. after reconnection), re-bootstrap
+                # to heal the CandleBuilder — otherwise has_data_gap would
+                # reject every cycle for the rest of the day.
+                if self.validator.has_data_gap(df):
+                    logger.warning("[%s] WS candle gap detected — re-bootstrapping from API", symbol)
+                    cache_key = f"{instrument.exchange.value}:{instrument.token}"
+                    self.client._ws_bootstrapped.discard(cache_key)
+                    try:
+                        await asyncio.to_thread(
+                            self.client.bootstrap_ws_candles,
+                            instrument.token, instrument.exchange.value,
+                            from_date, to_date,
+                        )
+                        df = self.client.get_live_candles(instrument.token, instrument.exchange.value)
+                    except Exception:
+                        logger.warning("[%s] WS re-bootstrap failed — using API fallback", symbol)
+                        df = pd.DataFrame()
+                if not df.empty:
+                    self._log_event("candle", f"Candles from WebSocket: {len(df)} rows", cycle=cycle, instrument=symbol)
+            if df.empty:
+                # Fallback: API polling (used on first cycle or when WS is down)
+                try:
+                    candles = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.client.get_candle_data,
+                            instrument.token, instrument.exchange.value,
+                            "ONE_MINUTE", from_date, to_date,
+                        ),
+                        timeout=45,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[%s][Cycle %d] Candle data fetch timed out", symbol, cycle)
+                    self._log_event("candle", "Candle fetch TIMED OUT", cycle=cycle, instrument=symbol)
+                    return
+                df = self.client.candles_to_dataframe(candles)
 
             if df.empty:
                 logger.warning("[%s][Cycle %d] No candle data received", symbol, cycle)
@@ -928,52 +1012,50 @@ class Orchestrator:
 
             # 2b. For indices, merge futures volume
             if instrument.is_index:
-                try:
-                    fut_candles = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self.client.get_index_futures_candles,
-                            instrument.symbol,  # NIFTY, BANKNIFTY, etc.
-                            "ONE_MINUTE", from_date, to_date,
-                        ),
-                        timeout=45,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("[%s] Futures candle fetch timed out", symbol)
-                    fut_candles = []
-                except Exception:
-                    logger.warning("[%s] Futures candle fetch failed", symbol, exc_info=True)
-                    fut_candles = []
-                if fut_candles:
-                    fut_df = self.client.candles_to_dataframe(fut_candles)
+                # Try WebSocket-fed futures candles first
+                fut_df = self.client.get_live_futures_candles(instrument.symbol)
+                if not fut_df.empty:
                     df = self.feature_engine.merge_futures_volume(df, fut_df)
-                    self._log_event("data", f"Futures volume merged: {fut_df['volume'].sum():,}", cycle=cycle, instrument=symbol)
+                    self._log_event("data", f"Futures volume (WS) merged: {fut_df['volume'].sum():,}", cycle=cycle, instrument=symbol)
                 else:
-                    logger.warning("[%s][Cycle %d] No futures volume — VWAP/volume scoring limited", symbol, cycle)
-                    self._log_event("data", "No futures volume available — using ATR/option proxies", cycle=cycle, instrument=symbol)
+                    # Fallback: API call for futures candles
+                    try:
+                        fut_candles = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self.client.get_index_futures_candles,
+                                instrument.symbol,  # NIFTY, BANKNIFTY, etc.
+                                "ONE_MINUTE", from_date, to_date,
+                            ),
+                            timeout=45,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("[%s] Futures candle fetch timed out", symbol)
+                        fut_candles = []
+                    except Exception:
+                        logger.warning("[%s] Futures candle fetch failed", symbol, exc_info=True)
+                        fut_candles = []
+                    if fut_candles:
+                        fut_df = self.client.candles_to_dataframe(fut_candles)
+                        df = self.feature_engine.merge_futures_volume(df, fut_df)
+                        self._log_event("data", f"Futures volume merged: {fut_df['volume'].sum():,}", cycle=cycle, instrument=symbol)
+                    else:
+                        logger.warning("[%s][Cycle %d] No futures volume — VWAP/volume scoring limited", symbol, cycle)
+                        self._log_event("data", "No futures volume available — using ATR/option proxies", cycle=cycle, instrument=symbol)
 
-            # 2c. Fetch 5-min candles for multi-timeframe filter (every 5 min)
+            # 2c. Compute 5-min HTF bias (resample from 1-min data — no API call)
             if now.minute % 5 == 0 or symbol not in self._htf_biases:
                 try:
-                    candles_5m = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self.client.get_candle_data,
-                            instrument.token, instrument.exchange.value,
-                            "FIVE_MINUTE", from_date, to_date,
-                        ),
-                        timeout=30,
-                    )
-                    df_5m = self.client.candles_to_dataframe(candles_5m)
+                    df_5m = df.resample("5min").agg(
+                        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+                    ).dropna(subset=["open"])
                     if not df_5m.empty:
                         htf_bias = self.feature_engine.compute_htf_bias(df_5m)
                     else:
                         htf_bias = "neutral"
                     self._htf_biases[symbol] = htf_bias
                     logger.debug("[%s] HTF (5-min) trend: %s", symbol, htf_bias)
-                except asyncio.TimeoutError:
-                    logger.warning("[%s] 5-min candle fetch timed out", symbol)
-                    self._htf_biases.setdefault(symbol, "neutral")
                 except Exception as e:
-                    logger.warning("[%s] 5-min candle fetch failed: %s", symbol, e)
+                    logger.warning("[%s] 5-min resample failed: %s", symbol, e)
                     self._htf_biases.setdefault(symbol, "neutral")
 
             # 3. Feature engineering (on full history for proper indicator warmup)
@@ -1114,17 +1196,26 @@ class Orchestrator:
 
             # 9b. Multi-timeframe filter: skip signals against 5-min trend
             # Override: if 1-min RSI is extreme (≤30 or ≥70), momentum is clearly
-            # directional — bypass HTF filter (Elder Triple Screen: use momentum,
-            # not lagging EMA cross, when price is moving decisively).
+            # directional — filter signals to match the RSI direction.
+            # RSI ≤ 30 = oversold → expect bounce → CALL only
+            # RSI ≥ 70 = overbought → expect pullback → PUT only
             htf_bias = self._htf_biases.get(symbol, "neutral")
             current_rsi = snap.indicators.rsi if snap and snap.indicators else None
             htf_rsi_override = current_rsi is not None and (current_rsi <= 30 or current_rsi >= 70)
-            if htf_rsi_override and htf_bias != "neutral":
+            if htf_rsi_override and signals:
+                # RSI extreme: filter signals to match expected bounce/pullback direction
+                rsi_direction = OptionType.CALL if current_rsi <= 30 else OptionType.PUT
+                pre_count = len(signals)
+                signals = [s for s in signals if s.option_type == rsi_direction]
+                filtered = pre_count - len(signals)
                 logger.info(
-                    "[%s][Cycle %d] HTF filter bypassed — RSI %.1f is extreme (momentum override)",
-                    symbol, cycle, current_rsi,
+                    "[%s][Cycle %d] RSI %.1f extreme — keeping only %s signals (%d filtered)",
+                    symbol, cycle, current_rsi, rsi_direction.value, filtered,
                 )
-                self._log_event("filter", f"HTF filter bypassed — RSI {current_rsi:.1f} extreme momentum override", cycle=cycle, instrument=symbol)
+                self._log_event("filter", f"RSI {current_rsi:.1f} extreme — only {rsi_direction.value} allowed ({filtered} filtered)", cycle=cycle, instrument=symbol)
+                if not signals:
+                    self._log_event("filter", "All signals filtered by RSI extreme direction — skipping", cycle=cycle, instrument=symbol)
+                    return
             elif htf_bias != "neutral" and signals:
                 pre_count = len(signals)
                 signals = [
@@ -1313,13 +1404,13 @@ class Orchestrator:
             #   - Score 40-47: AI OVERRIDE path → ask AI, need confidence >= 80
             is_ai_override = best_signal.details.get("ai_override_path", False)
 
-            if best_score >= 65 and not is_ai_override:
+            if best_score >= 80 and not is_ai_override:
                 # HIGH CONVICTION — skip AI gate, system score is strong enough
                 logger.info(
-                    "[%s][Cycle %d] Score %.0f >= 65 — HIGH CONVICTION, skipping AI gate",
+                    "[%s][Cycle %d] Score %.0f >= 80 — HIGH CONVICTION, skipping AI gate",
                     symbol, cycle, best_score,
                 )
-                self._log_event("ai", f"AI BYPASSED — score {best_score:.0f} >= 65 (high conviction)", cycle=cycle, instrument=symbol)
+                self._log_event("ai", f"AI BYPASSED — score {best_score:.0f} >= 80 (high conviction)", cycle=cycle, instrument=symbol)
                 # Create a synthetic decision for downstream compatibility
                 from app.core.models import AIDecision
                 decision = AIDecision(
@@ -1329,7 +1420,7 @@ class Orchestrator:
                     stoploss=best_signal.stoploss,
                     target1=best_signal.target1,
                     target2=best_signal.target2,
-                    reason=f"High conviction bypass (score={best_score:.0f})",
+                    reason=f"High conviction bypass (score={best_score:.0f}, >= 80)",
                 )
                 await self._save_signal_record(
                     best_signal, best_score, "accepted",
@@ -2318,6 +2409,9 @@ class Orchestrator:
                 await self.alert_manager.send_exit_alert(trade)
 
             logger.info("[%s] All trades closed for EOD. Count: %d", engine_label.upper(), len(closed))
+
+        # Disconnect WebSocket at end of day
+        self.client.stop_websocket()
 
     async def _generate_daily_report(self) -> None:
         """Generate and send daily performance report."""
