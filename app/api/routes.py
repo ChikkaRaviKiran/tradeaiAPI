@@ -240,25 +240,36 @@ async def get_system_status():
     orch = _state.get("orchestrator")
     snapshot = _state.get("snapshot")
 
-    # Quick DB connectivity check (uses its own engine to avoid event-loop
-    # mismatch with the orchestrator thread's loop)
+    # Quick DB connectivity check
     db_ok = False
     try:
         from sqlalchemy import text
-        from app.db.models import create_new_async_session_factory
-        if not hasattr(get_system_status, "_health_sf"):
-            sf, eng = create_new_async_session_factory()
-            get_system_status._health_sf = sf
-            get_system_status._health_eng = eng
-        async with get_system_status._health_sf() as session:
+        from app.db.models import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
             await session.execute(text("SELECT 1"))
         db_ok = True
     except Exception as e:
         logger.warning("DB health check failed: %s", e)
-        # Reset so it rebinds to current loop on next call
-        for attr in ("_health_sf", "_health_eng"):
-            if hasattr(get_system_status, attr):
-                delattr(get_system_status, attr)
+
+    # WebSocket status
+    ws_status = "not_started"
+    ws_last_tick = None
+    ws_subscriptions = 0
+    if orch and hasattr(orch, "client") and orch.client.ws:
+        ws = orch.client.ws
+        ws_subscriptions = len(ws._subscriptions)
+        if ws.is_connected:
+            if ws.is_stale:
+                ws_status = "stale"
+            else:
+                ws_status = "connected"
+        elif ws._running:
+            ws_status = "reconnecting"
+        else:
+            ws_status = "disconnected"
+        tick_time = ws.last_tick_time
+        if tick_time:
+            ws_last_tick = tick_time.strftime("%H:%M:%S")
 
     return {
         "status": "running" if orch and getattr(orch, "running", False) else "stopped",
@@ -276,6 +287,11 @@ async def get_system_status():
         "last_snapshot_time": snapshot.timestamp.isoformat() if snapshot else None,
         "open_trades_count": len(_state.get("open_trades", [])),
         "db_connected": db_ok,
+        "websocket": {
+            "status": ws_status,
+            "last_tick": ws_last_tick,
+            "subscriptions": ws_subscriptions,
+        },
     }
 
 
