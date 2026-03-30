@@ -1,17 +1,20 @@
-"""Application entry point — starts FastAPI server and trading orchestrator."""
+"""Application entry point — starts FastAPI server and trading orchestrator.
 
-import asyncio
+The orchestrator runs as an asyncio background task inside uvicorn's event
+loop (via the FastAPI lifespan handler in routes.py).  This keeps everything
+in a single event loop, avoiding asyncpg "Future attached to a different
+loop" errors that occur when using a separate thread.
+"""
+
 import logging
 import logging.handlers
 import os
 import sys
-import threading
 
 import uvicorn
 
-from app.api.routes import app, get_state
+from app.api.routes import app
 from app.core.config import settings
-from app.engine.orchestrator import Orchestrator
 
 # ── Logging setup: both console AND file ──────────────────────────────────
 log_dir = os.path.join(os.path.dirname(__file__), "logs")
@@ -36,30 +39,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def run_orchestrator() -> None:
-    """Run the trading orchestrator in the background."""
-    orchestrator = Orchestrator()
-    state = get_state()
-    state["orchestrator"] = orchestrator
-    state["eval_scheduler"] = orchestrator.eval_scheduler
-    await orchestrator.start()
-
-
-def start_orchestrator_thread() -> None:
-    """Run orchestrator in a separate thread with its own event loop."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_orchestrator())
-
-
 def main() -> None:
     logger.info("Starting TradeAI System v1.0")
 
-    # Start orchestrator in background thread
-    orch_thread = threading.Thread(target=start_orchestrator_thread, daemon=True)
-    orch_thread.start()
-
-    # Start FastAPI server
+    # Start FastAPI server — orchestrator runs as a background task
+    # inside the SAME event loop (via lifespan in routes.py)
     uvicorn.run(
         app,
         host="0.0.0.0",

@@ -152,6 +152,9 @@ class AngelOneWebSocket:
     MODE_QUOTE = 2
     MODE_SNAP = 3
 
+    # If no tick received for this many seconds during market hours, consider stale
+    STALE_THRESHOLD_SEC = 90
+
     def __init__(
         self,
         auth_token: str,
@@ -177,6 +180,10 @@ class AngelOneWebSocket:
 
         # track subscriptions for auto-resubscribe on reconnect
         self._subscriptions: set[tuple[int, str, int]] = set()
+
+        # Staleness tracking: time of last received tick
+        self._last_tick_time: Optional[datetime] = None
+        self._cred_lock = threading.Lock()
 
     # ── connection lifecycle ───────────────────────────────────────────
 
@@ -227,9 +234,47 @@ class AngelOneWebSocket:
     def is_connected(self) -> bool:
         return self._connected.is_set()
 
+    def update_credentials(
+        self, auth_token: str, feed_token: str,
+    ) -> None:
+        """Update auth credentials so the next reconnect uses fresh tokens."""
+        with self._cred_lock:
+            self._auth_token = auth_token
+            self._feed_token = feed_token
+        logger.info("WebSocket credentials updated for next reconnect")
+
+    @property
+    def last_tick_time(self) -> Optional[datetime]:
+        """Timestamp of last received binary tick (for staleness detection)."""
+        with self._lock:
+            return self._last_tick_time
+
+    @property
+    def is_stale(self) -> bool:
+        """True if connected but no ticks received recently."""
+        if not self._connected.is_set():
+            return False
+        with self._lock:
+            if self._last_tick_time is None:
+                return False
+            elapsed = (datetime.now(_IST) - self._last_tick_time).total_seconds()
+        return elapsed > self.STALE_THRESHOLD_SEC
+
+    def force_reconnect(self) -> None:
+        """Force close the current WebSocket so _run_forever reconnects."""
+        logger.warning("Force-reconnecting WebSocket...")
+        self._connected.clear()
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
     # ── internal WS loop + heartbeat ───────────────────────────────────
 
     def _run_forever(self) -> None:
+        reconnect_delay = 5
+        max_delay = 60
         while self._running:
             try:
                 self._ws.run_forever(
@@ -240,15 +285,21 @@ class AngelOneWebSocket:
 
             if self._running:
                 self._connected.clear()
-                logger.warning("WebSocket disconnected — reconnecting in 5 s")
-                time.sleep(5)
-                # Rebuild WS app with same headers for reconnect
-                headers = {
-                    "Authorization": self._auth_token,
-                    "x-api-key": self._api_key,
-                    "x-client-code": self._client_code,
-                    "x-feed-token": self._feed_token,
-                }
+                logger.warning(
+                    "WebSocket disconnected — reconnecting in %d s", reconnect_delay
+                )
+                time.sleep(reconnect_delay)
+                # Exponential backoff capped at max_delay
+                reconnect_delay = min(reconnect_delay * 2, max_delay)
+
+                # Use latest credentials (may have been refreshed by client)
+                with self._cred_lock:
+                    headers = {
+                        "Authorization": self._auth_token,
+                        "x-api-key": self._api_key,
+                        "x-client-code": self._client_code,
+                        "x-feed-token": self._feed_token,
+                    }
                 self._ws = websocket.WebSocketApp(
                     self.WS_URL,
                     header=headers,
@@ -260,12 +311,22 @@ class AngelOneWebSocket:
 
     def _start_heartbeat(self) -> None:
         def _heartbeat() -> None:
+            consecutive_failures = 0
             while self._running and self._connected.is_set():
                 try:
                     if self._ws and self._ws.sock and self._ws.sock.connected:
                         self._ws.send("ping")
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
                 except Exception:
-                    logger.debug("Heartbeat send failed")
+                    consecutive_failures += 1
+                    logger.debug("Heartbeat send failed (consecutive=%d)", consecutive_failures)
+
+                # If heartbeat fails 3 times in a row, force reconnect
+                if consecutive_failures >= 3:
+                    logger.warning("Heartbeat failed %d times — forcing reconnect", consecutive_failures)
+                    self.force_reconnect()
                     break
                 time.sleep(self.HEARTBEAT_SEC)
 
@@ -277,6 +338,7 @@ class AngelOneWebSocket:
     def _on_open(self, ws) -> None:
         logger.info("WebSocket opened")
         self._connected.set()
+        # Reset reconnect backoff on successful connection
         self._start_heartbeat()
         if self._subscriptions:
             self._resubscribe_all()
@@ -341,6 +403,7 @@ class AngelOneWebSocket:
 
         with self._lock:
             self._ltp_cache[key] = (ltp, ts)
+            self._last_tick_time = datetime.now(_IST)
 
         builder = self._candle_builders.get(key)
         if builder and mode >= self.MODE_QUOTE:

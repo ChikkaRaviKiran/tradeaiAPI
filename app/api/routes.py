@@ -6,6 +6,7 @@ and ML predictions alongside existing trade/performance endpoints.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime
@@ -46,9 +47,29 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Initializing database...")
     await init_db()
+
+    # Start orchestrator as a background task in the SAME event loop
+    # (avoids asyncpg "Future attached to a different loop" errors)
+    from app.engine.orchestrator import Orchestrator
+
+    async def _run_orchestrator():
+        orchestrator = Orchestrator()
+        state = get_state()
+        state["orchestrator"] = orchestrator
+        state["eval_scheduler"] = orchestrator.eval_scheduler
+        await orchestrator.start()
+
+    orchestrator_task = asyncio.create_task(_run_orchestrator())
+
     yield
+
     # Shutdown
     logger.info("Shutting down...")
+    orchestrator_task.cancel()
+    try:
+        await orchestrator_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(

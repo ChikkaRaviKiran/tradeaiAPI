@@ -602,6 +602,17 @@ class Orchestrator:
 
             # Market hours: continuous analysis
             if MARKET_OPEN <= current_time < PRE_CLOSE:
+                # Proactive re-auth every 90 min to keep WebSocket tokens fresh
+                if (
+                    self.client._last_auth
+                    and (datetime.now(IST) - self.client._last_auth).total_seconds() > 5400
+                ):
+                    try:
+                        logger.info("Proactive re-authentication for token freshness")
+                        self.client.authenticate()
+                    except Exception:
+                        logger.warning("Proactive re-auth failed (non-critical)")
+
                 # Fetch global data if never fetched (late start) or stale (>15 min)
                 if self._global_last_fetched is None:
                     logger.info("Late start detected — fetching global data now")
@@ -619,6 +630,8 @@ class Orchestrator:
                 await self._maybe_fetch_rss_news()
 
                 await self._run_analysis_cycle()
+                # Check WebSocket health after every cycle
+                await self._check_ws_health()
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
                 continue
 
@@ -895,6 +908,55 @@ class Orchestrator:
                 logger.warning("[%s] Daily candle fetch timed out", symbol)
             except Exception:
                 logger.exception("[%s] Failed to fetch daily candles for Donchian", symbol)
+
+    async def _check_ws_health(self) -> None:
+        """Detect stale or dead WebSocket and recover.
+
+        Called after every analysis cycle.  If the WebSocket is connected
+        but hasn't received any ticks for STALE_THRESHOLD_SEC, force a
+        reconnect with fresh credentials.  If the WebSocket is fully
+        disconnected, attempt to restart it.
+        """
+        ws = self.client.ws
+        if ws is None:
+            return  # WS was never started or intentionally disabled
+
+        try:
+            if ws.is_stale:
+                logger.warning(
+                    "WebSocket is stale (no ticks for >%ds) — refreshing credentials and forcing reconnect",
+                    ws.STALE_THRESHOLD_SEC,
+                )
+                self._log_event("ws", "WebSocket stale — forcing reconnect")
+                # Re-authenticate to get fresh tokens
+                self.client.authenticate()  # also calls ws.update_credentials
+                ws.force_reconnect()
+                # Give it a moment to reconnect before next cycle
+                await asyncio.sleep(3)
+                # Re-bootstrap if reconnect succeeded
+                if ws.is_connected:
+                    self.client._ws_bootstrapped.clear()
+                    await self._bootstrap_websocket()
+                    self._log_event("ws", "WebSocket recovered after stale detection")
+
+            elif not ws.is_connected:
+                logger.warning("WebSocket disconnected — attempting restart")
+                self._log_event("ws", "WebSocket disconnected — restarting")
+                # Re-authenticate to get fresh tokens
+                self.client.authenticate()
+                ws.update_credentials(self.client._auth_token, self.client._feed_token)
+                # force_reconnect will let the _run_forever loop pick up
+                # but if ws thread died entirely, restart it
+                if not ws._running:
+                    self.client.stop_websocket()
+                    if self.client.start_websocket():
+                        self.client._ws_bootstrapped.clear()
+                        await self._bootstrap_websocket()
+                        self._log_event("ws", "WebSocket restarted successfully")
+                    else:
+                        self._log_event("ws", "WebSocket restart failed — using API fallback")
+        except Exception:
+            logger.exception("WebSocket health check failed (non-critical)")
 
     async def _bootstrap_websocket(self) -> None:
         """Subscribe instruments to WebSocket and seed CandleBuilders with history.

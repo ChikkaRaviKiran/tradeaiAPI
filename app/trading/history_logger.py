@@ -3,47 +3,40 @@
 from __future__ import annotations
 
 import logging
-import threading
 from datetime import datetime
 
 from sqlalchemy import select
 
 from app.core.models import AlertItem, MarketSnapshot
-from app.db.models import AlertRecord, MarketSnapshotRecord, create_new_async_session_factory
+from app.db.models import AlertRecord, MarketSnapshotRecord, AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
-
-# Thread-local storage so each event loop gets its own engine
-_thread_local = threading.local()
 
 # Track DB errors to avoid spamming logs/alerts
 _db_error_count = 0
 _DB_ERROR_LOG_INTERVAL = 10  # Only log every N failures
 
+_tables_ensured = False
+
 
 def _get_session_factory():
-    """Return a session factory bound to the current thread's event loop."""
-    if not hasattr(_thread_local, 'session_factory'):
-        _thread_local.session_factory, _thread_local.engine = create_new_async_session_factory()
-    return _thread_local.session_factory
+    """Return the shared async session factory."""
+    return AsyncSessionLocal
 
 
 async def _ensure_tables():
-    """Ensure our tables exist (called once per thread)."""
-    if not hasattr(_thread_local, '_tables_created'):
-        try:
-            _get_session_factory()  # ensure engine is created
-            from app.db.models import Base
-            engine = _thread_local.engine
-            async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            _thread_local._tables_created = True
-        except Exception:
-            # Reset thread-local state so next call retries fresh
-            for attr in ('session_factory', 'engine', '_tables_created'):
-                if hasattr(_thread_local, attr):
-                    delattr(_thread_local, attr)
-            raise
+    """Ensure our tables exist (called once)."""
+    global _tables_ensured
+    if _tables_ensured:
+        return
+    try:
+        from app.db.models import async_engine, Base
+        async with async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        _tables_ensured = True
+    except Exception:
+        logger.debug("_ensure_tables failed (tables likely already created by init_db)")
+        _tables_ensured = True  # Don't keep retrying; init_db handles creation
 
 
 class HistoryLogger:
@@ -122,12 +115,10 @@ class HistoryLogger:
                 async with session.begin():
                     session.add(record)
         except Exception as e:
-            # Reset thread-local state so next attempt retries fresh
-            for attr in ('session_factory', 'engine', '_tables_created'):
-                if hasattr(_thread_local, attr):
-                    delattr(_thread_local, attr)
-            logger.error("Error saving alert")
-            logger.debug("save_alert detail: %s", str(e), exc_info=True)
+            _db_error_count += 1
+            if _db_error_count % _DB_ERROR_LOG_INTERVAL == 1:
+                logger.error("Error saving alert")
+                logger.debug("save_alert detail: %s", str(e), exc_info=True)
 
     async def get_snapshots_by_date(self, target_date: str) -> list[dict]:
         """Get all snapshots for a specific date (YYYY-MM-DD)."""

@@ -139,6 +139,9 @@ class AngelOneClient:
             self._feed_token = self._smart_api.getfeedToken()
             self._last_auth = datetime.now(_IST)
             logger.info("AngelOne authenticated successfully.")
+            # Update WebSocket credentials so reconnects use fresh tokens
+            if self.ws:
+                self.ws.update_credentials(self._auth_token, self._feed_token)
             return True
         except Exception:
             logger.exception("AngelOne authentication error")
