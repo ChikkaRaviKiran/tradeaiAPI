@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.core.holidays import is_market_holiday, next_trading_date
 from app.core.models import AlertItem, MarketSnapshot, PerformanceMetrics, Trade
 from app.db.models import init_db
 from app.trading.history_logger import HistoryLogger
@@ -143,8 +144,29 @@ async def get_system_status():
     """System health and status."""
     orch = _state.get("orchestrator")
     snapshot = _state.get("snapshot")
+    today = date.today()
+    holiday = is_market_holiday(today)
+    weekend = today.weekday() >= 5
+
+    if holiday and weekend:
+        holiday_message = f"Weekend — market closed. Next trading day: {next_trading_date(today).strftime('%a, %d %b %Y')}"
+    elif holiday:
+        holiday_message = f"Market holiday today. Next trading day: {next_trading_date(today).strftime('%a, %d %b %Y')}"
+    else:
+        holiday_message = None
+
+    if holiday:
+        status = "holiday"
+    elif orch and getattr(orch, "running", False):
+        status = "running"
+    else:
+        status = "stopped"
+
     return {
-        "status": "running" if orch and getattr(orch, "running", False) else "stopped",
+        "status": status,
+        "is_holiday": holiday,
+        "holiday_message": holiday_message,
+        "next_trading_day": next_trading_date(today).isoformat() if holiday else None,
         "paper_trading": settings.paper_trading,
         "capital": settings.initial_capital,
         "max_trades_per_day": settings.max_trades_per_day,

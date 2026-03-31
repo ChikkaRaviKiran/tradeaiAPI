@@ -83,36 +83,55 @@ def _load_cache(year: int) -> Optional[list[dict]]:
 
 
 def _get_holidays_for_year(year: int) -> set[date]:
-    """Get NSE holidays: try API → disk cache → hardcoded fallback."""
+    """Get NSE holidays: merge API/cache data WITH hardcoded fallback.
+
+    Always includes hardcoded holidays so known dates are never missed
+    even if the NSE API returns incomplete data.
+    """
     if year in _holiday_cache:
         return _holiday_cache[year]
 
-    # 1. Try fetching from NSE
+    # Start with hardcoded holidays (guaranteed baseline)
+    holidays = set(_FALLBACK_HOLIDAYS.get(year, set()))
+
+    # 1. Try fetching from NSE — merge into baseline
     try:
         raw = _fetch_from_nse()
-        holidays = {d for d in _parse_holidays(raw) if d.year == year}
-        if holidays:
-            logger.info("[Holidays] Fetched %d holidays for %d from NSE", len(holidays), year)
+        api_holidays = {d for d in _parse_holidays(raw) if d.year == year}
+        if api_holidays:
+            holidays |= api_holidays
+            logger.info(
+                "[Holidays] Merged %d API + %d hardcoded holidays for %d (total %d)",
+                len(api_holidays), len(_FALLBACK_HOLIDAYS.get(year, set())),
+                year, len(holidays),
+            )
             _save_cache(year, [e for e in raw if str(year) in e.get("tradingDate", "")])
             _holiday_cache[year] = holidays
             return holidays
     except Exception:
         logger.warning("[Holidays] Could not fetch from NSE API — trying cache")
 
-    # 2. Try local disk cache
+    # 2. Try local disk cache — merge into baseline
     cached = _load_cache(year)
     if cached:
-        holidays = _parse_holidays(cached)
-        if holidays:
-            logger.info("[Holidays] Loaded %d holidays for %d from cache", len(holidays), year)
+        cache_holidays = _parse_holidays(cached)
+        if cache_holidays:
+            holidays |= cache_holidays
+            logger.info(
+                "[Holidays] Merged %d cached + %d hardcoded holidays for %d (total %d)",
+                len(cache_holidays), len(_FALLBACK_HOLIDAYS.get(year, set())),
+                year, len(holidays),
+            )
             _holiday_cache[year] = holidays
             return holidays
 
-    # 3. Hardcoded fallback (2026 only — as a safety net)
-    logger.warning("[Holidays] Using hardcoded fallback for %d", year)
-    fallback = _FALLBACK_HOLIDAYS.get(year, set())
-    _holiday_cache[year] = fallback
-    return fallback
+    # 3. Only hardcoded holidays available
+    if holidays:
+        logger.info("[Holidays] Using %d hardcoded holidays for %d", len(holidays), year)
+    else:
+        logger.warning("[Holidays] No holiday data available for %d", year)
+    _holiday_cache[year] = holidays
+    return holidays
 
 
 # Hardcoded fallback — only used if both NSE API and cache fail

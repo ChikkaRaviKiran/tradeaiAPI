@@ -90,6 +90,7 @@ class Orchestrator:
         # State
         self.running = False
         self._cycle_count = 0
+        self._consecutive_empty = 0  # Track consecutive cycles with no data
         self._global_last_fetched: Optional[datetime] = None
         self.global_bias = GlobalBias.UNAVAILABLE
         self.global_indices: list = []  # Store individual index data
@@ -120,6 +121,7 @@ class Orchestrator:
     def _reset_for_new_day(self) -> None:
         """Reset daily state for a fresh trading day."""
         self._cycle_count = 0
+        self._consecutive_empty = 0
         self._global_last_fetched = None
         self.global_bias = GlobalBias.UNAVAILABLE
         self.global_indices = []
@@ -233,8 +235,33 @@ class Orchestrator:
             df = self.client.candles_to_dataframe(candles)
 
             if df.empty:
-                logger.warning("[Cycle %d] No candle data received from AngelOne", cycle)
+                self._consecutive_empty += 1
+                logger.warning(
+                    "[Cycle %d] No candle data received from AngelOne (empty streak: %d)",
+                    cycle, self._consecutive_empty,
+                )
+                if self._consecutive_empty >= 5:
+                    logger.error(
+                        "[Cycle %d] %d consecutive empty cycles — market may be closed or API down. Pausing.",
+                        cycle, self._consecutive_empty,
+                    )
+                    await self.alert_manager.send_info(
+                        "NO DATA — PAUSING",
+                        f"{self._consecutive_empty} consecutive cycles returned no data.\n"
+                        "Possible causes:\n"
+                        "• Market holiday not detected\n"
+                        "• AngelOne API authentication expired\n"
+                        "• Network connectivity issue\n\n"
+                        "System will auto-retry after 5 minutes.",
+                    )
+                    # Re-authenticate and wait 5 min before retrying
+                    self.client.authenticate()
+                    self._consecutive_empty = 0
+                    await asyncio.sleep(300)
                 return
+
+            # Data received — reset empty streak
+            self._consecutive_empty = 0
 
             # 2. Validate data (NIFTY is an index — volume is always 0)
             df = self.validator.validate_candles(df, is_index=True)
