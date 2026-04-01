@@ -517,6 +517,7 @@ class AngelOneWebSocket:
 
         df = pd.DataFrame(bars)
         df.set_index("timestamp", inplace=True)
+        df.index = pd.to_datetime(df.index, utc=True).tz_convert("Asia/Kolkata")
         df.sort_index(inplace=True)
         if df.index.has_duplicates:
             df = df[~df.index.duplicated(keep="last")]

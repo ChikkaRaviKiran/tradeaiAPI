@@ -621,6 +621,7 @@ class AngelOneClient:
         data = [c.model_dump() for c in candles]
         df = pd.DataFrame(data)
         df.set_index("timestamp", inplace=True)
+        df.index = pd.to_datetime(df.index, utc=True).tz_convert("Asia/Kolkata")
         df.sort_index(inplace=True)
         # Remove duplicate timestamps (keep first occurrence)
         if df.index.has_duplicates:
