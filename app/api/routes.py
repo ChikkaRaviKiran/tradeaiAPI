@@ -11,6 +11,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 
+import pyotp
 import pytz
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -812,3 +813,171 @@ async def get_evaluation_history(target_date: str):
             for r in rows
         ],
     }
+
+
+# ── Broker Settings ─────────────────────────────────────────────────────
+
+@app.get("/api/broker/status")
+async def get_broker_status():
+    """Get AngelOne broker connection status and auth health."""
+    orch = _state.get("orchestrator")
+    client = orch.client if orch and hasattr(orch, "client") else None
+
+    result = {
+        "configured": bool(settings.angelone_api_key and settings.angelone_client_id),
+        "api_key_set": bool(settings.angelone_api_key),
+        "client_id_set": bool(settings.angelone_client_id),
+        "mpin_set": bool(settings.angelone_mpin),
+        "totp_secret_set": bool(settings.angelone_totp_secret),
+        "authenticated": False,
+        "last_auth": None,
+        "auth_error": None,
+        "client_id": settings.angelone_client_id[:2] + "***" if settings.angelone_client_id else None,
+    }
+
+    if client:
+        result["authenticated"] = client._auth_token is not None
+        if client._last_auth:
+            result["last_auth"] = client._last_auth.isoformat()
+            # Check if token is stale
+            age = (datetime.now(_IST) - client._last_auth).total_seconds()
+            result["token_age_minutes"] = round(age / 60, 1)
+            result["token_stale"] = age > 7200  # >2 hours
+
+    return result
+
+
+@app.post("/api/broker/test")
+async def test_broker_connection():
+    """Test AngelOne authentication with current credentials.
+
+    Attempts a fresh login and reports success/failure with details.
+    """
+    from SmartApi import SmartConnect
+
+    api_key = settings.angelone_api_key
+    client_id = settings.angelone_client_id
+    credential = settings.angelone_mpin or settings.angelone_password
+    totp_secret = settings.angelone_totp_secret
+
+    if not api_key:
+        return {"success": False, "error": "ANGELONE_API_KEY is not configured"}
+    if not client_id:
+        return {"success": False, "error": "ANGELONE_CLIENT_ID is not configured"}
+    if not credential:
+        return {"success": False, "error": "ANGELONE_MPIN / ANGELONE_PASSWORD is not configured"}
+    if not totp_secret:
+        return {"success": False, "error": "ANGELONE_TOTP_SECRET is not configured"}
+
+    try:
+        smart_api = SmartConnect(api_key=api_key)
+        totp = pyotp.TOTP(totp_secret).now()
+        data = smart_api.generateSession(client_id, credential, totp)
+
+        if not data or data.get("status") is False:
+            error_msg = data.get("message", "Unknown error") if data else "No response"
+            error_code = data.get("errorcode", "") if data else ""
+            return {
+                "success": False,
+                "error": f"{error_msg} (code: {error_code})" if error_code else error_msg,
+                "raw_response": str(data),
+            }
+
+        return {
+            "success": True,
+            "message": "Authentication successful",
+            "client_id": client_id[:2] + "***",
+        }
+    except Exception as e:
+        logger.exception("Broker test connection failed")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/broker/update-credentials")
+async def update_broker_credentials(body: dict):
+    """Update AngelOne credentials in .env file and reload settings.
+
+    Only updates fields that are provided (non-empty).
+    Requires system to be stopped.
+    """
+    import os
+    import re
+
+    orch = _state.get("orchestrator")
+    if orch and getattr(orch, "running", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot update credentials while system is running. Stop the system first.",
+        )
+
+    field_map = {
+        "api_key": "ANGELONE_API_KEY",
+        "client_id": "ANGELONE_CLIENT_ID",
+        "password": "ANGELONE_PASSWORD",
+        "mpin": "ANGELONE_MPIN",
+        "totp_secret": "ANGELONE_TOTP_SECRET",
+    }
+
+    updates = {}
+    for field, env_var in field_map.items():
+        value = body.get(field, "").strip()
+        if value:
+            updates[env_var] = value
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No credentials provided")
+
+    # Update .env file
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env")
+    env_path = os.path.abspath(env_path)
+
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    else:
+        content = ""
+
+    for env_var, value in updates.items():
+        # Replace existing line or append
+        pattern = rf"^{re.escape(env_var)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, f"{env_var}={value}", content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\n{env_var}={value}\n"
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    # Reload settings in memory
+    for env_var, value in updates.items():
+        attr_name = env_var.lower()
+        if hasattr(settings, attr_name):
+            object.__setattr__(settings, attr_name, value)
+
+    # Force re-auth on next use
+    if orch and hasattr(orch, "client"):
+        orch.client._last_auth = None
+        orch.client._smart_api = None
+        orch.client._auth_token = None
+
+    updated_fields = list(updates.keys())
+    logger.info("Broker credentials updated: %s", updated_fields)
+    return {"success": True, "updated_fields": updated_fields}
+
+
+@app.post("/api/broker/re-authenticate")
+async def re_authenticate_broker():
+    """Force re-authentication with AngelOne using current credentials."""
+    orch = _state.get("orchestrator")
+    if not orch or not hasattr(orch, "client"):
+        raise HTTPException(status_code=503, detail="AngelOne client not initialized")
+
+    client = orch.client
+    client._last_auth = None
+    client._smart_api = None
+    client._auth_token = None
+
+    success = client.authenticate()
+    if success:
+        return {"success": True, "message": "Re-authenticated successfully"}
+    return {"success": False, "error": "Authentication failed — check logs for details"}
