@@ -399,6 +399,20 @@ class AngelOneClient:
                     sell_depth = depth.get("sell", [])
                     best_bid = float(buy_depth[0].get("price", 0)) if buy_depth else 0.0
                     best_ask = float(sell_depth[0].get("price", 0)) if sell_depth else 0.0
+
+                    # Stale depth detection: if LTP is far outside the bid-ask
+                    # range, the depth data is stale (common for illiquid monthly
+                    # contracts). Zero out depth so the liquidity gate blocks entry.
+                    if best_bid > 0 and best_ask > 0 and ltp > 0:
+                        if ltp < best_bid * 0.80 or ltp > best_ask * 1.20:
+                            logger.warning(
+                                "Stale depth detected for %s: LTP=%.2f outside "
+                                "bid=%.2f/ask=%.2f — zeroing depth",
+                                symbol, ltp, best_bid, best_ask,
+                            )
+                            best_bid = 0.0
+                            best_ask = 0.0
+
                     # Compute spread
                     spread = best_ask - best_bid if best_bid > 0 and best_ask > 0 else 0.0
                     mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else ltp

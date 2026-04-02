@@ -1641,8 +1641,10 @@ class Orchestrator:
         instruments = []
         for name in names:
             inst = get_instrument(name)
-            if inst:
+            if inst and inst.enabled:
                 instruments.append(inst)
+            elif inst and not inst.enabled:
+                logger.warning("Instrument %s is disabled — skipping", name)
             else:
                 logger.warning("Unknown instrument in config: %s — skipping", name)
         if not instruments:
@@ -1664,8 +1666,8 @@ class Orchestrator:
         inst_best: dict[str, float] = {}  # symbol -> best composite score
         inst_strats: dict[str, list[str]] = {}  # symbol -> [strategy names]
 
-        # Only these 3 indices are allowed for trading
-        ALLOWED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY"}
+        # Only these indices are allowed for trading
+        ALLOWED_INDICES = {"NIFTY"}
 
         for r in recs:
             if r.composite_score < min_score:
@@ -1706,7 +1708,7 @@ class Orchestrator:
 
         for sym in selected_symbols:
             inst = get_instrument(sym)
-            if not inst:
+            if not inst or not inst.enabled:
                 continue
             instruments.append(inst)
 
