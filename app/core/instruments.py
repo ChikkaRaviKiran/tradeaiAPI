@@ -92,6 +92,7 @@ BANKNIFTY = InstrumentConfig(
     futures_symbol_prefix="BANKNIFTY",
     option_symbol_prefix="BANKNIFTY",
     is_index=True,
+    enabled=False,  # Disabled — only NIFTY active
 )
 
 FINNIFTY = InstrumentConfig(
@@ -105,6 +106,7 @@ FINNIFTY = InstrumentConfig(
     futures_symbol_prefix="FINNIFTY",
     option_symbol_prefix="FINNIFTY",
     is_index=True,
+    enabled=False,  # Disabled — only NIFTY active
 )
 
 MIDCPNIFTY = InstrumentConfig(
