@@ -34,6 +34,16 @@ from app.data.global_markets import fetch_global_indices
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
 
+
+def _ensure_str(val) -> str:
+    """Convert list/dict to string for DB storage."""
+    if isinstance(val, list):
+        return "\n".join(str(v) for v in val)
+    if isinstance(val, dict):
+        return json.dumps(val, default=str)
+    return str(val) if val else ""
+
+
 PRE_MARKET_SYSTEM_PROMPT = """You are an expert Indian stock market analyst preparing a pre-market trading plan.
 
 You receive comprehensive market data including:
@@ -53,7 +63,7 @@ Your job is to produce a structured trading plan for the day. Respond ONLY with 
     "trading_plan": "Detailed trading plan for the day (3-5 bullet points)",
     "sectors_to_watch": ["SECTOR1", "SECTOR2"],
     "avoid_sectors": ["SECTOR1"],
-    "score_modifier": -15 to +15,
+    "score_modifier": -5 to +15,
     "risk_advice": "conservative" | "normal" | "aggressive",
     "key_levels": {
         "nifty_support": [level1, level2],
@@ -412,7 +422,7 @@ class PreMarketAnalyst:
                     weak_sectors=",".join(breadth.weak_sectors) if breadth else None,
                     key_levels=json.dumps(insight.get("key_levels", {})),
                     ai_summary=insight.get("summary", ""),
-                    trading_plan=insight.get("trading_plan", ""),
+                    trading_plan=_ensure_str(insight.get("trading_plan", "")),
                     raw_data=json.dumps(insight, default=str),
                 )
                 session.add(record)

@@ -59,6 +59,7 @@ class Breakout20DStrategy(BaseStrategy):
         options_metrics: OptionsMetrics,
         spot_price: float,
         daily_levels: Optional[dict] = None,
+        structure_data: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         # Require daily levels — cannot evaluate without real 20-day data
         if not daily_levels or "high_20d" not in daily_levels or "low_20d" not in daily_levels:

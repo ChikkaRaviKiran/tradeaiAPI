@@ -48,9 +48,11 @@ from app.data.global_markets import compute_global_bias, fetch_global_indices
 from app.data.validator import DataValidator
 from app.engine.ai_decision import AIDecisionEngine
 from app.engine.feature_engine import FeatureEngine
+from app.engine.feature_engine import compute_market_structure
 from app.engine.regime_detector import RegimeDetector
 from app.engine.signal_scorer import SignalScorer, MIN_SCORE, compute_adaptive_min_score, set_insight_manager, lock_session_threshold
 from app.strategies.base import BaseStrategy
+from app.strategies.adaptive import AdaptiveStrategy
 from app.strategies.liquidity_sweep import LiquiditySweepStrategy
 from app.strategies.momentum_breakout import MomentumBreakoutStrategy
 from app.strategies.ema_breakout import EMABreakoutStrategy
@@ -157,6 +159,7 @@ class Orchestrator:
         self.ai_engine = AIDecisionEngine()
         self.risk_manager = RiskManager()
         self.paper_trader = PaperTradingEngine()
+        self.smart_exit = SmartExitEngine()  # V1 smart exit engine
         self.broker = AngelOneBroker()
         self.trade_logger = TradeLogger()
         self.history_logger = HistoryLogger()
@@ -170,7 +173,9 @@ class Orchestrator:
         set_ai_insight_manager(self.insight_manager)
 
         # Strategies (applied to every instrument) — V1 Engine
+        # AdaptiveStrategy is primary (context-aware), mechanical strategies are secondary
         self.strategies: list[BaseStrategy] = [
+            AdaptiveStrategy(),
             ORBStrategy(),
             VWAPReclaimStrategy(),
             TrendPullbackStrategy(),
@@ -229,6 +234,10 @@ class Orchestrator:
         self._last_option_chain: dict[str, list] = {}
         # Per-instrument higher-timeframe trend bias
         self._htf_biases: dict[str, str] = {}
+        # Per-instrument computed market structure (swing points, bias, BOS/CHoCH)
+        self._market_structures: dict[str, dict] = {}
+        # Re-entry cooldown: {(instrument, direction): datetime of last SL exit}
+        self._sl_cooldowns: dict[tuple[str, str], datetime] = {}
         # Per-instrument 20-day Donchian levels from daily candles
         # {symbol: {"high_20d": float, "low_20d": float}}
         self._daily_levels: dict[str, dict] = {}
@@ -321,6 +330,8 @@ class Orchestrator:
         self._expiry_dates = {}
         self._last_option_chain = {}
         self._htf_biases = {}
+        self._market_structures = {}
+        self._sl_cooldowns = {}
         self.snapshot = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
@@ -1236,6 +1247,23 @@ class Orchestrator:
                 return
 
             # 9. Run strategies — filtered by market regime
+            #    Compute market structure only when new candle appears (cache by candle count)
+            candle_count = len(df_today)
+            last_candle_count = self._market_structures.get(f"{symbol}_count", 0)
+            if candle_count != last_candle_count or symbol not in self._market_structures:
+                structure = compute_market_structure(df_today)
+                self._market_structures[symbol] = structure
+                self._market_structures[f"{symbol}_count"] = candle_count
+                if structure["bias"] != "neutral":
+                    self._log_event(
+                        "structure",
+                        f"Structure: {structure['bias'].upper()}, HH/HL={structure['hh_hl']}, LH/LL={structure['lh_ll']}"
+                        + (f", BOS={structure['last_bos']['type']}@{structure['last_bos']['level']:.2f}" if structure.get('last_bos') else "")
+                        + (f", CHoCH={structure['last_choch']['type']}" if structure.get('last_choch') else ""),
+                        cycle=cycle, instrument=symbol,
+                    )
+            structure = self._market_structures.get(symbol, {})
+
             strategies_to_run = self._instrument_strategies.get(symbol, self.strategies)
             daily_levels = self._daily_levels.get(symbol)
             signals: list[StrategySignal] = []
@@ -1243,7 +1271,7 @@ class Orchestrator:
                 # Regime-strategy filtering: skip strategies that don't fit current regime
                 if not _strategy_compatible_with_regime(strategy, regime):
                     continue
-                signal = strategy.evaluate(df_today, options_metrics, spot_price, daily_levels=daily_levels)
+                signal = strategy.evaluate(df_today, options_metrics, spot_price, daily_levels=daily_levels, structure_data=structure)
                 if signal:
                     signal.instrument = symbol
                     signals.append(signal)
@@ -1256,7 +1284,7 @@ class Orchestrator:
                 self._consecutive_no_signal = 0
                 self._log_event("signal", f"{len(signals)} signal(s): {', '.join(s.strategy.value for s in signals)}", cycle=cycle, instrument=symbol)
 
-            # 9b. Multi-timeframe filter: skip signals against 5-min trend
+            # 9b. Multi-timeframe filter: PENALIZE (not block) signals against 5-min trend
             # Override: if 1-min RSI is extreme (≤30 or ≥70), momentum is clearly
             # directional — filter signals to match the RSI direction.
             # RSI ≤ 30 = oversold → expect bounce → CALL only
@@ -1279,19 +1307,56 @@ class Orchestrator:
                     self._log_event("filter", "All signals filtered by RSI extreme direction — skipping", cycle=cycle, instrument=symbol)
                     return
             elif htf_bias != "neutral" and signals:
+                # Softened HTF filter: apply -5 score penalty to opposing signals
+                # Only BLOCK if HTF trend is strongly opposing (EMA gap > 0.5%)
                 pre_count = len(signals)
-                signals = [
-                    s for s in signals
-                    if not (htf_bias == "bullish" and s.option_type == OptionType.PUT)
-                    and not (htf_bias == "bearish" and s.option_type == OptionType.CALL)
-                ]
-                filtered = pre_count - len(signals)
-                if filtered > 0:
-                    logger.info(
-                        "[%s][Cycle %d] HTF filter removed %d signal(s) against %s trend",
-                        symbol, cycle, filtered, htf_bias,
-                    )
-                    self._log_event("filter", f"HTF filter removed {filtered} signal(s) against {htf_bias} trend", cycle=cycle, instrument=symbol)
+                strong_opposing = False
+                ema9_5m = None
+                ema20_5m = None
+                # Check if HTF trend is strong by looking at 5-min EMA gap
+                if symbol in self._htf_biases:
+                    try:
+                        df_5m_check = df.resample("5min").agg(
+                            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+                        ).dropna(subset=["open"])
+                        if len(df_5m_check) >= 12:
+                            import ta as _ta
+                            _e9 = _ta.trend.ema_indicator(df_5m_check["close"], window=9)
+                            _e20 = _ta.trend.ema_indicator(df_5m_check["close"], window=20)
+                            ema9_5m = float(_e9.iloc[-1])
+                            ema20_5m = float(_e20.iloc[-1])
+                            if ema20_5m > 0:
+                                gap_pct = abs(ema9_5m - ema20_5m) / ema20_5m * 100
+                                strong_opposing = gap_pct > 0.5
+                    except Exception:
+                        pass
+
+                if strong_opposing:
+                    # Strong opposing HTF trend: block opposing signals entirely
+                    signals = [
+                        s for s in signals
+                        if not (htf_bias == "bullish" and s.option_type == OptionType.PUT)
+                        and not (htf_bias == "bearish" and s.option_type == OptionType.CALL)
+                    ]
+                    filtered = pre_count - len(signals)
+                    if filtered > 0:
+                        logger.info(
+                            "[%s][Cycle %d] STRONG HTF filter removed %d signal(s) against %s trend (EMA gap >0.5%%)",
+                            symbol, cycle, filtered, htf_bias,
+                        )
+                        self._log_event("filter", f"Strong HTF filter removed {filtered} signal(s) against {htf_bias} trend", cycle=cycle, instrument=symbol)
+                else:
+                    # Weak HTF filter: mark opposing signals for -5 score penalty
+                    for s in signals:
+                        is_opposing = (htf_bias == "bullish" and s.option_type == OptionType.PUT) or \
+                                      (htf_bias == "bearish" and s.option_type == OptionType.CALL)
+                        if is_opposing:
+                            s.details["htf_penalty"] = -5
+                            logger.info(
+                                "[%s][Cycle %d] HTF soft penalty: %s %s gets -5 (against %s trend)",
+                                symbol, cycle, s.strategy.value, s.option_type.value, htf_bias,
+                            )
+
                 if not signals:
                     self._log_event("filter", "All signals filtered by HTF — skipping", cycle=cycle, instrument=symbol)
                     await self.alert_manager.send_info(
@@ -1321,7 +1386,8 @@ class Orchestrator:
 
             for signal in signals:
                 score_result = self.signal_scorer.score(
-                    signal, df, options_metrics, self.global_bias
+                    signal, df, options_metrics, self.global_bias,
+                    structure_data=structure,
                 )
                 raw_score = score_result.total
 
@@ -1339,6 +1405,12 @@ class Orchestrator:
                     eval_boost = 5
 
                 boosted_score = min(raw_score + eval_boost, 100)
+
+                # Apply HTF soft penalty if marked by filter
+                htf_penalty = signal.details.get("htf_penalty", 0)
+                if htf_penalty:
+                    boosted_score = max(0, boosted_score + htf_penalty)
+
                 all_scored.append((signal, boosted_score))
 
                 if eval_boost > 0:
@@ -1374,7 +1446,8 @@ class Orchestrator:
                     best_signal = ai_override_candidates[0][0]
                     best_score = ai_override_candidates[0][1]
                     best_score_result = self.signal_scorer.score(
-                        best_signal, df, options_metrics, self.global_bias
+                        best_signal, df, options_metrics, self.global_bias,
+                        structure_data=structure,
                     )
                     best_signal.score = best_score
                     # Mark as AI-override path so we require high AI confidence
@@ -1398,6 +1471,22 @@ class Orchestrator:
                             f"Signal(s) close to threshold but not passed:\n{miss_info}",
                         )
                     return
+
+            # 10b. Re-entry cooldown — block same instrument+direction within 15 min of SL hit
+            cooldown_key = (symbol, best_signal.option_type.value)
+            cooldown_until = self._sl_cooldowns.get(cooldown_key)
+            if cooldown_until and now < cooldown_until:
+                remaining = (cooldown_until - now).total_seconds() / 60
+                logger.info(
+                    "[%s][Cycle %d] Re-entry cooldown active for %s (%.0f min left) — skipping",
+                    symbol, cycle, best_signal.option_type.value, remaining,
+                )
+                self._log_event(
+                    "gate",
+                    f"Re-entry cooldown: {best_signal.option_type.value} blocked for {remaining:.0f} more min",
+                    cycle=cycle, instrument=symbol,
+                )
+                return
 
             # 11. Fetch option premium (with bid-ask spread)
             option_quote = await self._fetch_option_quote_for(instrument, best_signal, expiry)
@@ -1456,7 +1545,7 @@ class Orchestrator:
             # ATR-based SL/targets (Wilder: 2×ATR stop, Tharp: 2R+ reward)
             option_atr = atr * 0.5  # ATM delta ~0.5 scales spot ATR to option premium
             best_signal.entry_price = entry_price
-            best_signal.stoploss = round(max(entry_price - (2.0 * option_atr), entry_price * 0.70), 2)
+            best_signal.stoploss = round(max(entry_price - (2.5 * option_atr), entry_price * 0.70), 2)
             best_signal.target1 = round(entry_price + (2.0 * option_atr), 2)
             best_signal.target2 = round(entry_price + (3.5 * option_atr), 2)
 
@@ -1466,13 +1555,13 @@ class Orchestrator:
             #   - Score 40-47: AI OVERRIDE path → ask AI, need confidence >= 80
             is_ai_override = best_signal.details.get("ai_override_path", False)
 
-            if best_score >= 80 and not is_ai_override:
+            if best_score >= 85 and not is_ai_override:
                 # HIGH CONVICTION — skip AI gate, system score is strong enough
                 logger.info(
-                    "[%s][Cycle %d] Score %.0f >= 80 — HIGH CONVICTION, skipping AI gate",
+                    "[%s][Cycle %d] Score %.0f >= 85 — HIGH CONVICTION, skipping AI gate",
                     symbol, cycle, best_score,
                 )
-                self._log_event("ai", f"AI BYPASSED — score {best_score:.0f} >= 80 (high conviction)", cycle=cycle, instrument=symbol)
+                self._log_event("ai", f"AI BYPASSED — score {best_score:.0f} >= 85 (high conviction)", cycle=cycle, instrument=symbol)
                 # Create a synthetic decision for downstream compatibility
                 from app.core.models import AIDecision
                 decision = AIDecision(
@@ -1482,7 +1571,7 @@ class Orchestrator:
                     stoploss=best_signal.stoploss,
                     target1=best_signal.target1,
                     target2=best_signal.target2,
-                    reason=f"High conviction bypass (score={best_score:.0f}, >= 80)",
+                    reason=f"High conviction bypass (score={best_score:.0f}, >= 85)",
                 )
                 await self._save_signal_record(
                     best_signal, best_score, "accepted",
@@ -1495,12 +1584,14 @@ class Orchestrator:
                 # Adaptive AI confidence threshold:
                 # - AI override path (score < threshold): need high AI confidence (80)
                 # - Normal path: adaptive based on score
+                # - Early session (09:15-11:15): lower thresholds to avoid over-filtering
+                early_session = now.time() < dtime(11, 15)
                 if is_ai_override:
-                    ai_threshold = 80  # AI must be very confident to rescue a low score
+                    ai_threshold = 70 if early_session else 80
                 elif best_score >= 55:
-                    ai_threshold = 60
+                    ai_threshold = 55 if early_session else 60
                 else:
-                    ai_threshold = 65
+                    ai_threshold = 60 if early_session else 65
 
                 if not decision.trade_decision or decision.confidence_score < ai_threshold:
                     # Override: if AI gave confidence >= threshold but trade_decision=False,
@@ -2139,7 +2230,7 @@ class Orchestrator:
                     )
 
     async def _check_trade_exits(self, spot_price: float) -> None:
-        """Check all open trades for stoploss/target hits."""
+        """Check all open V1 trades using SmartExitEngine for exit decisions."""
         if not self.paper_trader.open_trades:
             return
 
@@ -2155,10 +2246,60 @@ class Orchestrator:
                 if ltp:
                     current_prices[trade.symbol] = ltp
 
-        closed = self.paper_trader.check_exits(current_prices)
-        for trade in closed:
-            await self.trade_logger.log_trade(trade)
-            await self.alert_manager.send_exit_alert(trade)
+        # Use SmartExitEngine for V1 trades (same as V2)
+        for trade in list(self.paper_trader.open_trades):
+            ltp = current_prices.get(trade.symbol)
+            if ltp is None:
+                continue
+
+            # Get snapshot for this trade's instrument
+            instrument_symbol = getattr(trade, 'instrument', None) or 'NIFTY'
+            snap = self.snapshots.get(instrument_symbol)
+            if not snap:
+                continue
+
+            # Compute option ATR from spot ATR
+            atr = snap.indicators.atr if snap.indicators else None
+            opt_atr = (atr or 0) * 0.5  # ATM delta ~0.5
+
+            result = self.smart_exit.evaluate(
+                trade=trade,
+                current_ltp=ltp,
+                snap=snap,
+                day_type=self.v2_day_type if self.v2_day_classified else DayType.PENDING,
+                spot_price=spot_price,
+                candle_closed=True,  # V1 runs once per candle close
+                option_atr=opt_atr,
+            )
+
+            # Update trailing SL
+            if result.new_stoploss is not None and not result.should_exit:
+                if result.new_stoploss > trade.stoploss:
+                    logger.debug(
+                        "[V1] SL UPDATE: %s | Old=%.2f -> New=%.2f | %s",
+                        trade.symbol, trade.stoploss, result.new_stoploss, result.reason,
+                    )
+                    trade.stoploss = result.new_stoploss
+
+            if result.should_exit:
+                trade.exit_price = result.exit_price
+                trade.exit_type = result.exit_type
+                self.paper_trader._close_trade(trade, result.exit_type)
+                await self.trade_logger.log_trade(trade)
+                await self.alert_manager.send_exit_alert(trade)
+                logger.info(
+                    "[V1] EXIT [%s]: %s | PnL=%.2f | %s",
+                    result.exit_type, trade.symbol, trade.pnl or 0, result.reason,
+                )
+                # Record re-entry cooldown on stoploss exits (15 min)
+                if result.exit_type in ("stoploss", "hard_stoploss"):
+                    cooldown_key = (instrument_symbol, trade.option_type.value if trade.option_type else "")
+                    self._sl_cooldowns[cooldown_key] = datetime.now() + timedelta(minutes=15)
+                    logger.info(
+                        "[%s] SL cooldown set for %s direction until %s",
+                        instrument_symbol, cooldown_key[1],
+                        self._sl_cooldowns[cooldown_key].strftime("%H:%M"),
+                    )
 
     # ── V2 Engine ─────────────────────────────────────────────────────────
 
@@ -2243,7 +2384,13 @@ class Orchestrator:
                 if self.v2_day_type == DayType.RANGE and strat_name != "GEXBounceStrategy":
                     continue
 
-                signal = strategy.evaluate(df_today, options_metrics, spot_price, daily_levels=daily_levels)
+                # Use cached market structure if available (computed by V1)
+                v2_structure = self._market_structures.get(symbol)
+                signal = strategy.evaluate(
+                    df_today, options_metrics, spot_price,
+                    daily_levels=daily_levels,
+                    structure_data=v2_structure,
+                )
                 if signal:
                     signal.instrument = symbol
                     v2_signals.append(signal)
@@ -2263,8 +2410,10 @@ class Orchestrator:
             best_score = 0.0
             best_score_result = None
             for signal in v2_signals:
+                v2_structure = self._market_structures.get(symbol)
                 score_result = self.v2_signal_scorer.score(
-                    signal, df_today, options_metrics, self.global_bias
+                    signal, df_today, options_metrics, self.global_bias,
+                    structure_data=v2_structure,
                 )
                 if score_result.total > best_score:
                     best_score = score_result.total
@@ -2410,12 +2559,18 @@ class Orchestrator:
             if ltp is None:
                 continue
 
+            # Compute option ATR from spot ATR
+            v2_atr = snap.indicators.atr if snap and snap.indicators else None
+            v2_opt_atr = (v2_atr or 0) * 0.5
+
             result = self.v2_smart_exit.evaluate(
                 trade=trade,
                 current_ltp=ltp,
                 snap=snap,
                 day_type=self.v2_day_type,
                 spot_price=spot_price,
+                candle_closed=True,
+                option_atr=v2_opt_atr,
             )
 
             # Update trailing SL (even if not exiting)
@@ -2442,6 +2597,10 @@ class Orchestrator:
                     f"{result.exit_type}: {trade.symbol}, PnL={trade.pnl or 0:.2f} — {result.reason}",
                     instrument=instrument.symbol,
                 )
+                # Record re-entry cooldown on SL exits
+                if result.exit_type in ("stoploss", "hard_stoploss"):
+                    cooldown_key = (instrument.symbol, trade.option_type.value if hasattr(trade, 'option_type') and trade.option_type else "")
+                    self._sl_cooldowns[cooldown_key] = datetime.now() + timedelta(minutes=15)
 
     async def _close_all_trades(self) -> None:
         """Close all open trades at 15:20 (both V1 and V2)."""

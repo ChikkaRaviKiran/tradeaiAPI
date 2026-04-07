@@ -125,12 +125,13 @@ class SignalScorer:
         df: pd.DataFrame,
         options_metrics: OptionsMetrics,
         global_bias: GlobalBias,
+        structure_data: dict | None = None,
     ) -> SignalScore:
         """Compute multi-factor score for a strategy signal."""
         scores = SignalScore()
         is_call = signal.option_type == OptionType.CALL
 
-        # 1. Strategy trigger (22 pts) — earned from signal quality
+        # 1. Strategy trigger (15 pts — reduced from 22, less weight on mechanical rules)
         scores.strategy_trigger = self._score_strategy_trigger(signal, df)
 
         # 2. Volume confirmation (18 pts) — from futures volume or ATM option volume
@@ -157,6 +158,18 @@ class SignalScorer:
             breadth_score = _insight_manager.get_breadth_score(is_call)
             news_score = _insight_manager.get_news_sentiment_score(is_call)
 
+        # 10. Structure alignment (10 pts — NEW)
+        structure_score = self._score_structure(signal, structure_data)
+
+        # 11. Pre-market directional penalty (-8 if opposing pre-market bias)
+        premarket_penalty = 0.0
+        if _insight_manager and _insight_manager.has_insight:
+            pm_bias = _insight_manager.get_market_bias()
+            if pm_bias == "bullish" and signal.option_type == OptionType.PUT:
+                premarket_penalty = -8
+            elif pm_bias == "bearish" and signal.option_type == OptionType.CALL:
+                premarket_penalty = -8
+
         scores.total = (
             scores.strategy_trigger
             + scores.volume_confirmation
@@ -167,10 +180,12 @@ class SignalScorer:
             + fii_score
             + breadth_score
             + news_score
+            + structure_score
+            + premarket_penalty
         )
 
         logger.info(
-            "Signal score: %.0f (strat=%.0f vol=%.0f vwap=%.0f oi=%.0f global=%.0f hist=%.0f fii=%.0f breadth=%.0f news=%.0f)",
+            "Signal score: %.0f (strat=%.0f vol=%.0f vwap=%.0f oi=%.0f global=%.0f hist=%.0f fii=%.0f breadth=%.0f news=%.0f struct=%.0f)",
             scores.total,
             scores.strategy_trigger,
             scores.volume_confirmation,
@@ -181,6 +196,7 @@ class SignalScorer:
             fii_score,
             breadth_score,
             news_score,
+            structure_score,
         )
         return scores
 
@@ -291,7 +307,7 @@ class SignalScorer:
             elif signal.option_type == OptionType.PUT and macd_hist < 0:
                 score += 5
 
-        return min(score, 22.0)
+        return min(score, 15.0)
 
     def _score_volume(
         self, signal: StrategySignal, df: pd.DataFrame, options_metrics: OptionsMetrics,
@@ -400,11 +416,17 @@ class SignalScorer:
 
         if signal.option_type == OptionType.CALL and close > vwap:
             pct_above = (close - vwap) / vwap * 100 if vwap > 0 else 0
+            # Extended move penalty: price too far above VWAP → mean reversion risk
+            if pct_above > 1.5:
+                return -5
             if pct_above > 0.1:
                 return max_pts
             return round(max_pts * 0.67)
         if signal.option_type == OptionType.PUT and close < vwap:
             pct_below = (vwap - close) / vwap * 100 if vwap > 0 else 0
+            # Extended move penalty: price too far below VWAP → mean reversion risk
+            if pct_below > 1.5:
+                return -5
             if pct_below > 0.1:
                 return max_pts
             return round(max_pts * 0.67)
@@ -580,3 +602,37 @@ class SignalScorer:
                     score += 1
 
         return min(score, 16)
+
+    def _score_structure(self, signal: StrategySignal, structure_data: dict | None) -> float:
+        """Score based on market structure alignment (0–10).
+
+        +5 if signal direction matches structural bias (HH/HL = bullish, LH/LL = bearish)
+        +3 if BOS confirms direction
+        +2 if signal has confirmation candle (from adaptive strategy details)
+        """
+        if not structure_data:
+            return 0.0
+
+        score = 0.0
+        bias = structure_data.get("bias", "neutral")
+        is_call = signal.option_type == OptionType.CALL
+
+        # Direction matches structural bias (+5)
+        if (is_call and bias == "bullish") or (not is_call and bias == "bearish"):
+            score += 5.0
+        elif bias == "neutral":
+            pass  # No penalty, no bonus
+        else:
+            score -= 2.0  # Opposing structure = mild penalty
+
+        # BOS confirms direction (+3)
+        bos = structure_data.get("last_bos")
+        if bos:
+            if (is_call and bos["type"] == "bullish") or (not is_call and bos["type"] == "bearish"):
+                score += 3.0
+
+        # Confirmation candle present (+2) — from adaptive strategy
+        if signal.details.get("confirmed_hold") or signal.details.get("setup"):
+            score += 2.0
+
+        return max(min(score, 10.0), 0.0)

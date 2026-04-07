@@ -49,6 +49,7 @@ class EMABreakoutStrategy(BaseStrategy):
         options_metrics: OptionsMetrics,
         spot_price: float,
         daily_levels: Optional[dict] = None,
+        structure_data: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < 20:
             return None
@@ -75,6 +76,11 @@ class EMABreakoutStrategy(BaseStrategy):
 
         # Require real indicator data
         if any(v is None or (isinstance(v, float) and v != v) for v in [rsi, ema9, ema20, ema50]):
+            return None
+
+        # ADX floor — need minimum directional movement for EMA breakout
+        adx = last.get("adx")
+        if adx is not None and not (isinstance(adx, float) and adx != adx) and adx < 15:
             return None
 
         # EMA200 may not be available early — use EMA50 as fallback for trend

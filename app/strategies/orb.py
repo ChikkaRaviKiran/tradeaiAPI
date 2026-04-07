@@ -44,6 +44,7 @@ class ORBStrategy(BaseStrategy):
         options_metrics: OptionsMetrics,
         spot_price: float,
         daily_levels: Optional[dict] = None,
+        structure_data: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < 16:  # Need at least 15-min ORB window + 1 candle
             return None
@@ -57,6 +58,10 @@ class ORBStrategy(BaseStrategy):
 
         orh = or_candles["high"].max()
         orl = or_candles["low"].min()
+
+        # Reject narrow opening ranges (< 0.3% of spot) — too noisy for reliable breakout
+        if spot_price > 0 and (orh - orl) / spot_price * 100 < 0.3:
+            return None
 
         # Only evaluate candles after ORB window
         post_orb = df[df.index.time > ORB_END]
@@ -78,6 +83,12 @@ class ORBStrategy(BaseStrategy):
         # Require real indicator data
         if any(v is None or (isinstance(v, float) and v != v) for v in [rsi, ema9, ema20]):
             return None
+
+        # ADX floor — need minimum directional movement for breakout
+        adx = last.get("adx")
+        if adx is not None and not (isinstance(adx, float) and adx != adx) and adx < 15:
+            return None
+
         if vwap is None or (isinstance(vwap, float) and vwap != vwap):
             vwap = close  # Fallback: VWAP unavailable, use close (VWAP checks won't earn score)
 

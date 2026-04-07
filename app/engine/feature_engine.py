@@ -293,3 +293,311 @@ def _safe(row: pd.Series, col: str) -> Optional[float]:
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
     return float(val)
+
+
+# ── Market Structure Detection ───────────────────────────────────────────────
+
+
+def compute_market_structure(df: pd.DataFrame, swing_lookback: int = 5) -> dict:
+    """Detect swing points, trend structure, BOS and CHoCH from OHLCV data.
+
+    Args:
+        df: OHLCV DataFrame with at least 20 rows.
+        swing_lookback: Number of candles each side to confirm a swing (default 5).
+
+    Returns:
+        dict with keys:
+          - swing_highs: list of (index, price) tuples
+          - swing_lows: list of (index, price) tuples
+          - bias: "bullish" | "bearish" | "neutral"
+          - last_bos: dict or None — last Break of Structure event
+          - last_choch: dict or None — last Change of Character event
+          - hh_hl: bool — Higher High / Higher Low sequence present
+          - lh_ll: bool — Lower High / Lower Low sequence present
+    """
+    result = {
+        "swing_highs": [],
+        "swing_lows": [],
+        "bias": "neutral",
+        "last_bos": None,
+        "last_choch": None,
+        "hh_hl": False,
+        "lh_ll": False,
+    }
+
+    if df.empty or len(df) < swing_lookback * 2 + 1:
+        return result
+
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
+    idx = df.index
+
+    # Detect swing highs / swing lows (pivot points)
+    swing_highs = []  # (position, price)
+    swing_lows = []
+
+    for i in range(swing_lookback, len(df) - swing_lookback):
+        # Swing high: high[i] > all neighbors within lookback
+        if all(highs[i] >= highs[i - j] for j in range(1, swing_lookback + 1)) and \
+           all(highs[i] >= highs[i + j] for j in range(1, swing_lookback + 1)):
+            swing_highs.append((i, float(highs[i])))
+
+        # Swing low: low[i] < all neighbors within lookback
+        if all(lows[i] <= lows[i - j] for j in range(1, swing_lookback + 1)) and \
+           all(lows[i] <= lows[i + j] for j in range(1, swing_lookback + 1)):
+            swing_lows.append((i, float(lows[i])))
+
+    result["swing_highs"] = swing_highs
+    result["swing_lows"] = swing_lows
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return result
+
+    # Determine HH/HL (bullish) or LH/LL (bearish) structure
+    last_two_highs = swing_highs[-2:]
+    last_two_lows = swing_lows[-2:]
+
+    hh = last_two_highs[1][1] > last_two_highs[0][1]
+    hl = last_two_lows[1][1] > last_two_lows[0][1]
+    lh = last_two_highs[1][1] < last_two_highs[0][1]
+    ll = last_two_lows[1][1] < last_two_lows[0][1]
+
+    result["hh_hl"] = hh and hl
+    result["lh_ll"] = lh and ll
+
+    if hh and hl:
+        result["bias"] = "bullish"
+    elif lh and ll:
+        result["bias"] = "bearish"
+
+    # Detect BOS: price CLOSES beyond the previous swing high/low
+    # BOS bullish: close > prev swing high (body, not just wick)
+    # BOS bearish: close < prev swing low
+    last_close = float(closes[-1])
+    prev_swing_high = swing_highs[-1][1]
+    prev_swing_low = swing_lows[-1][1]
+    second_last_high = swing_highs[-2][1] if len(swing_highs) >= 2 else None
+    second_last_low = swing_lows[-2][1] if len(swing_lows) >= 2 else None
+
+    if last_close > prev_swing_high:
+        result["last_bos"] = {
+            "type": "bullish",
+            "level": prev_swing_high,
+            "close": last_close,
+        }
+    elif last_close < prev_swing_low:
+        result["last_bos"] = {
+            "type": "bearish",
+            "level": prev_swing_low,
+            "close": last_close,
+        }
+
+    # Detect CHoCH: first structural shift
+    # Bullish CHoCH: was making LH/LL, now makes a higher high
+    # Bearish CHoCH: was making HH/HL, now makes a lower low
+    if len(swing_highs) >= 3 and len(swing_lows) >= 3:
+        h3, h2, h1 = [x[1] for x in swing_highs[-3:]]
+        l3, l2, l1 = [x[1] for x in swing_lows[-3:]]
+
+        # Was bearish (h3>h2 = LH), now bullish (h1>h2 = HH)
+        if h2 < h3 and h1 > h2:
+            result["last_choch"] = {"type": "bullish", "level": h2}
+
+        # Was bullish (l2>l3 = HL), now bearish (l1<l2 = LL)
+        if l2 > l3 and l1 < l2:
+            result["last_choch"] = {"type": "bearish", "level": l2}
+
+    return result
+
+
+def compute_key_levels(
+    df: pd.DataFrame,
+    options_metrics=None,
+    daily_levels: Optional[dict] = None,
+    gex_data: Optional[dict] = None,
+) -> list[dict]:
+    """Build a priority-ranked key level map from multiple sources.
+
+    Each level is {price, type, strength (1-5), source}.
+
+    Sources:
+      - Previous day high/low/close
+      - Opening range high/low
+      - Swing highs/lows from market structure
+      - GEX flip / support / resistance
+      - Max pain
+      - OI clusters
+    """
+    levels: list[dict] = []
+
+    if df.empty:
+        return levels
+
+    today_str = df.index[-1].strftime("%Y-%m-%d") if hasattr(df.index[-1], "strftime") else None
+
+    # 1. Previous day high/low/close
+    if daily_levels:
+        if "prev_high" in daily_levels:
+            levels.append({"price": daily_levels["prev_high"], "type": "resistance", "strength": 4, "source": "prev_day_high"})
+        if "prev_low" in daily_levels:
+            levels.append({"price": daily_levels["prev_low"], "type": "support", "strength": 4, "source": "prev_day_low"})
+        if "prev_close" in daily_levels:
+            levels.append({"price": daily_levels["prev_close"], "type": "pivot", "strength": 3, "source": "prev_day_close"})
+
+    # 2. Opening range high/low (09:15-09:30)
+    if today_str:
+        or_mask = (df.index.strftime("%Y-%m-%d") == today_str) & \
+                  (df.index.time >= pd.Timestamp("09:15").time()) & \
+                  (df.index.time <= pd.Timestamp("09:30").time())
+        or_candles = df[or_mask]
+        if not or_candles.empty:
+            orh = float(or_candles["high"].max())
+            orl = float(or_candles["low"].min())
+            levels.append({"price": orh, "type": "resistance", "strength": 4, "source": "orb_high"})
+            levels.append({"price": orl, "type": "support", "strength": 4, "source": "orb_low"})
+
+    # 3. Swing points
+    structure = compute_market_structure(df)
+    for _, price in structure["swing_highs"][-3:]:
+        levels.append({"price": price, "type": "resistance", "strength": 3, "source": "swing_high"})
+    for _, price in structure["swing_lows"][-3:]:
+        levels.append({"price": price, "type": "support", "strength": 3, "source": "swing_low"})
+
+    # 4. GEX levels
+    if gex_data:
+        if gex_data.get("flip_strike"):
+            levels.append({"price": gex_data["flip_strike"], "type": "pivot", "strength": 5, "source": "gex_flip"})
+        for s in gex_data.get("support_zones", [])[:2]:
+            levels.append({"price": s, "type": "support", "strength": 4, "source": "gex_support"})
+        for r in gex_data.get("resistance_zones", [])[:2]:
+            levels.append({"price": r, "type": "resistance", "strength": 4, "source": "gex_resistance"})
+
+    # 5. Options metrics
+    if options_metrics:
+        if options_metrics.max_pain:
+            levels.append({"price": options_metrics.max_pain, "type": "pivot", "strength": 3, "source": "max_pain"})
+        if options_metrics.call_oi_cluster:
+            levels.append({"price": options_metrics.call_oi_cluster, "type": "resistance", "strength": 3, "source": "call_oi_wall"})
+        if options_metrics.put_oi_cluster:
+            levels.append({"price": options_metrics.put_oi_cluster, "type": "support", "strength": 3, "source": "put_oi_wall"})
+
+    # Sort by strength descending
+    levels.sort(key=lambda x: x["strength"], reverse=True)
+    return levels
+
+
+def analyze_candle_character(df: pd.DataFrame) -> dict:
+    """Analyze the character of the most recent candle.
+
+    Returns:
+        dict with keys:
+          - type: "momentum" | "rejection" | "absorption" | "indecision" | "neutral"
+          - direction: "bullish" | "bearish" | "neutral"
+          - body_ratio: float (body / full range, 0-1)
+          - upper_wick_ratio: float
+          - lower_wick_ratio: float
+          - volume_character: "climax" | "acceleration" | "declining" | "normal"
+    """
+    result = {
+        "type": "neutral",
+        "direction": "neutral",
+        "body_ratio": 0.0,
+        "upper_wick_ratio": 0.0,
+        "lower_wick_ratio": 0.0,
+        "volume_character": "normal",
+    }
+
+    if df.empty or len(df) < 2:
+        return result
+
+    last = df.iloc[-1]
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    vol = float(last.get("volume", 0))
+    avg_vol = float(df["volume"].tail(10).mean()) if len(df) >= 10 else vol
+
+    candle_range = h - l
+    if candle_range <= 0:
+        return result
+
+    body = abs(c - o)
+    body_ratio = body / candle_range
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    upper_wick_ratio = upper_wick / candle_range
+    lower_wick_ratio = lower_wick / candle_range
+
+    result["body_ratio"] = round(body_ratio, 3)
+    result["upper_wick_ratio"] = round(upper_wick_ratio, 3)
+    result["lower_wick_ratio"] = round(lower_wick_ratio, 3)
+    result["direction"] = "bullish" if c > o else ("bearish" if c < o else "neutral")
+
+    # Classify candle type
+    if body_ratio > 0.65:
+        result["type"] = "momentum"  # Strong directional candle
+    elif upper_wick_ratio > 0.5 and lower_wick_ratio < 0.15:
+        result["type"] = "rejection"  # Shooting star / bearish rejection
+        result["direction"] = "bearish"
+    elif lower_wick_ratio > 0.5 and upper_wick_ratio < 0.15:
+        result["type"] = "rejection"  # Hammer / bullish rejection
+        result["direction"] = "bullish"
+    elif body_ratio < 0.25:
+        result["type"] = "indecision"  # Doji-like
+    elif upper_wick_ratio > 0.3 and lower_wick_ratio > 0.3:
+        result["type"] = "absorption"  # Both sides tested, body small
+
+    # Volume character
+    if avg_vol > 0 and vol > 0:
+        vol_ratio = vol / avg_vol
+        if vol_ratio >= 2.5:
+            result["volume_character"] = "climax"
+        elif vol_ratio >= 1.5:
+            result["volume_character"] = "acceleration"
+        elif vol_ratio < 0.7:
+            result["volume_character"] = "declining"
+
+    return result
+
+
+def find_nearest_levels(
+    spot_price: float,
+    levels: list[dict],
+    max_distance_pct: float = 1.0,
+) -> dict:
+    """Find nearest support and resistance from key levels relative to spot.
+
+    Returns:
+        dict with nearest_support, nearest_resistance, at_key_level (bool),
+        distance_to_support_pct, distance_to_resistance_pct.
+    """
+    nearest_support = None
+    nearest_resistance = None
+    min_sup_dist = float("inf")
+    min_res_dist = float("inf")
+
+    for lvl in levels:
+        price = lvl["price"]
+        dist = abs(price - spot_price) / spot_price * 100
+        if dist > max_distance_pct:
+            continue
+
+        if lvl["type"] in ("support", "pivot") and price <= spot_price:
+            if spot_price - price < min_sup_dist:
+                min_sup_dist = spot_price - price
+                nearest_support = lvl
+        elif lvl["type"] in ("resistance", "pivot") and price >= spot_price:
+            if price - spot_price < min_res_dist:
+                min_res_dist = price - spot_price
+                nearest_resistance = lvl
+
+    sup_dist_pct = (min_sup_dist / spot_price * 100) if nearest_support else None
+    res_dist_pct = (min_res_dist / spot_price * 100) if nearest_resistance else None
+
+    return {
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
+        "at_key_level": (sup_dist_pct is not None and sup_dist_pct < 0.15)
+                        or (res_dist_pct is not None and res_dist_pct < 0.15),
+        "distance_to_support_pct": round(sup_dist_pct, 3) if sup_dist_pct else None,
+        "distance_to_resistance_pct": round(res_dist_pct, 3) if res_dist_pct else None,
+    }

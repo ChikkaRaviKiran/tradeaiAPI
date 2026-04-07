@@ -55,6 +55,7 @@ class RSIExtremeStrategy(BaseStrategy):
         options_metrics: OptionsMetrics,
         spot_price: float,
         daily_levels: Optional[dict] = None,
+        structure_data: Optional[dict] = None,
     ) -> Optional[StrategySignal]:
         if df.empty or len(df) < 15:
             return None

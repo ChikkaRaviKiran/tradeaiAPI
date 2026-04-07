@@ -43,6 +43,88 @@ class DayClassifier:
     ATR_EXPANSION_FACTOR = 1.5      # ATR > 1.5× 20-period avg → volatile
     CANDLE_RANGE_RATIO = 0.65       # % of candles with body > 50% of range → trend
 
+    # Provisional classification thresholds (first 15 candles)
+    PROVISIONAL_MIN_CANDLES = 15    # Classify provisionally after 15 min (09:30)
+    PROVISIONAL_GAP_TREND = 0.40    # Gap > 0.4% suggests trend
+    PROVISIONAL_RANGE_WIDTH = 0.25  # First 15-min range < 0.25% = range day
+
+    def classify_provisional(
+        self,
+        df: pd.DataFrame,
+        snap: MarketSnapshot,
+        vix: Optional[float] = None,
+    ) -> DayType:
+        """Fast provisional classification using first 15 candles (09:15-09:30).
+
+        Uses opening gap, first candle character, initial range width, VIX.
+        Lower confidence than full classify() but enables earlier trading.
+        """
+        if df is None or df.empty or len(df) < 5:
+            return DayType.UNCLEAR
+
+        votes: dict[DayType, float] = {
+            DayType.TREND: 0.0,
+            DayType.RANGE: 0.0,
+            DayType.VOLATILE: 0.0,
+        }
+
+        # 1. Opening gap (strongest early signal)
+        gap_pct = self._gap_pct(snap)
+        if gap_pct > self.GAP_VOLATILE_PCT:
+            votes[DayType.VOLATILE] += 2.5
+        elif gap_pct > self.PROVISIONAL_GAP_TREND:
+            votes[DayType.TREND] += 2.0
+        elif gap_pct < 0.15:
+            votes[DayType.RANGE] += 1.5
+
+        # 2. First candle character (09:15 candle)
+        first = df.iloc[0]
+        first_body = abs(float(first["close"]) - float(first["open"]))
+        first_range = float(first["high"]) - float(first["low"])
+        if first_range > 0:
+            first_body_ratio = first_body / first_range
+            if first_body_ratio > 0.70:
+                votes[DayType.TREND] += 1.5  # Full body = directional momentum
+            elif first_body_ratio < 0.25:
+                votes[DayType.RANGE] += 1.0  # Doji = indecision
+
+        # 3. Range width of first N candles vs expected ATR
+        range_width = float(df["high"].max()) - float(df["low"].min())
+        price = float(df.iloc[-1]["close"])
+        range_pct = (range_width / price * 100) if price > 0 else 0
+        if range_pct > 0.50:
+            votes[DayType.VOLATILE] += 1.5
+        elif range_pct < self.PROVISIONAL_RANGE_WIDTH:
+            votes[DayType.RANGE] += 1.5
+        else:
+            votes[DayType.TREND] += 0.5
+
+        # 4. VIX at open
+        if vix is not None:
+            if vix > self.VIX_VOLATILE_THRESHOLD:
+                votes[DayType.VOLATILE] += 2.0
+            elif vix > 15:
+                votes[DayType.VOLATILE] += 0.5
+            else:
+                votes[DayType.RANGE] += 0.5
+
+        # Winner with reduced margin requirement (provisional = lower bar)
+        winner = max(votes, key=votes.get)  # type: ignore[arg-type]
+        winner_score = votes[winner]
+        runner_up = sorted(votes.values(), reverse=True)[1]
+
+        logger.info(
+            "DayClassifier PROVISIONAL: TREND=%.1f RANGE=%.1f VOLATILE=%.1f → %s (margin=%.1f)",
+            votes[DayType.TREND], votes[DayType.RANGE], votes[DayType.VOLATILE],
+            winner.value, winner_score - runner_up,
+        )
+
+        # Lower margin for provisional (0.5 vs 1.0 for full)
+        if winner_score - runner_up < 0.5:
+            return DayType.UNCLEAR
+
+        return winner
+
     def classify(
         self,
         df: pd.DataFrame,

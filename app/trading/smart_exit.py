@@ -54,10 +54,12 @@ class ExitConfig:
 
     stoploss_pct: float = 30.0          # Max loss %
     quick_target_pct: float = 25.0      # T1 %
-    breakeven_trigger_pct: float = 12.0 # Move SL to entry after this % profit
+    breakeven_trigger_pct: float = 8.0  # Move SL to entry after this % profit (was 12%)
     trail_factor: float = 0.50          # Trail SL at this fraction of profit
     max_hold_minutes: int = 45          # Time-based exit limit
     thesis_break_buffer: float = 0.0015 # 0.15% buffer for breakout fail
+    use_close_based_sl: bool = True     # Use candle-close SL instead of tick-based
+    catastrophic_atr_mult: float = 3.0  # Immediate SL if drop > this × ATR
 
 
 class SmartExitEngine:
@@ -74,6 +76,8 @@ class SmartExitEngine:
         snap: MarketSnapshot,
         day_type: DayType,
         spot_price: Optional[float] = None,
+        candle_closed: bool = False,
+        option_atr: float = 0.0,
     ) -> ExitResult:
         """Evaluate a single trade for exit conditions.
 
@@ -87,10 +91,12 @@ class SmartExitEngine:
         Returns:
             ExitResult with exit decision and updated SL if applicable.
         """
-        cfg = self._build_config(day_type)
+        cfg = self._build_config(day_type, trade)
 
         # 1. Hard stoploss — non-negotiable
-        result = self._check_hard_stoploss(trade, current_ltp)
+        #    Close-based SL: only trigger if candle_closed (1-min close below SL)
+        #    Exception: catastrophic drop (> 3× ATR) exits immediately
+        result = self._check_hard_stoploss(trade, current_ltp, cfg, candle_closed, option_atr)
         if result.should_exit:
             return result
 
@@ -128,7 +134,30 @@ class SmartExitEngine:
 
     # ── Exit checks ──────────────────────────────────────────────────────
 
-    def _check_hard_stoploss(self, trade: Trade, ltp: float) -> ExitResult:
+    def _check_hard_stoploss(self, trade: Trade, ltp: float, cfg: ExitConfig, candle_closed: bool = False, option_atr: float = 0.0) -> ExitResult:
+        # Catastrophic exit: immediate if drop > 3× ATR (regardless of candle close)
+        if option_atr > 0:
+            catastrophic_level = trade.entry_price - (cfg.catastrophic_atr_mult * option_atr)
+            if ltp <= catastrophic_level:
+                return ExitResult(
+                    should_exit=True,
+                    exit_type="stoploss",
+                    exit_price=ltp,
+                    reason=f"CATASTROPHIC SL: {ltp:.2f} <= {catastrophic_level:.2f} (>{cfg.catastrophic_atr_mult:.0f}×ATR below entry)",
+                )
+
+        # Close-based SL: only exit if the 1-min candle CLOSED below SL
+        if cfg.use_close_based_sl:
+            if candle_closed and ltp <= trade.stoploss:
+                return ExitResult(
+                    should_exit=True,
+                    exit_type="stoploss",
+                    exit_price=ltp,
+                    reason=f"Close-based SL hit at {ltp:.2f} (SL={trade.stoploss:.2f})",
+                )
+            return ExitResult()
+
+        # Legacy tick-based SL
         if ltp <= trade.stoploss:
             return ExitResult(
                 should_exit=True,
@@ -264,37 +293,53 @@ class SmartExitEngine:
 
     # ── Config builder ───────────────────────────────────────────────────
 
-    def _build_config(self, day_type: DayType) -> ExitConfig:
-        """Build exit config adjusted for day type.
+    def _build_config(self, day_type: DayType, trade: Optional[Trade] = None) -> ExitConfig:
+        """Build exit config adjusted for day type and strategy.
 
         - TREND days: wider trail (let winners run), longer hold time
         - RANGE days: tighter targets, faster exits
         - VOLATILE days: wider SL, quicker breakeven
+        - Strategy-specific trailing factors
         """
         base = ExitConfig(
             stoploss_pct=settings.v2_stoploss_pct,
             quick_target_pct=settings.v2_quick_target_pct,
-            breakeven_trigger_pct=settings.v2_breakeven_trigger_pct,
+            breakeven_trigger_pct=8.0,  # Earlier breakeven (was 12%)
             trail_factor=0.50,
             max_hold_minutes=settings.v2_max_hold_minutes,
         )
 
+        # Strategy-specific trailing factors
+        if trade and hasattr(trade, 'strategy'):
+            strategy_name = trade.strategy.value if hasattr(trade.strategy, 'value') else str(trade.strategy)
+            strategy_trails = {
+                "ORB": 0.65,                # Tight trail — ORB moves are sharp
+                "TREND_PULLBACK": 0.30,     # Wide trail — let trend run
+                "VWAP_RECLAIM": 0.45,       # Moderate
+                "MOMENTUM_BREAKOUT": 0.45,  # Moderate
+                "LIQUIDITY_SWEEP": 0.40,    # Wide — reversals need room
+                "ADAPTIVE": 0.40,           # Wide — structure-based
+            }
+            if strategy_name in strategy_trails:
+                base.trail_factor = strategy_trails[strategy_name]
+
         if day_type == DayType.TREND:
             # Let winners run on trend days
-            base.trail_factor = 0.40          # Wider trail → more room
+            base.trail_factor = min(base.trail_factor, 0.40)  # Don't override strategy if already wider
             base.max_hold_minutes = int(base.max_hold_minutes * 1.3)  # Hold longer
-            base.breakeven_trigger_pct *= 0.9  # Slightly earlier breakeven
+            base.breakeven_trigger_pct = 7.2  # Slightly earlier on trend days
 
         elif day_type == DayType.RANGE:
             # Quick in-and-out on range days
-            base.trail_factor = 0.60          # Tighter trail
+            base.trail_factor = max(base.trail_factor, 0.60)  # Tighter trail
             base.max_hold_minutes = int(base.max_hold_minutes * 0.7)  # Shorter hold
             base.quick_target_pct *= 0.8       # Lower T1 target
+            base.breakeven_trigger_pct = 5.6   # Even earlier on range days
 
         elif day_type == DayType.VOLATILE:
             # Wider stops but faster breakeven on volatile days
             base.stoploss_pct *= 1.2           # Wider SL
-            base.breakeven_trigger_pct *= 0.7  # Earlier breakeven
-            base.trail_factor = 0.45           # Moderate trail
+            base.breakeven_trigger_pct = 5.6   # Earlier breakeven
+            base.trail_factor = min(base.trail_factor, 0.45)  # Moderate trail
 
         return base

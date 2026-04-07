@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Clamp range for score modifiers from AI insights
 MAX_SCORE_MODIFIER = 15
-MIN_SCORE_MODIFIER = -15
+MIN_SCORE_MODIFIER = -5
 
 
 class InsightManager:
