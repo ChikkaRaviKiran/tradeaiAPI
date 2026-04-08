@@ -48,7 +48,7 @@ from app.data.global_markets import compute_global_bias, fetch_global_indices
 from app.data.validator import DataValidator
 from app.engine.ai_decision import AIDecisionEngine
 from app.engine.feature_engine import FeatureEngine
-from app.engine.feature_engine import compute_market_structure
+from app.engine.feature_engine import compute_market_structure, compute_key_levels, analyze_candle_character
 from app.engine.regime_detector import RegimeDetector
 from app.engine.signal_scorer import SignalScorer, MIN_SCORE, compute_adaptive_min_score, set_insight_manager, lock_session_threshold
 from app.strategies.base import BaseStrategy
@@ -1549,91 +1549,163 @@ class Orchestrator:
             best_signal.target1 = round(entry_price + (2.0 * option_atr), 2)
             best_signal.target2 = round(entry_price + (3.5 * option_atr), 2)
 
-            # 12. AI validation — OR logic:
-            #   - Score >= 65: HIGH conviction → skip AI entirely (saves API cost)
-            #   - Score 48-64: NORMAL flow → ask AI with adaptive threshold
-            #   - Score 40-47: AI OVERRIDE path → ask AI, need confidence >= 80
+            # 12. AI validation — always pass through AI, no bypass
+            #   - AI override path (score 40-47): need confidence >= 70
+            #   - Normal path: adaptive threshold based on score
             is_ai_override = best_signal.details.get("ai_override_path", False)
 
-            if best_score >= 85 and not is_ai_override:
-                # HIGH CONVICTION — skip AI gate, system score is strong enough
-                logger.info(
-                    "[%s][Cycle %d] Score %.0f >= 85 — HIGH CONVICTION, skipping AI gate",
-                    symbol, cycle, best_score,
-                )
-                self._log_event("ai", f"AI BYPASSED — score {best_score:.0f} >= 85 (high conviction)", cycle=cycle, instrument=symbol)
-                # Create a synthetic decision for downstream compatibility
-                from app.core.models import AIDecision
-                decision = AIDecision(
-                    trade_decision=True,
-                    confidence_score=best_score,  # Use system score as proxy
-                    entry_price=option_ltp,
-                    stoploss=best_signal.stoploss,
-                    target1=best_signal.target1,
-                    target2=best_signal.target2,
-                    reason=f"High conviction bypass (score={best_score:.0f}, >= 85)",
-                )
-                await self._save_signal_record(
-                    best_signal, best_score, "accepted",
-                    decision.confidence_score, decision.reason,
-                )
-            else:
-                # Ask AI for validation
-                decision = await self.ai_engine.evaluate(best_signal, snap, best_score, best_score_result)
-
-                # Adaptive AI confidence threshold:
-                # - AI override path (score < threshold): need high AI confidence (80)
-                # - Normal path: adaptive based on score
-                # - Early session (09:15-11:15): lower thresholds to avoid over-filtering
-                early_session = now.time() < dtime(11, 15)
-                if is_ai_override:
-                    ai_threshold = 70 if early_session else 80
-                elif best_score >= 55:
-                    ai_threshold = 55 if early_session else 60
+            # Build enriched context for AI
+            # Session state
+            all_today = self.paper_trader.all_today_trades
+            today_str = now.date().isoformat()
+            todays_closed = [
+                t for t in all_today
+                if t.date == today_str and t.status.value == "closed"
+            ]
+            today_pnl = sum(t.pnl or 0 for t in todays_closed)
+            consecutive_losses = 0
+            for t in reversed(todays_closed):
+                if (t.pnl or 0) < 0:
+                    consecutive_losses += 1
                 else:
-                    ai_threshold = 60 if early_session else 65
+                    break
+            last_trade_info = {}
+            if todays_closed:
+                lt = todays_closed[-1]
+                last_trade_info = {
+                    "result": "stoploss" if (lt.pnl or 0) < 0 else "profit",
+                    "strategy": lt.strategy.value if hasattr(lt.strategy, "value") else str(lt.strategy),
+                    "direction": lt.option_type.value if hasattr(lt.option_type, "value") else str(lt.option_type),
+                    "pnl": lt.pnl,
+                }
+                # Minutes since last trade
+                if lt.exit_time:
+                    try:
+                        exit_parts = lt.exit_time.split(":")
+                        exit_mins = int(exit_parts[0]) * 60 + int(exit_parts[1])
+                        now_mins = now.hour * 60 + now.minute
+                        last_trade_info["minutes_since"] = now_mins - exit_mins
+                    except (ValueError, IndexError):
+                        pass
 
-                if not decision.trade_decision or decision.confidence_score < ai_threshold:
-                    # Override: if AI gave confidence >= threshold but trade_decision=False,
-                    # trust the confidence score (AI sometimes contradicts itself)
-                    if decision.confidence_score >= ai_threshold and not decision.trade_decision:
-                        logger.info(
-                            "[%s] AI override: confidence %.0f%% >= %d but trade_decision=False — approving",
-                            symbol, decision.confidence_score, ai_threshold,
-                        )
-                        decision.trade_decision = True
-                        self._log_event("ai", f"AI OVERRIDE: confidence {decision.confidence_score:.0f}% >= {ai_threshold} — approving despite trade_decision=False", cycle=cycle, instrument=symbol)
-                    else:
-                        path_label = "AI-OVERRIDE" if is_ai_override else "NORMAL"
-                        logger.info(
-                            "[%s] AI rejected [%s path] (confidence=%.0f%%, threshold=%d): %s",
-                            symbol, path_label, decision.confidence_score, ai_threshold, decision.reason,
-                        )
-                        self._log_event("ai", f"AI REJECTED [{path_label}] ({decision.confidence_score:.0f}%/{ai_threshold}): {decision.reason}", cycle=cycle, instrument=symbol, data={
-                            "confidence": decision.confidence_score, "reason": decision.reason,
-                            "strategy": best_signal.strategy.value, "score": best_score,
-                        })
-                        await self.alert_manager.send_info(
-                            f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
-                            f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
-                            f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
-                            f"Reason: {decision.reason}",
-                        )
-                        await self._save_signal_record(
-                            best_signal, best_score, "rejected",
-                            decision.confidence_score, decision.reason,
-                        )
-                        return
+            session_context = {
+                "trades_today": len([t for t in all_today if t.date == today_str]),
+                "open_positions": len(self.paper_trader.open_trades),
+                "today_pnl": round(today_pnl, 2),
+                "consecutive_losses": consecutive_losses,
+            }
+            if last_trade_info:
+                session_context["last_trade"] = last_trade_info
 
-                self._log_event("ai", f"AI APPROVED ({decision.confidence_score:.0f}%): {best_signal.strategy.value} {best_signal.option_type.value}", cycle=cycle, instrument=symbol, data={
-                    "confidence": decision.confidence_score, "strategy": best_signal.strategy.value,
-                    "strike": best_signal.strike_price, "option_type": best_signal.option_type.value,
-                    "entry": decision.entry_price, "sl": decision.stoploss, "target1": decision.target1,
+            # Extra score components
+            extra_scores = {}
+            if self.insight_manager:
+                try:
+                    is_call = best_signal.option_type.value == "CE"
+                    extra_scores = {
+                        "fii_dii": self.insight_manager.get_fii_dii_score(is_call),
+                        "breadth": self.insight_manager.get_breadth_score(is_call),
+                        "news": self.insight_manager.get_news_sentiment_score(is_call),
+                    }
+                except Exception:
+                    pass
+            # Structure score
+            if structure:
+                from app.engine.signal_scorer import SignalScorer
+                try:
+                    extra_scores["structure"] = self.signal_scorer._score_structure(best_signal, structure)
+                except Exception:
+                    pass
+
+            # Candle character and key levels
+            candle_data = None
+            key_levels_list = []
+            try:
+                candle_data = analyze_candle_character(df_today)
+            except Exception:
+                pass
+            try:
+                daily_levels_for_ai = self._daily_levels.get(symbol)
+                key_levels_list = compute_key_levels(df_today, options_metrics, daily_levels=daily_levels_for_ai)
+            except Exception:
+                pass
+
+            # DataFrame-derived indicators (slopes, ROC)
+            df_indicators = {}
+            try:
+                last_row = df_today.iloc[-1]
+                for col in ("ema20_slope", "atr_slope", "roc_10"):
+                    val = last_row.get(col)
+                    if val is not None and not (isinstance(val, float) and val != val):
+                        df_indicators[col] = round(float(val), 4)
+            except Exception:
+                pass
+
+            # VIX from global indices
+            vix_val = None
+            for idx_data in self.global_indices:
+                if hasattr(idx_data, "symbol") and "VIX" in idx_data.symbol:
+                    vix_val = idx_data.last_price
+                    break
+
+            extra_context = {
+                "structure_data": structure,
+                "day_type": self.v2_day_type.value if hasattr(self, "v2_day_type") and self.v2_day_type else None,
+                "session_context": session_context,
+                "global_indices": self.global_indices,
+                "candle_data": candle_data,
+                "key_levels": key_levels_list,
+                "bid_ask_spread_pct": spread_pct,
+                "extra_scores": extra_scores,
+                "df_indicators": df_indicators,
+            }
+
+            # Ask AI for validation — every signal goes through AI
+            decision = await self.ai_engine.evaluate(
+                best_signal, snap, best_score, best_score_result,
+                extra_context=extra_context,
+            )
+
+            # Adaptive AI confidence threshold
+            early_session = now.time() < dtime(11, 15)
+            if is_ai_override:
+                ai_threshold = 65 if early_session else 70
+            elif best_score >= 55:
+                ai_threshold = 60 if early_session else 65
+            else:
+                ai_threshold = 65 if early_session else 70
+
+            if not decision.trade_decision or decision.confidence_score < ai_threshold:
+                path_label = "AI-OVERRIDE" if is_ai_override else "NORMAL"
+                logger.info(
+                    "[%s] AI rejected [%s path] (confidence=%.0f%%, threshold=%d): %s",
+                    symbol, path_label, decision.confidence_score, ai_threshold, decision.reason,
+                )
+                self._log_event("ai", f"AI REJECTED [{path_label}] ({decision.confidence_score:.0f}%/{ai_threshold}): {decision.reason}", cycle=cycle, instrument=symbol, data={
+                    "confidence": decision.confidence_score, "reason": decision.reason,
+                    "strategy": best_signal.strategy.value, "score": best_score,
                 })
+                await self.alert_manager.send_info(
+                    f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
+                    f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
+                    f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
+                    f"Reason: {decision.reason}",
+                )
                 await self._save_signal_record(
-                    best_signal, best_score, "accepted",
+                    best_signal, best_score, "rejected",
                     decision.confidence_score, decision.reason,
                 )
+                return
+
+            self._log_event("ai", f"AI APPROVED ({decision.confidence_score:.0f}%): {best_signal.strategy.value} {best_signal.option_type.value}", cycle=cycle, instrument=symbol, data={
+                "confidence": decision.confidence_score, "strategy": best_signal.strategy.value,
+                "strike": best_signal.strike_price, "option_type": best_signal.option_type.value,
+                "entry": decision.entry_price, "sl": decision.stoploss, "target1": decision.target1,
+            })
+            await self._save_signal_record(
+                best_signal, best_score, "accepted",
+                decision.confidence_score, decision.reason,
+            )
 
             # 13. Build NFO trading symbol
             nfo_symbol = instrument.build_option_symbol(

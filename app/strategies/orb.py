@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 ORB_START = dtime(9, 15)
 ORB_END = dtime(9, 30)
+ORB_EXPIRY = dtime(11, 30)  # No ORB signals after this — momentum exhausted
 
 
 class ORBStrategy(BaseStrategy):
@@ -66,6 +67,11 @@ class ORBStrategy(BaseStrategy):
         # Only evaluate candles after ORB window
         post_orb = df[df.index.time > ORB_END]
         if post_orb.empty:
+            return None
+
+        # Time cap: reject ORB signals after 11:30 — breakout momentum is exhausted
+        last_candle_time = post_orb.index[-1].time()
+        if last_candle_time > ORB_EXPIRY:
             return None
 
         last = post_orb.iloc[-1]

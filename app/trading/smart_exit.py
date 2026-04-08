@@ -58,7 +58,7 @@ class ExitConfig:
     trail_factor: float = 0.50          # Trail SL at this fraction of profit
     max_hold_minutes: int = 45          # Time-based exit limit
     thesis_break_buffer: float = 0.0015 # 0.15% buffer for breakout fail
-    use_close_based_sl: bool = True     # Use candle-close SL instead of tick-based
+    use_close_based_sl: bool = False     # Tick-based SL — exit immediately when breached
     catastrophic_atr_mult: float = 3.0  # Immediate SL if drop > this × ATR
 
 
