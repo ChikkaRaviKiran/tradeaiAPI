@@ -52,11 +52,11 @@ class ExitResult:
 class ExitConfig:
     """Per-trade exit parameters — populated at entry time."""
 
-    stoploss_pct: float = 30.0          # Max loss %
+    stoploss_pct: float = 20.0          # Max loss %
     quick_target_pct: float = 25.0      # T1 %
-    breakeven_trigger_pct: float = 8.0  # Move SL to entry after this % profit (was 12%)
+    breakeven_trigger_pct: float = 8.0  # Move SL to entry after this % profit
     trail_factor: float = 0.50          # Trail SL at this fraction of profit
-    max_hold_minutes: int = 45          # Time-based exit limit
+    max_hold_minutes: int = 180         # Time-based exit limit
     thesis_break_buffer: float = 0.0015 # 0.15% buffer for breakout fail
     use_close_based_sl: bool = False     # Tick-based SL — exit immediately when breached
     catastrophic_atr_mult: float = 3.0  # Immediate SL if drop > this × ATR

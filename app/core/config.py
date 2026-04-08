@@ -65,18 +65,18 @@ class Settings(BaseSettings):
 
     # Dual-Engine Control
     v1_enabled: bool = Field(default=True, alias="V1_ENABLED")
-    v2_enabled: bool = Field(default=True, alias="V2_ENABLED")
+    v2_enabled: bool = Field(default=False, alias="V2_ENABLED")
     v2_live_orders: bool = Field(default=False, alias="V2_LIVE_ORDERS")  # V2 always paper until proven
 
     # V2 Trading Parameters
-    v2_max_trades_per_day: int = Field(default=3, alias="V2_MAX_TRADES_PER_DAY")
-    v2_max_concurrent_positions: int = Field(default=2, alias="V2_MAX_CONCURRENT_POSITIONS")
+    v2_max_trades_per_day: int = Field(default=1, alias="V2_MAX_TRADES_PER_DAY")
+    v2_max_concurrent_positions: int = Field(default=1, alias="V2_MAX_CONCURRENT_POSITIONS")
     v2_risk_per_trade_pct: float = Field(default=1.5, alias="V2_RISK_PER_TRADE_PCT")
     v2_consecutive_loss_limit: int = Field(default=2, alias="V2_CONSECUTIVE_LOSS_LIMIT")
-    v2_max_hold_minutes: int = Field(default=45, alias="V2_MAX_HOLD_MINUTES")
+    v2_max_hold_minutes: int = Field(default=180, alias="V2_MAX_HOLD_MINUTES")
     v2_quick_target_pct: float = Field(default=25.0, alias="V2_QUICK_TARGET_PCT")
-    v2_stoploss_pct: float = Field(default=30.0, alias="V2_STOPLOSS_PCT")
-    v2_breakeven_trigger_pct: float = Field(default=12.0, alias="V2_BREAKEVEN_TRIGGER_PCT")
+    v2_stoploss_pct: float = Field(default=20.0, alias="V2_STOPLOSS_PCT")
+    v2_breakeven_trigger_pct: float = Field(default=8.0, alias="V2_BREAKEVEN_TRIGGER_PCT")
     v2_skip_unclear_days: bool = Field(default=True, alias="V2_SKIP_UNCLEAR_DAYS")
     v2_openai_model: str = Field(default="gpt-4o-mini", alias="V2_OPENAI_MODEL")
 

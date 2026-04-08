@@ -173,17 +173,12 @@ class Orchestrator:
         set_ai_insight_manager(self.insight_manager)
 
         # Strategies (applied to every instrument) — V1 Engine
-        # AdaptiveStrategy is primary (context-aware), mechanical strategies are secondary
+        # Only proven profitable strategies from 30-day backtest (Apr 2026):
+        #   TREND_PULLBACK: 80% WR, ₹+3,135  |  MOMENTUM_BREAKOUT: 67% WR, ₹+3,870
+        # Removed: ORB (₹-7,270), VWAP_RECLAIM (₹-2,506), others never triggered
         self.strategies: list[BaseStrategy] = [
-            AdaptiveStrategy(),
-            ORBStrategy(),
-            VWAPReclaimStrategy(),
             TrendPullbackStrategy(),
-            LiquiditySweepStrategy(),
-            RangeBreakoutStrategy(),
             MomentumBreakoutStrategy(),
-            EMABreakoutStrategy(),
-            Breakout20DStrategy(),
         ]
 
         # ── V2 Engine components ─────────────────────────────────────────
@@ -238,6 +233,10 @@ class Orchestrator:
         self._market_structures: dict[str, dict] = {}
         # Re-entry cooldown: {(instrument, direction): datetime of last SL exit}
         self._sl_cooldowns: dict[tuple[str, str], datetime] = {}
+        # Duplicate strike guard: set of (symbol, strike, option_type) traded today
+        self._traded_strikes_today: set[tuple[str, float, str]] = {}
+        # Daily SL circuit breaker: if first trade hit full stoploss, stop for the day
+        self._daily_sl_hit: dict[str, bool] = {}  # {symbol: True if SL hit today}
         # Per-instrument 20-day Donchian levels from daily candles
         # {symbol: {"high_20d": float, "low_20d": float}}
         self._daily_levels: dict[str, dict] = {}
@@ -332,6 +331,8 @@ class Orchestrator:
         self._htf_biases = {}
         self._market_structures = {}
         self._sl_cooldowns = {}
+        self._traded_strikes_today = set()
+        self._daily_sl_hit = {}
         self.snapshot = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
@@ -1246,6 +1247,12 @@ class Orchestrator:
                 self._log_event("gate", "Risk limits reached — skipping", cycle=cycle, instrument=symbol)
                 return
 
+            # 8c. Daily SL circuit breaker — if any trade today hit full stoploss, stop trading
+            if self._daily_sl_hit.get(symbol, False):
+                logger.info("[%s][Cycle %d] Daily SL circuit breaker active — no more trades", symbol, cycle)
+                self._log_event("gate", "SL circuit breaker — no more trades today", cycle=cycle, instrument=symbol)
+                return
+
             # 9. Run strategies — filtered by market regime
             #    Compute market structure only when new candle appears (cache by candle count)
             candle_count = len(df_today)
@@ -1488,6 +1495,20 @@ class Orchestrator:
                 )
                 return
 
+            # 10c. Duplicate strike guard — never trade same strike+type twice in a day
+            strike_key = (symbol, best_signal.strike_price, best_signal.option_type.value)
+            if strike_key in self._traded_strikes_today:
+                logger.info(
+                    "[%s][Cycle %d] Strike %d %s already traded today — skipping",
+                    symbol, cycle, int(best_signal.strike_price), best_signal.option_type.value,
+                )
+                self._log_event(
+                    "gate",
+                    f"Duplicate strike: {int(best_signal.strike_price)} {best_signal.option_type.value} already traded",
+                    cycle=cycle, instrument=symbol,
+                )
+                return
+
             # 11. Fetch option premium (with bid-ask spread)
             option_quote = await self._fetch_option_quote_for(instrument, best_signal, expiry)
             if option_quote is None or option_quote["ltp"] <= 0:
@@ -1726,6 +1747,11 @@ class Orchestrator:
 
             # Store breakout level for failed breakout detection
             trade.breakout_level = _extract_breakout_level(best_signal)
+
+            # Register strike to prevent duplicate trades on same option
+            self._traded_strikes_today.add(
+                (symbol, best_signal.strike_price, best_signal.option_type.value)
+            )
 
             # 15b. Place real order if live trading
             if not settings.paper_trading:
@@ -2367,8 +2393,10 @@ class Orchestrator:
                 if result.exit_type in ("stoploss", "hard_stoploss"):
                     cooldown_key = (instrument_symbol, trade.option_type.value if trade.option_type else "")
                     self._sl_cooldowns[cooldown_key] = datetime.now() + timedelta(minutes=15)
+                    # Daily SL circuit breaker — stop trading this instrument today
+                    self._daily_sl_hit[instrument_symbol] = True
                     logger.info(
-                        "[%s] SL cooldown set for %s direction until %s",
+                        "[%s] SL cooldown set for %s direction until %s | Daily SL circuit breaker ACTIVE",
                         instrument_symbol, cooldown_key[1],
                         self._sl_cooldowns[cooldown_key].strftime("%H:%M"),
                     )
@@ -2673,6 +2701,8 @@ class Orchestrator:
                 if result.exit_type in ("stoploss", "hard_stoploss"):
                     cooldown_key = (instrument.symbol, trade.option_type.value if hasattr(trade, 'option_type') and trade.option_type else "")
                     self._sl_cooldowns[cooldown_key] = datetime.now() + timedelta(minutes=15)
+                    # Daily SL circuit breaker
+                    self._daily_sl_hit[instrument.symbol] = True
 
     async def _close_all_trades(self) -> None:
         """Close all open trades at 15:20 (both V1 and V2)."""
