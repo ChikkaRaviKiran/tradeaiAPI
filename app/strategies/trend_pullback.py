@@ -98,19 +98,25 @@ class TrendPullbackStrategy(BaseStrategy):
         # EMA200 availability check
         has_ema200 = ema200 is not None and not (isinstance(ema200, float) and ema200 != ema200)
 
+        # Micro-trigger: widen pullback tolerance, lower volume requirement
+        micro = (structure_data or {}).get("micro_trigger", {})
+        micro_active = micro.get("active", False)
+        pullback_tol = 0.55 if micro_active else self.PULLBACK_TOLERANCE_PCT
+        vol_mult = 1.0 if micro_active else 1.2
+
         logger.debug(
-            "TrendPullback check: close=%.2f EMA20=%.1f EMA50=%.1f EMA200=%s RSI=%.1f pullback=%.2f%%",
-            close, ema20, ema50, f"{ema200:.1f}" if has_ema200 else "N/A", rsi, pullback_distance_pct,
+            "TrendPullback check: close=%.2f EMA20=%.1f EMA50=%.1f EMA200=%s RSI=%.1f pullback=%.2f%% micro=%s",
+            close, ema20, ema50, f"{ema200:.1f}" if has_ema200 else "N/A", rsi, pullback_distance_pct, micro_active,
         )
 
         # CALL: uptrend pullback
         if (
             ema20 > ema50
             and close > vwap
-            and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
+            and pullback_distance_pct <= pullback_tol
             and 38 <= rsi <= 60
             and close > open_  # bullish candle
-            and (is_index or volume > 1.2 * avg_vol)
+            and (is_index or volume > vol_mult * avg_vol)
             and (not has_ema200 or close > ema200)  # above EMA200 if available
         ):
             return StrategySignal(
@@ -123,16 +129,17 @@ class TrendPullbackStrategy(BaseStrategy):
                     "ema50": ema50,
                     "ema200": ema200 if has_ema200 else None,
                     "pullback_pct": round(pullback_distance_pct, 2),
+                    "micro_trigger": micro_active,
                 },
             )
 
         # PUT: downtrend pullback
         if (
             ema20 < ema50
-            and pullback_distance_pct <= self.PULLBACK_TOLERANCE_PCT
+            and pullback_distance_pct <= pullback_tol
             and 40 <= rsi <= 62
             and close < open_  # bearish candle
-            and (is_index or volume > 1.2 * avg_vol)
+            and (is_index or volume > vol_mult * avg_vol)
             and (not has_ema200 or close < ema200)  # below EMA200 if available
         ):
             return StrategySignal(
@@ -145,6 +152,7 @@ class TrendPullbackStrategy(BaseStrategy):
                     "ema50": ema50,
                     "ema200": ema200 if has_ema200 else None,
                     "pullback_pct": round(pullback_distance_pct, 2),
+                    "micro_trigger": micro_active,
                 },
             )
 

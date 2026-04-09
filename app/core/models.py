@@ -144,12 +144,12 @@ class StrategySignal(BaseModel):
 
 
 class SignalScore(BaseModel):
-    strategy_trigger: float = 0.0
-    volume_confirmation: float = 0.0
-    vwap_alignment: float = 0.0
-    options_oi_signal: float = 0.0
-    global_bias_score: float = 0.0
-    historical_pattern: float = 0.0
+    """LOCKED v1.0: 5-factor scoring model (max 100)."""
+    strategy_strength: float = 0.0      # 30 pts max
+    market_alignment: float = 0.0       # 25 pts max
+    volume_confirmation: float = 0.0    # 20 pts max
+    options_oi_signal: float = 0.0      # 15 pts max
+    volatility_context: float = 0.0     # 10 pts max
     total: float = 0.0
 
 

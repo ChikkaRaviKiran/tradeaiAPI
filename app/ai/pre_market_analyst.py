@@ -53,6 +53,7 @@ You receive comprehensive market data including:
 - Recent news from financial channels
 - Rolling 30-day trade performance history
 - Global market indices
+- Strategy performance under different market conditions
 
 Your job is to produce a structured trading plan for the day. Respond ONLY with valid JSON:
 {
@@ -63,6 +64,9 @@ Your job is to produce a structured trading plan for the day. Respond ONLY with 
     "trading_plan": "Detailed trading plan for the day (3-5 bullet points)",
     "sectors_to_watch": ["SECTOR1", "SECTOR2"],
     "avoid_sectors": ["SECTOR1"],
+    "recommended_strategies": ["TREND_PULLBACK", "MOMENTUM_BREAKOUT"],
+    "avoid_strategies": ["ORB"],
+    "strategy_reasoning": "Why these strategies are recommended for today's conditions",
     "score_modifier": -5 to +15,
     "risk_advice": "conservative" | "normal" | "aggressive",
     "key_levels": {
@@ -72,7 +76,24 @@ Your job is to produce a structured trading plan for the day. Respond ONLY with 
     "lessons_applied": ["lesson from past trades being applied today"]
 }
 
+Available strategies:
+- ORB: Opening Range Breakout — works in trending/volatile days with clear directional opening
+- VWAP_RECLAIM: VWAP reclaim after morning sell-off — range/trend days
+- TREND_PULLBACK: Pullback entry in trending markets — best on trend days
+- LIQUIDITY_SWEEP: Liquidity sweep reversal — range/volatile days
+- RANGE_BREAKOUT: Range breakout after consolidation — range/trending days
+- MOMENTUM_BREAKOUT: Strong momentum continuation — trending/volatile days
+- EMA_BREAKOUT: EMA crossover breakout — trending days
+- BREAKOUT_20D: 20-day high breakout — strong trending days
+- VWAP_PULLBACK: VWAP pullback on trend days — needs clear trend
+- GEX_BOUNCE: GEX level bounce — range days with clear support/resistance
+- RSI_EXTREME: RSI extreme reversal — volatile days with oversold/overbought
+- ADAPTIVE: Context-aware adaptive entry — works in multiple conditions
+
 Rules:
+- recommended_strategies: pick 2-5 strategies that fit today's expected conditions
+- avoid_strategies: strategies that historically perform poorly in these conditions
+- strategy_reasoning: explain WHY these strategies are recommended based on data
 - score_modifier adjusts the signal scoring threshold: positive = more selective, negative = more aggressive
 - Base your analysis on DATA, not assumptions
 - If FII heavily selling (>1000cr), lean bearish unless strong DII buying offsets

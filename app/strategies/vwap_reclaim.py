@@ -70,15 +70,24 @@ class VWAPReclaimStrategy(BaseStrategy):
         # For index data (volume=0), skip volume filter
         is_index = volume == 0 and avg_vol == 0
 
+        # Micro-trigger: lower volume threshold, accept high/low touching VWAP
+        micro = (structure_data or {}).get("micro_trigger", {})
+        micro_active = micro.get("active", False)
+        vol_threshold = 1.1 if micro_active else 1.3
+
         # Look back at last MIN_BELOW_CANDLES candles
         recent = window.iloc[-(MIN_BELOW_CANDLES + 1) :]
 
-        # CALL: price was below VWAP for ≥10 candles, now closes above
+        # CALL: price was below VWAP for ≥5 candles, now crosses above
         below_vwap = recent.iloc[:-1]["close"] < recent.iloc[:-1]["vwap"]
+        # Micro-trigger: accept high > VWAP (intra-candle reclaim), not just close > VWAP
+        call_vwap_check = close > vwap
+        if micro_active and not call_vwap_check:
+            call_vwap_check = last["high"] > vwap
         if (
             below_vwap.sum() >= MIN_BELOW_CANDLES
-            and close > vwap
-            and (is_index or volume > 1.3 * avg_vol)
+            and call_vwap_check
+            and (is_index or volume > vol_threshold * avg_vol)
             and rsi > 50
             and _ema_cross_up(window, "ema9", "ema20")
         ):
@@ -86,15 +95,18 @@ class VWAPReclaimStrategy(BaseStrategy):
                 strategy=StrategyName.VWAP_RECLAIM,
                 option_type=OptionType.CALL,
                 strike_price=_nearest_strike(spot_price),
-                details={"rsi": rsi, "vwap": vwap, "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0},
+                details={"rsi": rsi, "vwap": vwap, "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0, "micro_trigger": micro_active},
             )
 
-        # PUT: price was above VWAP for ≥10 candles, now closes below
+        # PUT: price was above VWAP for ≥5 candles, now closes below
         above_vwap = recent.iloc[:-1]["close"] > recent.iloc[:-1]["vwap"]
+        put_vwap_check = close < vwap
+        if micro_active and not put_vwap_check:
+            put_vwap_check = last["low"] < vwap
         if (
             above_vwap.sum() >= MIN_BELOW_CANDLES
-            and close < vwap
-            and (is_index or volume > 1.3 * avg_vol)
+            and put_vwap_check
+            and (is_index or volume > vol_threshold * avg_vol)
             and rsi < 50
             and _ema_cross_down(window, "ema9", "ema20")
         ):
@@ -102,7 +114,7 @@ class VWAPReclaimStrategy(BaseStrategy):
                 strategy=StrategyName.VWAP_RECLAIM,
                 option_type=OptionType.PUT,
                 strike_price=_nearest_strike(spot_price),
-                details={"rsi": rsi, "vwap": vwap, "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0},
+                details={"rsi": rsi, "vwap": vwap, "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0, "micro_trigger": micro_active},
             )
 
         return None

@@ -202,26 +202,18 @@ class AIDecisionEngine:
         now = datetime.now(_IST)
         ctx = extra_context or {}
 
-        # Score breakdown — all components including hidden ones
+        # LOCKED v1.0: Score breakdown — 5 factors
         score_detail = {}
         if score_breakdown:
             score_detail = {
-                "strategy_trigger": round(score_breakdown.strategy_trigger, 1),
+                "strategy_strength": round(score_breakdown.strategy_strength, 1),
+                "market_alignment": round(score_breakdown.market_alignment, 1),
                 "volume_confirmation": round(score_breakdown.volume_confirmation, 1),
-                "vwap_alignment": round(score_breakdown.vwap_alignment, 1),
                 "options_oi_signal": round(score_breakdown.options_oi_signal, 1),
-                "global_bias_score": round(score_breakdown.global_bias_score, 1),
-                "historical_pattern": round(score_breakdown.historical_pattern, 1),
+                "volatility_context": round(score_breakdown.volatility_context, 1),
             }
-        # Add extra score components that the scorer computes but SignalScore model doesn't store
-        extra_scores = ctx.get("extra_scores", {})
-        if extra_scores:
-            score_detail.update({
-                "fii_dii_score": round(extra_scores.get("fii_dii", 0), 1),
-                "breadth_score": round(extra_scores.get("breadth", 0), 1),
-                "news_sentiment_score": round(extra_scores.get("news", 0), 1),
-                "structure_alignment_score": round(extra_scores.get("structure", 0), 1),
-            })
+        # Extra scores removed in LOCKED v1.0
+        extra_scores = {}
 
         # Compute today's open gap context
         open_gap_pct = None

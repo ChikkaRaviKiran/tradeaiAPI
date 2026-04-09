@@ -56,7 +56,7 @@ class ExitConfig:
     quick_target_pct: float = 25.0      # T1 %
     breakeven_trigger_pct: float = 8.0  # Move SL to entry after this % profit
     trail_factor: float = 0.50          # Trail SL at this fraction of profit
-    max_hold_minutes: int = 180         # Time-based exit limit
+    max_hold_minutes: int = 120         # LOCKED v1.0: Time-based exit limit
     thesis_break_buffer: float = 0.0015 # 0.15% buffer for breakout fail
     use_close_based_sl: bool = False     # Tick-based SL — exit immediately when breached
     catastrophic_atr_mult: float = 3.0  # Immediate SL if drop > this × ATR
@@ -312,13 +312,13 @@ class SmartExitEngine:
         # Strategy-specific trailing factors
         if trade and hasattr(trade, 'strategy'):
             strategy_name = trade.strategy.value if hasattr(trade.strategy, 'value') else str(trade.strategy)
+            # LOCKED v1.0: Strategy-specific trailing factors
             strategy_trails = {
                 "ORB": 0.65,                # Tight trail — ORB moves are sharp
                 "TREND_PULLBACK": 0.30,     # Wide trail — let trend run
                 "VWAP_RECLAIM": 0.45,       # Moderate
-                "MOMENTUM_BREAKOUT": 0.45,  # Moderate
+                "RANGE_BREAKOUT": 0.50,     # Moderate-tight
                 "LIQUIDITY_SWEEP": 0.40,    # Wide — reversals need room
-                "ADAPTIVE": 0.40,           # Wide — structure-based
             }
             if strategy_name in strategy_trails:
                 base.trail_factor = strategy_trails[strategy_name]

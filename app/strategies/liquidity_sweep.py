@@ -60,6 +60,13 @@ class LiquiditySweepStrategy(BaseStrategy):
         # For index data (volume=0), skip volume filter
         is_index = volume == 0 and avg_vol == 0
 
+        # Micro-trigger: lower volume threshold, slightly relax wick requirement
+        micro = (structure_data or {}).get("micro_trigger", {})
+        micro_active = micro.get("active", False)
+        vol_mult = 1.2 if micro_active else 1.4
+        call_wick_min = 35 if micro_active else 40
+        put_wick_min = 45 if micro_active else 50
+
         # Compute swing high/low from lookback window (excluding last 2 candles)
         lookback = df.iloc[-(SWING_LOOKBACK + 2) : -2]
         swing_low = lookback["low"].min()
@@ -68,7 +75,6 @@ class LiquiditySweepStrategy(BaseStrategy):
         candle_range = high - low
 
         # CALL: sweep of swing low + bullish reversal
-        # ICT/Smart Money: bullish sweep must show prominent lower wick
         sweep_threshold_low = swing_low * (1 - 0.0003)  # 0.03%
         lower_wick = min(close, open_) - low
         lower_wick_pct = (lower_wick / candle_range * 100) if candle_range > 0 else 0
@@ -76,8 +82,8 @@ class LiquiditySweepStrategy(BaseStrategy):
             low <= sweep_threshold_low
             and close > open_  # bullish close
             and close > swing_low  # reclaim above swing low
-            and lower_wick_pct >= 40  # sweep candle must show wick rejection
-            and (is_index or volume >= 1.4 * avg_vol)
+            and lower_wick_pct >= call_wick_min
+            and (is_index or volume >= vol_mult * avg_vol)
         ):
             return StrategySignal(
                 strategy=StrategyName.LIQUIDITY_SWEEP,
@@ -87,6 +93,7 @@ class LiquiditySweepStrategy(BaseStrategy):
                     "swing_low": swing_low,
                     "sweep_depth_pct": round((swing_low - low) / swing_low * 100, 3),
                     "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0,
+                    "micro_trigger": micro_active,
                 },
             )
 
@@ -99,8 +106,8 @@ class LiquiditySweepStrategy(BaseStrategy):
             high >= sweep_threshold_high
             and close < open_  # bearish close
             and close < swing_high  # rejected back below
-            and upper_wick_pct >= 50
-            and (is_index or volume >= 1.4 * avg_vol)
+            and upper_wick_pct >= put_wick_min
+            and (is_index or volume >= vol_mult * avg_vol)
         ):
             return StrategySignal(
                 strategy=StrategyName.LIQUIDITY_SWEEP,
@@ -110,6 +117,7 @@ class LiquiditySweepStrategy(BaseStrategy):
                     "swing_high": swing_high,
                     "upper_wick_pct": round(upper_wick_pct, 1),
                     "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0,
+                    "micro_trigger": micro_active,
                 },
             )
 

@@ -278,6 +278,50 @@ class OptionCandle(Base):
     created_at = Column(DateTime, default=_now_ist)
 
 
+class IndexCandle(Base):
+    """1-minute OHLCV candle for NIFTY/SENSEX — cached for backtesting & evaluation."""
+
+    __tablename__ = "index_candles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    instrument = Column(String(20), nullable=False, index=True)   # NIFTY, SENSEX
+    date = Column(String(10), nullable=False, index=True)         # YYYY-MM-DD
+    timestamp = Column(DateTime, nullable=False)
+    open = Column(Float, nullable=False)
+    high = Column(Float, nullable=False)
+    low = Column(Float, nullable=False)
+    close = Column(Float, nullable=False)
+    volume = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=_now_ist)
+
+
+class StrategyConditionPerformance(Base):
+    """Per-strategy per-condition performance stats — updated daily by evaluator."""
+
+    __tablename__ = "strategy_condition_performance"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    eval_date = Column(String(10), nullable=False, index=True)    # When this was computed
+    instrument = Column(String(20), nullable=False, index=True)
+    strategy = Column(String(30), nullable=False, index=True)
+    condition_key = Column(String(60), nullable=False, index=True) # e.g. "gap_small_vix_low_range"
+    day_type = Column(String(15), nullable=True)                   # trend/range/volatile
+    gap_bucket = Column(String(15), nullable=True)                 # small/medium/large
+    vix_bucket = Column(String(15), nullable=True)                 # low/medium/high
+    total_trades = Column(Integer, default=0)
+    win_rate = Column(Float, default=0.0)
+    avg_pnl = Column(Float, default=0.0)
+    profit_factor = Column(Float, default=0.0)
+    avg_rr = Column(Float, default=0.0)                            # avg risk-reward ratio
+    max_drawdown = Column(Float, default=0.0)
+    sharpe_ratio = Column(Float, default=0.0)
+    best_entry_window = Column(String(20), nullable=True)          # e.g. "09:30-10:30"
+    composite_score = Column(Float, default=0.0)
+    probability = Column(Float, default=0.0)                       # 0-100: win probability for this condition
+    lookback_days = Column(Integer, default=0)                     # How many days of data used
+    created_at = Column(DateTime, default=_now_ist)
+
+
 # Async engine
 async_engine = create_async_engine(settings.database_url, echo=False)
 AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
@@ -327,6 +371,12 @@ async def init_db() -> None:
             # Option candle cache indexes
             "CREATE INDEX IF NOT EXISTS ix_option_candles_lookup ON option_candles (instrument, date, strike, option_type)",
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_option_candles_unique ON option_candles (trading_symbol, timestamp)",
+            # Index candle cache indexes
+            "CREATE INDEX IF NOT EXISTS ix_index_candles_lookup ON index_candles (instrument, date)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_index_candles_unique ON index_candles (instrument, timestamp)",
+            # Strategy condition performance indexes
+            "CREATE INDEX IF NOT EXISTS ix_scp_lookup ON strategy_condition_performance (instrument, strategy, condition_key)",
+            "CREATE INDEX IF NOT EXISTS ix_scp_eval_date ON strategy_condition_performance (eval_date)",
         ]
         for sql in migrations:
             try:

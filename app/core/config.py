@@ -37,10 +37,10 @@ class Settings(BaseSettings):
 
     # Trading
     initial_capital: float = Field(default=100000, alias="INITIAL_CAPITAL")
-    max_trades_per_day: int = Field(default=5, alias="MAX_TRADES_PER_DAY")
+    max_trades_per_day: int = Field(default=3, alias="MAX_TRADES_PER_DAY")  # LOCKED v1.0
     max_daily_loss_pct: float = Field(default=3.0, alias="MAX_DAILY_LOSS_PCT")
     risk_per_trade_pct: float = Field(default=1.0, alias="RISK_PER_TRADE_PCT")
-    max_concurrent_positions: int = Field(default=3, alias="MAX_CONCURRENT_POSITIONS")
+    max_concurrent_positions: int = Field(default=1, alias="MAX_CONCURRENT_POSITIONS")  # LOCKED v1.0 — 1 at a time on same underlying
     consecutive_loss_limit: int = Field(default=3, alias="CONSECUTIVE_LOSS_LIMIT")
     nifty_lot_size: int = Field(default=65, alias="NIFTY_LOT_SIZE")
 
@@ -73,9 +73,9 @@ class Settings(BaseSettings):
     v2_max_concurrent_positions: int = Field(default=1, alias="V2_MAX_CONCURRENT_POSITIONS")
     v2_risk_per_trade_pct: float = Field(default=1.5, alias="V2_RISK_PER_TRADE_PCT")
     v2_consecutive_loss_limit: int = Field(default=2, alias="V2_CONSECUTIVE_LOSS_LIMIT")
-    v2_max_hold_minutes: int = Field(default=180, alias="V2_MAX_HOLD_MINUTES")
+    v2_max_hold_minutes: int = Field(default=120, alias="V2_MAX_HOLD_MINUTES")  # LOCKED v1.0
     v2_quick_target_pct: float = Field(default=25.0, alias="V2_QUICK_TARGET_PCT")
-    v2_stoploss_pct: float = Field(default=20.0, alias="V2_STOPLOSS_PCT")
+    v2_stoploss_pct: float = Field(default=15.0, alias="V2_STOPLOSS_PCT")  # Tightened from 20% to 15%
     v2_breakeven_trigger_pct: float = Field(default=8.0, alias="V2_BREAKEVEN_TRIGGER_PCT")
     v2_skip_unclear_days: bool = Field(default=True, alias="V2_SKIP_UNCLEAR_DAYS")
     v2_openai_model: str = Field(default="gpt-4o-mini", alias="V2_OPENAI_MODEL")

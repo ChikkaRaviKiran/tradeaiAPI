@@ -117,22 +117,35 @@ class ORBStrategy(BaseStrategy):
 
         breakout_buffer = 0.0005  # 0.05%
 
+        # Micro-trigger: use high/low for breakout check (don't require close past level)
+        micro = (structure_data or {}).get("micro_trigger", {})
+        micro_active = micro.get("active", False)
+
         # Log strategy evaluation details at DEBUG level
         logger.debug(
-            "ORB check: close=%.2f ORH=%.2f ORL=%.2f RSI=%.1f EMA9=%.1f EMA20=%.1f VWAP=%.2f",
-            close, orh, orl, rsi, ema9, ema20, vwap,
+            "ORB check: close=%.2f ORH=%.2f ORL=%.2f RSI=%.1f EMA9=%.1f EMA20=%.1f VWAP=%.2f micro=%s",
+            close, orh, orl, rsi, ema9, ema20, vwap, micro_active,
         )
+
+        # When micro-trigger fires, accept high > ORH (not just close > ORH)
+        # and lower volume threshold to 1.3x (from 1.5x)
+        call_price_check = close > orh * (1 + breakout_buffer)
+        call_vol_check = is_index or volume > 1.5 * avg_vol
+        if micro_active and not call_price_check:
+            call_price_check = high > orh * (1 + breakout_buffer)
+        if micro_active and not call_vol_check:
+            call_vol_check = is_index or volume > 1.3 * avg_vol
 
         # CALL breakout
         if (
-            close > orh * (1 + breakout_buffer)
-            and (is_index or volume > 1.5 * avg_vol)
+            call_price_check
+            and call_vol_check
             and close > vwap
             and ema9 > ema20
             and rsi >= 55  # Wilder: above centerline with directional bias
         ):
-            # Check next candle doesn't close inside range (if available)
-            if len(post_orb) >= 2:
+            # Next-candle confirmation: skip if micro-trigger is active
+            if not micro_active and len(post_orb) >= 2:
                 next_candle = post_orb.iloc[-1]
                 prev_candle = post_orb.iloc[-2]
                 if prev_candle["close"] > orh * (1 + breakout_buffer) and next_candle["close"] < orh:
@@ -147,18 +160,26 @@ class ORBStrategy(BaseStrategy):
                     "orl": orl,
                     "rsi": rsi,
                     "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0,
+                    "micro_trigger": micro_active,
                 },
             )
 
-        # PUT breakout
+        # PUT breakout — same micro-trigger relaxation
+        put_price_check = close < orl * (1 - breakout_buffer)
+        put_vol_check = is_index or volume > 1.5 * avg_vol
+        if micro_active and not put_price_check:
+            put_price_check = low < orl * (1 - breakout_buffer)
+        if micro_active and not put_vol_check:
+            put_vol_check = is_index or volume > 1.3 * avg_vol
+
         if (
-            close < orl * (1 - breakout_buffer)
-            and (is_index or volume > 1.5 * avg_vol)
+            put_price_check
+            and put_vol_check
             and close < vwap
             and ema9 < ema20
             and rsi <= 45  # Wilder: below centerline with directional bias
         ):
-            if len(post_orb) >= 2:
+            if not micro_active and len(post_orb) >= 2:
                 next_candle = post_orb.iloc[-1]
                 prev_candle = post_orb.iloc[-2]
                 if prev_candle["close"] < orl * (1 - breakout_buffer) and next_candle["close"] > orl:
@@ -173,6 +194,7 @@ class ORBStrategy(BaseStrategy):
                     "orl": orl,
                     "rsi": rsi,
                     "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0,
+                    "micro_trigger": micro_active,
                 },
             )
 

@@ -50,20 +50,13 @@ from app.engine.ai_decision import AIDecisionEngine
 from app.engine.feature_engine import FeatureEngine
 from app.engine.feature_engine import compute_market_structure, compute_key_levels, analyze_candle_character
 from app.engine.regime_detector import RegimeDetector
-from app.engine.signal_scorer import SignalScorer, MIN_SCORE, compute_adaptive_min_score, set_insight_manager, lock_session_threshold
+from app.engine.signal_scorer import SignalScorer
 from app.strategies.base import BaseStrategy
-from app.strategies.adaptive import AdaptiveStrategy
 from app.strategies.liquidity_sweep import LiquiditySweepStrategy
-from app.strategies.momentum_breakout import MomentumBreakoutStrategy
-from app.strategies.ema_breakout import EMABreakoutStrategy
 from app.strategies.orb import ORBStrategy
 from app.strategies.range_breakout import RangeBreakoutStrategy
 from app.strategies.trend_pullback import TrendPullbackStrategy
 from app.strategies.vwap_reclaim import VWAPReclaimStrategy
-from app.strategies.breakout_20d import Breakout20DStrategy
-from app.strategies.gex_bounce import GEXBounceStrategy
-from app.strategies.rsi_extreme import RSIExtremeStrategy
-from app.strategies.vwap_pullback import VWAPPullbackStrategy
 from app.trading.history_logger import HistoryLogger
 from app.trading.paper_trader import PaperTradingEngine
 from app.trading.risk_manager import RiskManager
@@ -74,7 +67,6 @@ from app.ai.pre_market_analyst import PreMarketAnalyst
 from app.ai.insight_manager import InsightManager
 from app.engine.ai_decision import set_ai_insight_manager
 from app.engine.day_classifier import DayClassifier
-from app.engine.gex_calculator import GEXCalculator
 from app.execution.angelone_broker import AngelOneBroker
 from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
 
@@ -92,18 +84,82 @@ NO_NEW_ENTRY_AFTER = dtime(14, 30)  # No new trades in last hour — high chop z
 
 LOOP_INTERVAL_SECONDS = 60  # 1-minute analysis cycle
 
-# Regime-strategy compatibility map
-# Strategies not listed here are allowed in all regimes
+# LOCKED v1.0: Regime-strategy compatibility for 5 strategies
+# Only 3 regimes returned: TRENDING, RANGE_BOUND, HIGH_VOLATILITY
 _REGIME_STRATEGY_COMPAT: dict[str, set[MarketRegime]] = {
     "ORBStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
-    "MomentumBreakoutStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
-    "EMABreakoutStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
-    "Breakout20DStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
-    "RangeBreakoutStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.LOW_VOLATILITY, MarketRegime.TRENDING},
-    "VWAPReclaimStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.LOW_VOLATILITY, MarketRegime.TRENDING},
-    "TrendPullbackStrategy": {MarketRegime.TRENDING, MarketRegime.LOW_VOLATILITY},
+    "RangeBreakoutStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.TRENDING},
+    "VWAPReclaimStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.TRENDING},
+    "TrendPullbackStrategy": {MarketRegime.TRENDING},
     "LiquiditySweepStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.HIGH_VOLATILITY},
 }
+
+
+def _detect_micro_trigger(df: pd.DataFrame) -> dict:
+    """Detect intra-candle momentum for faster entry.
+
+    Micro-triggers fire when the CURRENT candle shows strong directional
+    conviction BEFORE waiting for full close / next-candle confirmation.
+
+    Triggers:
+      - volume_spike:  current volume ≥ 1.3× avg
+      - momentum:      candle body ≥ 70% of range (strong directional candle)
+      - vwap_reclaim:  candle crosses VWAP with body in direction of cross
+
+    Returns dict with 'active' bool and trigger details.
+    """
+    result: dict = {"active": False, "type": "none", "volume_ratio": 0.0, "body_ratio": 0.0}
+    if df.empty or len(df) < 3:
+        return result
+
+    last = df.iloc[-1]
+    close = last["close"]
+    open_ = last["open"]
+    high = last["high"]
+    low = last["low"]
+    volume = last["volume"]
+    avg_vol = last.get("avg_volume_10", volume)
+    vwap = last.get("vwap")
+
+    if avg_vol is None or avg_vol == 0:
+        avg_vol = volume
+    if avg_vol == 0:
+        return result
+
+    candle_range = high - low
+    body = abs(close - open_)
+    vol_ratio = volume / avg_vol if avg_vol > 0 else 0.0
+    body_ratio = body / candle_range if candle_range > 0 else 0.0
+
+    result["volume_ratio"] = round(vol_ratio, 2)
+    result["body_ratio"] = round(body_ratio, 2)
+
+    triggers = []
+
+    # 1. Volume spike — 1.3× avg
+    if vol_ratio >= 1.3:
+        triggers.append("volume_spike")
+
+    # 2. Strong momentum — body ≥ 70% of range
+    if body_ratio >= 0.70:
+        triggers.append("momentum")
+
+    # 3. VWAP reclaim — price crosses VWAP in this candle
+    if vwap is not None and not (isinstance(vwap, float) and vwap != vwap):
+        prev = df.iloc[-2]
+        prev_close = prev["close"]
+        # Bullish VWAP reclaim: was below, now above
+        if prev_close < vwap and close > vwap:
+            triggers.append("vwap_reclaim_bull")
+        # Bearish VWAP break: was above, now below
+        elif prev_close > vwap and close < vwap:
+            triggers.append("vwap_reclaim_bear")
+
+    if triggers:
+        result["active"] = True
+        result["type"] = "+".join(triggers)
+
+    return result
 
 
 def _strategy_compatible_with_regime(strategy: BaseStrategy, regime: MarketRegime) -> bool:
@@ -164,49 +220,33 @@ class Orchestrator:
         self.trade_logger = TradeLogger()
         self.history_logger = HistoryLogger()
         self.alert_manager = AlertManager()
-        self.eval_scheduler = EvaluationScheduler(lookback_days=20)
+        self.eval_scheduler = EvaluationScheduler(lookback_days=90)
         self.pre_market_analyst = PreMarketAnalyst()
         self.insight_manager = InsightManager(self.pre_market_analyst)
 
-        # Wire insight manager into signal scorer and AI decision engine
-        set_insight_manager(self.insight_manager)
+        # Wire insight manager into AI decision engine
         set_ai_insight_manager(self.insight_manager)
 
-        # Strategies (applied to every instrument) — V1 Engine
-        # Only proven profitable strategies from 30-day backtest (Apr 2026):
-        #   TREND_PULLBACK: 80% WR, ₹+3,135  |  MOMENTUM_BREAKOUT: 67% WR, ₹+3,870
-        # Removed: ORB (₹-7,270), VWAP_RECLAIM (₹-2,506), others never triggered
+        # Strategy selector — picks best strategies based on condition-performance data
+        from app.engine.strategy_selector import StrategySelector
+        self.strategy_selector = StrategySelector()
+
+        # LOCKED v1.0: Only 5 strategies — do NOT change for 10-15 trading days
         self.strategies: list[BaseStrategy] = [
+            ORBStrategy(),
+            VWAPReclaimStrategy(),
             TrendPullbackStrategy(),
-            MomentumBreakoutStrategy(),
+            RangeBreakoutStrategy(),
+            LiquiditySweepStrategy(),
         ]
 
-        # ── V2 Engine components ─────────────────────────────────────────
-        self.v2_paper_trader = PaperTradingEngine()
-        self.v2_risk_manager = RiskManager(
-            max_trades=settings.v2_max_trades_per_day,
-            max_concurrent=settings.v2_max_concurrent_positions,
-            risk_pct=settings.v2_risk_per_trade_pct,
-            consecutive_limit=settings.v2_consecutive_loss_limit,
-        )
-        self.v2_signal_scorer = SignalScorer()
-        self.v2_smart_exit = SmartExitEngine()
-        self.v2_day_classifier = DayClassifier()
-        self.v2_gex_calculator = GEXCalculator()
-        self.v2_gex_bounce = GEXBounceStrategy()
-        self.v2_strategies: list[BaseStrategy] = [
-            VWAPPullbackStrategy(),
-            RSIExtremeStrategy(),
-            self.v2_gex_bounce,
-        ]
-        self.v2_day_type: DayType = DayType.PENDING
-        self.v2_day_classified = False
+        # Unified engine components
+        self.day_classifier = DayClassifier()
+        self.day_type: DayType = DayType.PENDING
+        self.day_classified = False
 
         # Active instruments — resolved from evaluation or config
         self._active_instruments: list[InstrumentConfig] = []
-        # Per-instrument strategy whitelist from evaluation
-        # {symbol: [strategy_instance, ...]}  — empty means run all
-        self._instrument_strategies: dict[str, list[BaseStrategy]] = {}
         # Eval score boost: {(symbol, strategy_name): composite_score}
         self._eval_scores: dict[tuple[str, str], float] = {}
 
@@ -237,6 +277,11 @@ class Orchestrator:
         self._traded_strikes_today: set[tuple[str, float, str]] = {}
         # Daily SL circuit breaker: if first trade hit full stoploss, stop for the day
         self._daily_sl_hit: dict[str, bool] = {}  # {symbol: True if SL hit today}
+        # No Trade Day guard: if no signal > 55 by 11:30, skip rest of day
+        self._no_trade_day: dict[str, bool] = {}  # {symbol: True if dead day}
+        self._best_score_today: dict[str, float] = {}  # track highest score per symbol
+        # Missed trade log: signals not taken, check later if target would've hit
+        self._missed_signals: list[dict] = []
         # Per-instrument 20-day Donchian levels from daily candles
         # {symbol: {"high_20d": float, "low_20d": float}}
         self._daily_levels: dict[str, dict] = {}
@@ -333,15 +378,19 @@ class Orchestrator:
         self._sl_cooldowns = {}
         self._traded_strikes_today = set()
         self._daily_sl_hit = {}
+        self._no_trade_day = {}
+        self._best_score_today = {}
+        self._missed_signals = []
         self.snapshot = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
         self._last_rss_fetch = None
         self.paper_trader = PaperTradingEngine()  # Fresh daily paper trader
-        # V2 reset
-        self.v2_paper_trader = PaperTradingEngine()
-        self.v2_day_type = DayType.PENDING
-        self.v2_day_classified = False
+        # Unified engine reset
+        self.day_type = DayType.PENDING
+        self.day_classified = False
+        # Reset strategies to defaults — selector will update pre-market
+        self.strategies = [TrendPullbackStrategy(), MomentumBreakoutStrategy()]
         self.running = False
         logger.info("Daily state reset complete")
 
@@ -426,6 +475,9 @@ class Orchestrator:
             self._active_instruments = self._resolve_instruments()
         else:
             self._active_instruments = self._resolve_instruments()
+
+        # ── Strategy selection: pick best strategies for today's conditions ──
+        await self._run_strategy_selection()
 
         # Authenticate with AngelOne (retry up to 3 times)
         auth_ok = False
@@ -590,17 +642,10 @@ class Orchestrator:
             logger.exception("Failed to fetch daily Donchian levels (non-critical)")
             self._log_event("setup", "Daily candle fetch FAILED — Breakout20D will be inactive")
 
-        # Lock the adaptive threshold for the entire session
-        # Based on what data sources are actually available right now
-        analyst = self.pre_market_analyst
-        session_threshold = lock_session_threshold(
-            options_available=bool(self._expiries),
-            global_available=(self.global_bias != GlobalBias.UNAVAILABLE),
-            fii_dii_available=(analyst.institutional_flow is not None),
-            breadth_available=(analyst.market_breadth is not None),
-            news_available=(self.insight_manager.has_insight and bool(analyst._news_items if hasattr(analyst, '_news_items') else False)),
-        )
-        logger.info("Session threshold locked at: %d", session_threshold)
+        # LOCKED v1.0: Fixed scoring with 5 factors, no adaptive threshold
+        logger.info("LOCKED v1.0: Using fixed 5-strategy, 5-factor scoring system")
+
+        # LOCKED v1.0: Using fixed 5 strategies, no daily strategy selection
 
         while self.running:
             now_ist = datetime.now(IST)
@@ -658,6 +703,7 @@ class Orchestrator:
                 await self._generate_daily_report()
                 await self._run_post_market_evaluation()
                 await self._collect_daily_option_data()
+                await self._collect_daily_index_candles()
                 self.running = False
                 logger.info("Trading day complete. Will restart next trading day.")
                 return
@@ -681,12 +727,7 @@ class Orchestrator:
             for idx, instrument in enumerate(self._active_instruments):
                 if idx > 0:
                     await asyncio.sleep(2)  # 2s gap to avoid AngelOne rate limiting
-                if settings.v1_enabled:
-                    await self._analyze_instrument(instrument, cycle, now)
-
-                # V2 engine: runs on the same data, independent trade book
-                if settings.v2_enabled:
-                    await self._v2_analyze_instrument(instrument, cycle, now)
+                await self._analyze_instrument(instrument, cycle, now)
 
             # Fetch basic price data for main indices not in active set
             await self._update_index_snapshots(now)
@@ -706,9 +747,8 @@ class Orchestrator:
             state["snapshots"] = self.snapshots  # All instrument snapshots
             state["intelligence"] = self.pre_market_analyst.latest_insight
             state["pre_market_analyst"] = self.pre_market_analyst
-            # V2 state
-            state["v2_open_trades"] = self.v2_paper_trader.open_trades
-            state["v2_day_type"] = self.v2_day_type.value if self.v2_day_type else "pending"
+            # Unified engine state
+            state["day_type"] = self.day_type.value if self.day_type else "pending"
 
             # Heartbeat alert every 15 cycles
             if self._consecutive_no_signal > 0 and cycle - self._last_heartbeat_cycle >= 15:
@@ -1178,15 +1218,23 @@ class Orchestrator:
                 "atr": round(indicators.atr, 2) if indicators.atr else None,
             })
 
-            # 4. Options chain (for all instruments with expiry, every 3 min)
+            # 4. Options chain — normal: every 3 min, active signal formation: every 60s
             options_metrics = self._options_metrics.get(symbol, OptionsMetrics())
             expiry = self._expiries.get(symbol)
-            if expiry and (now.minute % 3 == 0 or options_metrics.pcr is None):
+            # Detect active signal formation: any strategy produced signal last cycle
+            _has_recent_signal = symbol in getattr(self, '_last_signal_symbols', set())
+            _options_refresh = (
+                options_metrics.pcr is None  # first fetch
+                or (_has_recent_signal and True)  # active setup → every cycle (60s)
+                or (now.minute % 3 == 0)  # normal → every 3 min
+            )
+            if expiry and _options_refresh:
                 options_metrics = await self._update_options_chain_for(instrument, spot_price, expiry)
                 self._options_metrics[symbol] = options_metrics
                 pcr_val = f"{options_metrics.pcr:.2f}" if options_metrics.pcr else "N/A"
-                self._set_source("options_chain", "ok", f"{symbol} PCR={pcr_val}")
-                self._log_event("options", f"Options chain updated: PCR={pcr_val}, MaxPain={options_metrics.max_pain}", cycle=cycle, instrument=symbol)
+                _refresh_mode = "active" if _has_recent_signal else "normal"
+                self._set_source("options_chain", "ok", f"{symbol} PCR={pcr_val} [{_refresh_mode}]")
+                self._log_event("options", f"Options chain updated ({_refresh_mode}): PCR={pcr_val}, MaxPain={options_metrics.max_pain}", cycle=cycle, instrument=symbol)
 
             # 5. Market regime detection
             regime = self.regime_detector.detect(df)
@@ -1230,6 +1278,23 @@ class Orchestrator:
                 self.snapshot = snap
             state["snapshots"] = self.snapshots
 
+            # 6b. Day classification (unified — classify once at 10:00 or after 45 candles)
+            if not self.day_classified and (now.time() >= dtime(10, 0) or len(df_today) >= 45):
+                vix_val = None
+                for gi in self.global_indices:
+                    if hasattr(gi, 'symbol') and 'VIX' in gi.symbol.upper():
+                        vix_val = gi.last_price if hasattr(gi, 'last_price') else None
+                        break
+
+                self.day_type = self.day_classifier.classify(df_today, snap, vix_val)
+                self.day_classified = True
+                self._log_event(
+                    "classify",
+                    f"Day classified: {self.day_type.value}",
+                    cycle=cycle, instrument=symbol,
+                )
+                logger.info("[%s] Day classified as: %s", symbol, self.day_type.value)
+
             # 7. Check exits on open trades for this instrument
             await self._check_trade_exits_for(instrument, spot_price)
 
@@ -1254,6 +1319,11 @@ class Orchestrator:
                 self._log_event("gate", "SL circuit breaker — no more trades today", cycle=cycle, instrument=symbol)
                 return
 
+            # 8d. No Trade Day guard — if no signal scored > 55 by 11:30, skip rest of day
+            if self._no_trade_day.get(symbol, False):
+                logger.debug("[%s][Cycle %d] No Trade Day — skipping", symbol, cycle)
+                return
+
             # 9. Run strategies — filtered by market regime
             #    Compute market structure only when new candle appears (cache by candle count)
             candle_count = len(df_today)
@@ -1272,10 +1342,21 @@ class Orchestrator:
                     )
             structure = self._market_structures.get(symbol, {})
 
-            strategies_to_run = self._instrument_strategies.get(symbol, self.strategies)
+            # 9a. Micro-trigger detection — allow faster entry without full candle close
+            micro_trigger = _detect_micro_trigger(df_today)
+            if micro_trigger["active"]:
+                structure["micro_trigger"] = micro_trigger
+                self._log_event(
+                    "micro_trigger",
+                    f"Micro-trigger: {micro_trigger['type']} (vol_ratio={micro_trigger.get('volume_ratio', 0):.1f}, "
+                    f"body_ratio={micro_trigger.get('body_ratio', 0):.2f})",
+                    cycle=cycle, instrument=symbol,
+                )
+
+            # LOCKED v1.0: Run fixed 5 strategies, filtered by regime
             daily_levels = self._daily_levels.get(symbol)
             signals: list[StrategySignal] = []
-            for strategy in strategies_to_run:
+            for strategy in self.strategies:
                 # Regime-strategy filtering: skip strategies that don't fit current regime
                 if not _strategy_compatible_with_regime(strategy, regime):
                     continue
@@ -1287,10 +1368,18 @@ class Orchestrator:
             if not signals:
                 self._consecutive_no_signal += 1
                 self._log_event("signal", "No strategy signals", cycle=cycle, instrument=symbol)
+                # Track: no signals this cycle for this symbol → normal options refresh next time
+                if not hasattr(self, '_last_signal_symbols'):
+                    self._last_signal_symbols = set()
+                self._last_signal_symbols.discard(symbol)
                 return
             else:
                 self._consecutive_no_signal = 0
                 self._log_event("signal", f"{len(signals)} signal(s): {', '.join(s.strategy.value for s in signals)}", cycle=cycle, instrument=symbol)
+                # Track: signals found → next cycle uses 60s options refresh for this symbol
+                if not hasattr(self, '_last_signal_symbols'):
+                    self._last_signal_symbols = set()
+                self._last_signal_symbols.add(symbol)
 
             # 9b. Multi-timeframe filter: PENALIZE (not block) signals against 5-min trend
             # Override: if 1-min RSI is extreme (≤30 or ≥70), momentum is clearly
@@ -1373,24 +1462,9 @@ class Orchestrator:
                     )
                     return
 
-            # 10. Score and filter (with evaluation boost for top-ranked combos)
-            adaptive_min = compute_adaptive_min_score(options_metrics, self.global_bias)
-
-            # Apply insight-based score modifier to threshold
-            insight_modifier = self.insight_manager.get_score_modifier()
-            adaptive_min = max(35, adaptive_min + insight_modifier)
-
-            # Expiry day awareness: use real expiry date from SmartAPI
-            # Raise threshold by 5 to require stronger confirmation on expiry days
-            expiry_dt = self._expiry_dates.get(symbol)
-            if expiry_dt and expiry_dt == now.date():
-                adaptive_min += 5
-                logger.debug("[%s] Expiry day (%s) — threshold raised to %d", symbol, expiry_dt, adaptive_min)
-
-            best_signal = None
-            best_score = 0.0
-            best_score_result = None
-            all_scored: list[tuple] = []  # (signal, boosted_score) for near-miss alerts
+            # 10. LOCKED v1.0: Rank signals → take best (top 2 max)
+            #     Score >= 75: 1.5% risk | 60-75: 1% risk | 50-60: 0.5% risk | 45-50: lowest priority | <45: ignore
+            all_scored: list[tuple] = []
 
             for signal in signals:
                 score_result = self.signal_scorer.score(
@@ -1399,86 +1473,89 @@ class Orchestrator:
                 )
                 raw_score = score_result.total
 
-                # Evaluation boost: top-ranked strategy+instrument combos
-                # get a bonus based on their historical composite score.
-                # Max boost = 15 pts for combos with eval score >= 80.
-                eval_key = (symbol, signal.strategy.value)
-                eval_composite = self._eval_scores.get(eval_key, 0)
-                eval_boost = 0
-                if eval_composite >= 80:
-                    eval_boost = 15
-                elif eval_composite >= 70:
-                    eval_boost = 10
-                elif eval_composite >= 60:
-                    eval_boost = 5
-
-                boosted_score = min(raw_score + eval_boost, 100)
-
                 # Apply HTF soft penalty if marked by filter
                 htf_penalty = signal.details.get("htf_penalty", 0)
                 if htf_penalty:
-                    boosted_score = max(0, boosted_score + htf_penalty)
+                    raw_score = max(0, raw_score + htf_penalty)
 
-                all_scored.append((signal, boosted_score))
+                logger.info(
+                    "[%s][Cycle %d] %s scored %.0f/100",
+                    symbol, cycle, signal.strategy.value, raw_score,
+                )
+                self._log_event("score", f"{signal.strategy.value}: {raw_score:.0f}/100", cycle=cycle, instrument=symbol)
 
-                if eval_boost > 0:
-                    logger.info(
-                        "[%s][Cycle %d] %s scored %.0f + %d eval boost = %.0f/100 (min=%d)",
-                        symbol, cycle, signal.strategy.value,
-                        raw_score, eval_boost, boosted_score, adaptive_min,
-                    )
-                    self._log_event("score", f"{signal.strategy.value}: {raw_score:.0f} + {eval_boost} boost = {boosted_score:.0f}/100 (min={adaptive_min})", cycle=cycle, instrument=symbol)
-                else:
-                    logger.info(
-                        "[%s][Cycle %d] %s scored %.0f/100 (min=%d)",
-                        symbol, cycle, signal.strategy.value, raw_score, adaptive_min,
-                    )
-                    self._log_event("score", f"{signal.strategy.value}: {raw_score:.0f}/100 (min={adaptive_min})", cycle=cycle, instrument=symbol)
+                all_scored.append((signal, raw_score, score_result))
 
-                if boosted_score >= adaptive_min and boosted_score > best_score:
-                    best_signal = signal
-                    best_score = boosted_score
-                    best_score_result = score_result
-                    signal.score = boosted_score
+            # Rank by score descending, take top 2, ignore score < 45
+            all_scored.sort(key=lambda x: x[1], reverse=True)
 
-            # If no signal passed the threshold, check if AI can override
-            # a marginal signal (score 40+ but below threshold)
-            if best_signal is None:
-                # AI override path: let AI rescue marginal signals (score >= 40)
-                ai_override_candidates = [
-                    (s, sc) for s, sc in all_scored if sc >= 40
-                ]
-                if ai_override_candidates:
-                    # Pick the highest-scoring marginal signal
-                    ai_override_candidates.sort(key=lambda x: x[1], reverse=True)
-                    best_signal = ai_override_candidates[0][0]
-                    best_score = ai_override_candidates[0][1]
-                    best_score_result = self.signal_scorer.score(
-                        best_signal, df, options_metrics, self.global_bias,
-                        structure_data=structure,
-                    )
-                    best_signal.score = best_score
-                    # Mark as AI-override path so we require high AI confidence
-                    best_signal.details["ai_override_path"] = True
-                    logger.info(
-                        "[%s][Cycle %d] Score %d < threshold %d — sending to AI for override decision",
-                        symbol, cycle, int(best_score), adaptive_min,
-                    )
-                    self._log_event("score", f"Below threshold ({best_score:.0f}/{adaptive_min}) — AI override path", cycle=cycle, instrument=symbol)
-                else:
-                    self._log_event("score", f"No signal passed threshold ({adaptive_min})", cycle=cycle, instrument=symbol)
-                    # Alert on near-misses (within 5 pts of threshold)
-                    near_misses = [(s, sc) for s, sc in all_scored if sc >= adaptive_min - 5]
-                    if near_misses:
-                        miss_info = "\n".join(
-                            f"{s.strategy.value} {s.option_type.value}: {sc:.0f}/{adaptive_min}"
-                            for s, sc in near_misses
-                        )
-                        await self.alert_manager.send_info(
-                            f"NEAR MISS — {symbol}",
-                            f"Signal(s) close to threshold but not passed:\n{miss_info}",
-                        )
-                    return
+            # Track best score today for No Trade Day guard
+            if all_scored:
+                cycle_best = all_scored[0][1]
+                prev_best = self._best_score_today.get(symbol, 0)
+                if cycle_best > prev_best:
+                    self._best_score_today[symbol] = cycle_best
+            # At 11:30, if no signal all day scored > 55, declare No Trade Day
+            from datetime import time as _dtime
+            _NO_TRADE_CUTOFF = _dtime(11, 30)
+            if (
+                now.time() >= _NO_TRADE_CUTOFF
+                and not self._no_trade_day.get(symbol, False)
+                and self._best_score_today.get(symbol, 0) <= 55
+                # Only trigger if no trades placed yet (otherwise we already had conviction)
+                and not any(
+                    t.date == now.date().isoformat() and t.instrument == symbol
+                    for t in self.paper_trader.all_today_trades
+                )
+            ):
+                self._no_trade_day[symbol] = True
+                self._log_event("gate", f"NO TRADE DAY: best score {self._best_score_today.get(symbol, 0):.0f} <= 55 by 11:30", cycle=cycle, instrument=symbol)
+                logger.info("[%s] No Trade Day declared — best score %.0f by 11:30", symbol, self._best_score_today.get(symbol, 0))
+                await self.alert_manager.send_info(
+                    f"NO TRADE DAY — {symbol}",
+                    f"Best signal score today: {self._best_score_today.get(symbol, 0):.0f}/100\n"
+                    f"No score > 55 by 11:30 — skipping rest of day",
+                )
+                return
+
+            ranked = [(s, sc, sr) for s, sc, sr in all_scored if sc >= 45][:2]
+
+            if not ranked:
+                self._log_event("score", "No signal scored >= 45 — NO TRADE", cycle=cycle, instrument=symbol)
+                # Log missed signals with spot price for later target-hit analysis
+                for sig, sc, _ in all_scored:
+                    self._missed_signals.append({
+                        "time": now.strftime("%H:%M:%S"),
+                        "instrument": symbol,
+                        "strategy": sig.strategy.value,
+                        "direction": sig.option_type.value,
+                        "score": round(sc, 1),
+                        "spot_price": spot_price,
+                        "reason": "score_below_45",
+                        "details": {k: v for k, v in sig.details.items() if not isinstance(v, (pd.DataFrame,))},
+                    })
+                if all_scored:
+                    miss_info = ", ".join(f"{s.strategy.value}={sc:.0f}" for s, sc, _ in all_scored)
+                    self._log_event("missed", f"Signals below 45: {miss_info}", cycle=cycle, instrument=symbol)
+                return
+
+            best_signal = ranked[0][0]
+            best_score = ranked[0][1]
+            best_score_result = ranked[0][2]
+            best_signal.score = best_score
+
+            # Position sizing by score (LOCKED v1.0)
+            if best_score >= 75:
+                score_risk_pct = 1.5
+            elif best_score >= 60:
+                score_risk_pct = 1.0
+            elif best_score >= 55:
+                score_risk_pct = 0.5
+            elif best_score >= 50:
+                score_risk_pct = 0.3  # 50-55: moderate confidence, reduced risk
+            else:  # 45-50: lowest priority, minimal risk
+                score_risk_pct = 0.25
+            self.risk_manager.risk_per_trade_pct = score_risk_pct
 
             # 10b. Re-entry cooldown — block same instrument+direction within 15 min of SL hit
             cooldown_key = (symbol, best_signal.option_type.value)
@@ -1564,17 +1641,20 @@ class Orchestrator:
                     f"Score: {best_score:.0f}",
                 )
                 return
-            # ATR-based SL/targets (Wilder: 2×ATR stop, Tharp: 2R+ reward)
+            # ATR-based SL/targets — R:R fix: tighter SL, wider targets
             option_atr = atr * 0.5  # ATM delta ~0.5 scales spot ATR to option premium
             best_signal.entry_price = entry_price
-            best_signal.stoploss = round(max(entry_price - (2.5 * option_atr), entry_price * 0.70), 2)
-            best_signal.target1 = round(entry_price + (2.0 * option_atr), 2)
-            best_signal.target2 = round(entry_price + (3.5 * option_atr), 2)
+            # SL = min(2.0 × ATR, 15% of premium) — cap losses, floor at 85% of entry
+            atr_sl = entry_price - (2.0 * option_atr)
+            pct_sl = entry_price * 0.85  # 15% max loss
+            best_signal.stoploss = round(max(atr_sl, pct_sl), 2)
+            # T1 = 2.5× ATR, T2 = 4× ATR — reward must exceed risk
+            best_signal.target1 = round(entry_price + (2.5 * option_atr), 2)
+            best_signal.target2 = round(entry_price + (4.0 * option_atr), 2)
 
-            # 12. AI validation — always pass through AI, no bypass
-            #   - AI override path (score 40-47): need confidence >= 70
-            #   - Normal path: adaptive threshold based on score
-            is_ai_override = best_signal.details.get("ai_override_path", False)
+            # 12. AI — LOG ONLY (never blocks trades)
+            #   Score + Rank + Risk control is the decision layer.
+            #   AI generates explanation for UI/reports/audit trail.
 
             # Build enriched context for AI
             # Session state
@@ -1600,7 +1680,6 @@ class Orchestrator:
                     "direction": lt.option_type.value if hasattr(lt.option_type, "value") else str(lt.option_type),
                     "pnl": lt.pnl,
                 }
-                # Minutes since last trade
                 if lt.exit_time:
                     try:
                         exit_parts = lt.exit_time.split(":")
@@ -1619,25 +1698,7 @@ class Orchestrator:
             if last_trade_info:
                 session_context["last_trade"] = last_trade_info
 
-            # Extra score components
             extra_scores = {}
-            if self.insight_manager:
-                try:
-                    is_call = best_signal.option_type.value == "CE"
-                    extra_scores = {
-                        "fii_dii": self.insight_manager.get_fii_dii_score(is_call),
-                        "breadth": self.insight_manager.get_breadth_score(is_call),
-                        "news": self.insight_manager.get_news_sentiment_score(is_call),
-                    }
-                except Exception:
-                    pass
-            # Structure score
-            if structure:
-                from app.engine.signal_scorer import SignalScorer
-                try:
-                    extra_scores["structure"] = self.signal_scorer._score_structure(best_signal, structure)
-                except Exception:
-                    pass
 
             # Candle character and key levels
             candle_data = None
@@ -1672,7 +1733,7 @@ class Orchestrator:
 
             extra_context = {
                 "structure_data": structure,
-                "day_type": self.v2_day_type.value if hasattr(self, "v2_day_type") and self.v2_day_type else None,
+                "day_type": self.day_type.value if hasattr(self, "day_type") and self.day_type else None,
                 "session_context": session_context,
                 "global_indices": self.global_indices,
                 "candle_data": candle_data,
@@ -1682,51 +1743,37 @@ class Orchestrator:
                 "df_indicators": df_indicators,
             }
 
-            # Ask AI for validation — every signal goes through AI
-            decision = await self.ai_engine.evaluate(
-                best_signal, snap, best_score, best_score_result,
-                extra_context=extra_context,
-            )
-
-            # Adaptive AI confidence threshold
-            early_session = now.time() < dtime(11, 15)
-            if is_ai_override:
-                ai_threshold = 65 if early_session else 70
-            elif best_score >= 55:
-                ai_threshold = 60 if early_session else 65
-            else:
-                ai_threshold = 65 if early_session else 70
-
-            if not decision.trade_decision or decision.confidence_score < ai_threshold:
-                path_label = "AI-OVERRIDE" if is_ai_override else "NORMAL"
-                logger.info(
-                    "[%s] AI rejected [%s path] (confidence=%.0f%%, threshold=%d): %s",
-                    symbol, path_label, decision.confidence_score, ai_threshold, decision.reason,
+            # Fire-and-forget AI evaluation — for logging/explanation only
+            # Trade proceeds regardless of AI decision
+            ai_confidence = 0.0
+            ai_reason = ""
+            try:
+                decision = await self.ai_engine.evaluate(
+                    best_signal, snap, best_score, best_score_result,
+                    extra_context=extra_context,
                 )
-                self._log_event("ai", f"AI REJECTED [{path_label}] ({decision.confidence_score:.0f}%/{ai_threshold}): {decision.reason}", cycle=cycle, instrument=symbol, data={
-                    "confidence": decision.confidence_score, "reason": decision.reason,
-                    "strategy": best_signal.strategy.value, "score": best_score,
-                })
-                await self.alert_manager.send_info(
-                    f"SIGNAL REJECTED — {symbol} {best_signal.strategy.value}",
-                    f"{symbol} {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
-                    f"Premium: ₹{option_ltp:.2f} | Score: {best_score:.0f} | AI: {decision.confidence_score:.0f}%\n"
-                    f"Reason: {decision.reason}",
-                )
-                await self._save_signal_record(
-                    best_signal, best_score, "rejected",
-                    decision.confidence_score, decision.reason,
-                )
-                return
+                ai_confidence = decision.confidence_score
+                ai_reason = decision.reason
+                # Use AI-refined SL/targets only if they are tighter (safer)
+                if decision.stoploss > 0 and decision.stoploss > best_signal.stoploss:
+                    best_signal.stoploss = decision.stoploss
+                if decision.target1 > 0 and decision.target1 < best_signal.target1:
+                    best_signal.target1 = decision.target1
+            except Exception:
+                logger.warning("[%s] AI evaluation failed (non-blocking) — proceeding with trade", symbol)
+                ai_reason = "AI unavailable"
 
-            self._log_event("ai", f"AI APPROVED ({decision.confidence_score:.0f}%): {best_signal.strategy.value} {best_signal.option_type.value}", cycle=cycle, instrument=symbol, data={
-                "confidence": decision.confidence_score, "strategy": best_signal.strategy.value,
-                "strike": best_signal.strike_price, "option_type": best_signal.option_type.value,
-                "entry": decision.entry_price, "sl": decision.stoploss, "target1": decision.target1,
+            # Log AI opinion (never blocks)
+            ai_agreed = ai_confidence >= 60
+            ai_label = "AGREES" if ai_agreed else "CAUTION"
+            self._log_event("ai", f"AI {ai_label} ({ai_confidence:.0f}%): {ai_reason}", cycle=cycle, instrument=symbol, data={
+                "confidence": ai_confidence, "reason": ai_reason,
+                "strategy": best_signal.strategy.value, "score": best_score,
+                "ai_blocks": False,
             })
             await self._save_signal_record(
-                best_signal, best_score, "accepted",
-                decision.confidence_score, decision.reason,
+                best_signal, best_score, "executed",
+                ai_confidence, ai_reason,
             )
 
             # 13. Build NFO trading symbol
@@ -1856,14 +1903,14 @@ class Orchestrator:
         inst_best: dict[str, float] = {}  # symbol -> best composite score
         inst_strats: dict[str, list[str]] = {}  # symbol -> [strategy names]
 
-        # Only these indices are allowed for trading
-        ALLOWED_INDICES = {"NIFTY"}
+        # Allow all enabled instruments (no longer restricted to NIFTY only)
+        enabled_symbols = {i.symbol for i in get_enabled_instruments()}
 
         for r in recs:
             if r.composite_score < min_score:
                 continue
             sym = r.instrument
-            if sym not in ALLOWED_INDICES:
+            if sym not in enabled_symbols:
                 continue
             if sym not in inst_best:
                 inst_best[sym] = r.composite_score
@@ -2365,7 +2412,7 @@ class Orchestrator:
                 trade=trade,
                 current_ltp=ltp,
                 snap=snap,
-                day_type=self.v2_day_type if self.v2_day_classified else DayType.PENDING,
+                day_type=self.day_type if self.day_classified else DayType.PENDING,
                 spot_price=spot_price,
                 candle_closed=True,  # V1 runs once per candle close
                 option_atr=opt_atr,
@@ -2796,6 +2843,101 @@ class Orchestrator:
         except Exception:
             logger.exception("Error in pre-market evaluation — will use existing data or config fallback")
 
+    async def _run_strategy_selection(self) -> None:
+        """Select best strategies for today's conditions using StrategySelector.
+
+        Runs after pre-market evaluation. Queries strategy_condition_performance
+        to pick strategies with best historical performance for today's conditions.
+        Only selects from the 5 LOCKED strategies.
+        """
+        try:
+            from app.engine.strategy_selector import MarketConditions
+            from app.db.models import AsyncSessionLocal
+
+            # Build today's market conditions from available data
+            insight = self.pre_market_analyst.latest_insight or {}
+            vix_val = 0.0
+            for gi in self.global_indices:
+                if hasattr(gi, 'symbol') and 'VIX' in gi.symbol.upper():
+                    vix_val = gi.last_price if hasattr(gi, 'last_price') else 0.0
+                    break
+
+            gap_pct = 0.0
+            bias_str = insight.get("market_bias", "neutral")
+
+            # Map from strategy DB name → class instance from our locked list
+            _LOCKED_NAME_MAP = {
+                "ORB": ORBStrategy,
+                "VWAP_RECLAIM": VWAPReclaimStrategy,
+                "TREND_PULLBACK": TrendPullbackStrategy,
+                "RANGE_BREAKOUT": RangeBreakoutStrategy,
+                "LIQUIDITY_SWEEP": LiquiditySweepStrategy,
+            }
+
+            for instrument in self._active_instruments:
+                symbol = instrument.symbol
+                conditions = MarketConditions(
+                    instrument=symbol,
+                    gap_pct=gap_pct,
+                    vix=vix_val,
+                    global_bias=bias_str,
+                )
+
+                async with AsyncSessionLocal() as session:
+                    result = await self.strategy_selector.select(session, conditions)
+
+                if result.selected:
+                    strategy_names = result.strategy_names()
+                    self._log_event(
+                        "selection",
+                        f"[{symbol}] Strategies selected: {', '.join(f'{p.strategy}({p.probability:.0f}%)' for p in result.selected)}",
+                        instrument=symbol,
+                    )
+                    logger.info(
+                        "[%s] Strategy selection: %s (condition=%s)",
+                        symbol, strategy_names, result.condition_key,
+                    )
+
+                    # Only use strategies from the locked set
+                    selected = []
+                    for name in strategy_names:
+                        cls = _LOCKED_NAME_MAP.get(name)
+                        if cls:
+                            selected.append(cls())
+                    if selected:
+                        self.strategies = selected
+                        logger.info(
+                            "[%s] Active strategies updated: %s",
+                            symbol, [type(s).__name__ for s in selected],
+                        )
+                    else:
+                        self._log_event(
+                            "selection",
+                            f"[{symbol}] No locked strategies matched selection — keeping all 5",
+                            instrument=symbol,
+                        )
+                else:
+                    self._log_event(
+                        "selection",
+                        f"[{symbol}] No condition data — using all 5 locked strategies",
+                        instrument=symbol,
+                    )
+
+            # Send alert with today's strategy selection
+            selections = self.strategy_selector.latest_selections
+            if selections:
+                lines = []
+                for sym, sel in selections.items():
+                    strats = ", ".join(f"{p.strategy}({p.probability:.0f}%)" for p in sel.selected)
+                    lines.append(f"{sym}: {strats}" if strats else f"{sym}: all 5 defaults")
+                await self.alert_manager.send_info(
+                    "STRATEGY SELECTION",
+                    "\n".join(lines) + f"\nCondition: {sel.condition_key if sel else 'N/A'}",
+                )
+
+        except Exception:
+            logger.exception("Strategy selection failed — using default strategies")
+
     async def _run_post_market_evaluation(self) -> None:
         """Run strategy evaluation after daily report — ranks strategies for next day."""
         try:
@@ -2830,6 +2972,17 @@ class Orchestrator:
             await collector.cleanup()
         except Exception:
             logger.exception("Error collecting daily option data")
+
+    async def _collect_daily_index_candles(self) -> None:
+        """Collect today's 1-min index candles to DB for strategy evaluation."""
+        try:
+            from app.data.index_candle_collector import IndexCandleCollector
+            logger.info("Starting daily index candle collection...")
+            collector = IndexCandleCollector()
+            await collector.collect_today()
+            logger.info("Index candle collection done")
+        except Exception:
+            logger.exception("Error collecting daily index candles")
 
     # NOTE: No hardcoded expiry day fallback — expiry dates come exclusively from
     # SmartAPI instrument master via get_nearest_weekly_expiry(). If the instrument

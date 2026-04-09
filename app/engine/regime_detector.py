@@ -1,4 +1,11 @@
-"""Market regime detection module."""
+"""LOCKED v1.0 Market regime detection — 3 regimes only.
+
+TREND:    ADX > 20
+RANGE:    ADX < 18
+VOLATILE: Between thresholds + VIX spike or large candles
+
+DO NOT CHANGE for 10-15 trading days.
+"""
 
 from __future__ import annotations
 
@@ -12,63 +19,51 @@ logger = logging.getLogger(__name__)
 
 
 class RegimeDetector:
-    """Detect the current market regime from indicator data.
+    """LOCKED v1.0: Detect market regime — TREND, RANGE, or VOLATILE.
 
-    Regimes (ordered by priority):
-        Trending:        ADX > 25, EMA20 slope confirms direction
-        Range-bound:     ADX < 20, price range < 0.5% over lookback
-        High Volatility: ATR rising AND VIX elevated
-        Low Volatility:  ATR falling AND VIX calm
+    Recalculated every 30 minutes by the orchestrator.
     """
 
-    ADX_TRENDING_THRESHOLD = 22       # Lowered from 25 — catches trends earlier
-    ADX_RANGE_THRESHOLD = 20          # Raised from 18 — more forgiving range detection
-    RANGE_PCT_THRESHOLD = 0.50        # Raised from 0.35% — NIFTY ranges can be wider
-    RANGE_LOOKBACK = 60
-    MIN_CANDLES = 20                  # Need 20+ candles for reliable regime detection
+    ADX_TREND_THRESHOLD = 20
+    ADX_RANGE_THRESHOLD = 18
+    MIN_CANDLES = 20
 
     def detect(self, df: pd.DataFrame, vix_rising: bool = False) -> MarketRegime:
         """Determine market regime from the latest indicator DataFrame."""
         if df.empty or len(df) < self.MIN_CANDLES:
-            return MarketRegime.INSUFFICIENT_DATA
+            return MarketRegime.RANGE_BOUND  # Default to RANGE if insufficient data
 
         last = df.iloc[-1]
         adx = last.get("adx")
-        ema20_slope = last.get("ema20_slope")
-        atr_slope = last.get("atr_slope")
 
-        # If ADX unavailable (too few candles), fall back to range-bound
+        # If ADX unavailable, default to RANGE
         if adx is None or (isinstance(adx, float) and pd.isna(adx)):
             return MarketRegime.RANGE_BOUND
 
-        # Check trending — EMA slope confirms direction but isn't strictly required
-        slope = ema20_slope if (ema20_slope is not None and not pd.isna(ema20_slope)) else 0
-        if adx > self.ADX_TRENDING_THRESHOLD:
-            if slope != 0:
-                logger.info("Regime: TRENDING (ADX=%.1f, EMA20 slope=%.4f)", adx, slope)
-            else:
-                logger.info("Regime: TRENDING (ADX=%.1f, slope unavailable)", adx)
+        # TREND: ADX > 20
+        if adx > self.ADX_TREND_THRESHOLD:
+            logger.info("Regime: TREND (ADX=%.1f)", adx)
             return MarketRegime.TRENDING
 
-        # Check range-bound — use available candles up to RANGE_LOOKBACK
-        lookback = min(self.RANGE_LOOKBACK, len(df))
-        recent = df.tail(lookback)
-        price_range_pct = (
-            (recent["high"].max() - recent["low"].min()) / recent["close"].iloc[0] * 100
-        )
-        if adx < self.ADX_RANGE_THRESHOLD and price_range_pct < self.RANGE_PCT_THRESHOLD:
-            logger.info("Regime: RANGE_BOUND (ADX=%.1f, range=%.2f%%)", adx, price_range_pct)
+        # RANGE: ADX < 18
+        if adx < self.ADX_RANGE_THRESHOLD:
+            logger.info("Regime: RANGE (ADX=%.1f)", adx)
             return MarketRegime.RANGE_BOUND
 
-        # Check volatility regimes
-        atr_s = atr_slope if (atr_slope is not None and not pd.isna(atr_slope)) else 0
-        if atr_s > 0 and vix_rising:
-            logger.info("Regime: HIGH_VOLATILITY (ATR slope=%.4f, VIX rising)", atr_s)
+        # VOLATILE: ADX between 18-20 — check for VIX spike or large candles
+        atr = last.get("atr")
+        high = last.get("high", 0)
+        low = last.get("low", 0)
+        candle_range = high - low
+
+        large_candle = False
+        if atr and atr > 0 and candle_range > 0:
+            large_candle = (candle_range / atr) > 1.5
+
+        if vix_rising or large_candle:
+            logger.info("Regime: VOLATILE (ADX=%.1f, VIX_rising=%s, large_candle=%s)", adx, vix_rising, large_candle)
             return MarketRegime.HIGH_VOLATILITY
 
-        if atr_s < 0 and not vix_rising:
-            logger.info("Regime: LOW_VOLATILITY (ATR slope=%.4f)", atr_s)
-            return MarketRegime.LOW_VOLATILITY
-
-        # Between thresholds but has real data — default to range-bound
+        # Default: RANGE
+        logger.info("Regime: RANGE (ADX=%.1f, between thresholds)", adx)
         return MarketRegime.RANGE_BOUND

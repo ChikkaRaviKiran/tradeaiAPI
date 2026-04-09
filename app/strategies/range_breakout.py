@@ -97,8 +97,16 @@ class RangeBreakoutStrategy(BaseStrategy):
             close, range_low, range_high, rsi, adx, range_pct,
         )
 
+        # Micro-trigger: use high/low for breakout detection, lower volume
+        micro = (structure_data or {}).get("micro_trigger", {})
+        micro_active = micro.get("active", False)
+        vol_mult = 1.3 if micro_active else 1.5
+
         # CALL breakout
-        if close > range_high and (is_index or volume >= 1.5 * avg_vol) and rsi >= 55:
+        call_break = close > range_high
+        if micro_active and not call_break:
+            call_break = last.get("high", close) > range_high
+        if call_break and (is_index or volume >= vol_mult * avg_vol) and rsi >= 55:
             return StrategySignal(
                 strategy=StrategyName.RANGE_BREAKOUT,
                 option_type=OptionType.CALL,
@@ -110,11 +118,15 @@ class RangeBreakoutStrategy(BaseStrategy):
                     "adx": adx,
                     "rsi": rsi,
                     "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0,
+                    "micro_trigger": micro_active,
                 },
             )
 
         # PUT breakout
-        if close < range_low and (is_index or volume >= 1.5 * avg_vol) and rsi <= 45:
+        put_break = close < range_low
+        if micro_active and not put_break:
+            put_break = last.get("low", close) < range_low
+        if put_break and (is_index or volume >= vol_mult * avg_vol) and rsi <= 45:
             return StrategySignal(
                 strategy=StrategyName.RANGE_BREAKOUT,
                 option_type=OptionType.PUT,
@@ -126,6 +138,7 @@ class RangeBreakoutStrategy(BaseStrategy):
                     "adx": adx,
                     "rsi": rsi,
                     "volume_ratio": round(volume / avg_vol, 2) if avg_vol else 0,
+                    "micro_trigger": micro_active,
                 },
             )
 

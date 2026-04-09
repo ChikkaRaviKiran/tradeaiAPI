@@ -138,49 +138,60 @@ async def get_trades_by_date(target_date: str):
 
 # ── V2 Engine ────────────────────────────────────────────────────────────
 
-@app.get("/api/v2/active", response_model=list[Trade])
-async def get_v2_active_trades():
-    """Get V2 engine's currently open trades."""
-    return _state.get("v2_open_trades", [])
-
-
-@app.get("/api/v2/today", response_model=list[Trade])
-async def get_v2_today_trades():
-    """Get all V2 trades for today."""
-    today_trades = await trade_logger.get_today_trades()
-    return [t for t in today_trades if t.engine == "v2"]
-
-
-@app.get("/api/v2/status")
-async def get_v2_status():
-    """V2 engine status: day type, trade counts, enabled flag."""
+@app.get("/api/strategy-selection")
+async def get_strategy_selection():
+    """Get today's strategy selection with conditions and probabilities."""
     orch = _state.get("orchestrator")
-    v2_day_type = _state.get("v2_day_type", "pending")
-    v2_active = _state.get("v2_open_trades", [])
-    today_trades = await trade_logger.get_today_trades()
-    v2_today = [t for t in today_trades if t.engine == "v2"]
-    v2_closed = [t for t in v2_today if t.status.value == "closed"]
-    v2_wins = [t for t in v2_closed if (t.pnl or 0) > 0]
+    selector = _state.get("strategy_selector")
+
+    if not selector and orch:
+        selector = getattr(orch, "strategy_selector", None)
+
+    if not selector or not selector.latest_selections:
+        # Return default info
+        return {
+            "selections": [],
+            "day_type": _state.get("day_type", "pending"),
+            "active_strategies": ["TREND_PULLBACK", "MOMENTUM_BREAKOUT"],
+            "message": "No condition-based selection yet — using defaults",
+        }
+
+    selections = []
+    for symbol, result in selector.latest_selections.items():
+        selections.append(result.to_dict())
+
+    day_type = "pending"
+    if orch and hasattr(orch, "day_type"):
+        day_type = orch.day_type.value if orch.day_type else "pending"
+
+    active = []
+    if orch and hasattr(orch, "strategies"):
+        active = [type(s).__name__.replace("Strategy", "").upper() for s in orch.strategies]
+
     return {
-        "enabled": settings.v2_enabled,
-        "day_type": v2_day_type,
-        "active_count": len(v2_active),
-        "today_total": len(v2_today),
-        "today_closed": len(v2_closed),
-        "today_wins": len(v2_wins),
-        "today_pnl": round(sum(t.pnl or 0 for t in v2_closed), 2),
+        "selections": selections,
+        "day_type": day_type,
+        "active_strategies": active,
     }
 
 
 @app.get("/api/performance/comparison")
 async def get_performance_comparison():
-    """Side-by-side V1 vs V2 performance metrics."""
+    """Performance breakdown by strategy."""
     all_trades = await trade_logger.get_today_trades()
-    v1_trades = [t for t in all_trades if (t.engine or "v1") == "v1"]
-    v2_trades = [t for t in all_trades if t.engine == "v2"]
-    v1_metrics = await trade_logger.compute_performance(v1_trades)
-    v2_metrics = await trade_logger.compute_performance(v2_trades)
-    return {"v1": v1_metrics, "v2": v2_metrics}
+    # Group by strategy instead of V1/V2
+    from collections import defaultdict
+    by_strategy: dict[str, list] = defaultdict(list)
+    for t in all_trades:
+        strat = t.strategy.value if hasattr(t.strategy, 'value') else str(t.strategy)
+        by_strategy[strat].append(t)
+
+    result = {}
+    for strat, trades in by_strategy.items():
+        metrics = await trade_logger.compute_performance(trades)
+        result[strat] = metrics
+
+    return result
 
 
 # ── Performance ──────────────────────────────────────────────────────────
@@ -341,6 +352,7 @@ async def get_system_activity(limit: int = 200):
         "regimes": regimes,
         "paper_trading": settings.paper_trading,
         "open_trades": len(_state.get("open_trades", [])),
+        "missed_signals": getattr(orch, "_missed_signals", [])[-20:],
     }
 
 

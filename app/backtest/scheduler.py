@@ -27,7 +27,7 @@ _IST = pytz.timezone("Asia/Kolkata")
 class EvaluationScheduler:
     """Manages running strategy evaluations and persisting results."""
 
-    def __init__(self, lookback_days: int = 20) -> None:
+    def __init__(self, lookback_days: int = 90) -> None:
         self.evaluator = StrategyEvaluator(lookback_days=lookback_days)
         self._latest_report: EvaluationReport | None = None
         self._running = False
