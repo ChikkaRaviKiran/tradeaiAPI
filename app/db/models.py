@@ -257,6 +257,27 @@ class DailyAIInsight(Base):
     created_at = Column(DateTime, default=_now_ist)
 
 
+class OptionCandle(Base):
+    """1-minute OHLCV candle for NIFTY/BANKNIFTY options — cached for backtesting."""
+
+    __tablename__ = "option_candles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    instrument = Column(String(20), nullable=False, index=True)   # NIFTY, BANKNIFTY
+    expiry = Column(String(10), nullable=False, index=True)       # DDMMMYY e.g. 10APR26
+    strike = Column(Float, nullable=False)
+    option_type = Column(String(2), nullable=False)               # CE or PE
+    trading_symbol = Column(String(60), nullable=False, index=True)
+    date = Column(String(10), nullable=False, index=True)         # YYYY-MM-DD
+    timestamp = Column(DateTime, nullable=False)
+    open = Column(Float, nullable=False)
+    high = Column(Float, nullable=False)
+    low = Column(Float, nullable=False)
+    close = Column(Float, nullable=False)
+    volume = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=_now_ist)
+
+
 # Async engine
 async_engine = create_async_engine(settings.database_url, echo=False)
 AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
@@ -303,6 +324,9 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS ix_daily_reports_engine ON daily_reports (engine)",
             # V2 alert engine column
             "ALTER TABLE alert_records ADD COLUMN IF NOT EXISTS engine VARCHAR(4) DEFAULT 'v1'",
+            # Option candle cache indexes
+            "CREATE INDEX IF NOT EXISTS ix_option_candles_lookup ON option_candles (instrument, date, strike, option_type)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_option_candles_unique ON option_candles (trading_symbol, timestamp)",
         ]
         for sql in migrations:
             try:

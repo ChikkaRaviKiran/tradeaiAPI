@@ -657,6 +657,7 @@ class Orchestrator:
             if REPORT_TIME <= current_time <= dtime(16, 0):
                 await self._generate_daily_report()
                 await self._run_post_market_evaluation()
+                await self._collect_daily_option_data()
                 self.running = False
                 logger.info("Trading day complete. Will restart next trading day.")
                 return
@@ -2816,6 +2817,19 @@ class Orchestrator:
                 )
         except Exception:
             logger.exception("Error in post-market strategy evaluation")
+
+    async def _collect_daily_option_data(self) -> None:
+        """Collect today's 1-min option candles to DB for backtesting."""
+        try:
+            from app.data.option_data_collector import OptionDataCollector
+            logger.info("Starting daily option data collection...")
+            collector = OptionDataCollector()
+            results = await collector.collect_today()
+            total = sum(r.get("candles", 0) for r in results)
+            logger.info("Option data collection done: %d candles saved", total)
+            await collector.cleanup()
+        except Exception:
+            logger.exception("Error collecting daily option data")
 
     # NOTE: No hardcoded expiry day fallback — expiry dates come exclusively from
     # SmartAPI instrument master via get_nearest_weekly_expiry(). If the instrument
