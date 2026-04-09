@@ -9,6 +9,7 @@ from __future__ import annotations
 import enum
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class InstrumentConfig:
     option_symbol_prefix: str = ""    # e.g. "NIFTY" for NIFTY option chain
     is_index: bool = False    # True for indices (no direct volume)
     enabled: bool = True      # Whether this instrument is active
+    option_exchange: Exchange = Exchange.NFO  # Exchange for option contracts (NFO, BFO)
 
     def nearest_strike(self, price: float, option_type: str = "CE") -> float:
         """Round price to nearest valid strike for this instrument."""
@@ -64,6 +66,16 @@ class InstrumentConfig:
         """Build futures trading symbol. e.g. NIFTY17MAR2026FUT"""
         prefix = self.futures_symbol_prefix or self.symbol
         return f"{prefix}{expiry}FUT"
+
+    def format_expiry(self, expiry_date: date) -> str:
+        """Format expiry date into the symbol string used by the exchange.
+
+        NFO (NIFTY etc):  DDMMMYY   e.g. 09APR26
+        BFO (SENSEX):     YY + M (no leading zero) + DD   e.g. 26409
+        """
+        if self.option_exchange == Exchange.BFO:
+            return f"{expiry_date.strftime('%y')}{expiry_date.month}{expiry_date.strftime('%d')}"
+        return expiry_date.strftime("%d%b%y").upper()
 
 
 # ── Pre-configured Instruments ────────────────────────────────────────────────
@@ -123,6 +135,21 @@ MIDCPNIFTY = InstrumentConfig(
     enabled=False,  # Disabled — focusing on NIFTY, BANKNIFTY, FINNIFTY
 )
 
+SENSEX = InstrumentConfig(
+    symbol="SENSEX",
+    display_name="BSE SENSEX",
+    exchange=Exchange.BSE,
+    instrument_type=InstrumentType.INDEX,
+    lot_size=20,
+    strike_interval=100,
+    token="99919000",
+    futures_symbol_prefix="SENSEX",
+    option_symbol_prefix="SENSEX",
+    is_index=True,
+    enabled=True,
+    option_exchange=Exchange.BFO,
+)
+
 # ── Stock definitions (equity options on NSE) ────────────────────────────
 
 def _equity(symbol: str, name: str, token: str, lot_size: int, strike_int: float, enabled: bool = False) -> InstrumentConfig:
@@ -161,6 +188,7 @@ _ALL_INSTRUMENTS: dict[str, InstrumentConfig] = {
     "BANKNIFTY": BANKNIFTY,
     "FINNIFTY": FINNIFTY,
     "MIDCPNIFTY": MIDCPNIFTY,
+    "SENSEX": SENSEX,
     "RELIANCE": RELIANCE,
     "TCS": TCS,
     "HDFCBANK": HDFCBANK,

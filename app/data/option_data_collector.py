@@ -109,21 +109,17 @@ class OptionDataCollector:
         return strikes
 
     @staticmethod
-    def _compute_weekly_expiry(dt: date) -> str:
-        """Compute the NIFTY weekly expiry (Thursday) for a given trade date.
+    def _compute_weekly_expiry(dt: date) -> date:
+        """Compute the weekly expiry date (Thursday) for a given trade date.
 
-        Returns expiry in DDMMMYY format (e.g. '13FEB26').
         Weekly options expire on Thursday. For any date, find the nearest
         Thursday on or after that date.
         """
         # Thursday = weekday 3
         days_ahead = (3 - dt.weekday()) % 7
         if days_ahead == 0:
-            # dt is Thursday — expiry is today
-            expiry_date = dt
-        else:
-            expiry_date = dt + timedelta(days=days_ahead)
-        return expiry_date.strftime("%d%b%y").upper()
+            return dt
+        return dt + timedelta(days=days_ahead)
 
     async def _save_candles(
         self,
@@ -223,7 +219,8 @@ class OptionDataCollector:
 
         # Get expiry — compute algorithmically (nearest Thursday)
         if expiry_str is None:
-            expiry_str = self._compute_weekly_expiry(dt)
+            expiry_date = self._compute_weekly_expiry(dt)
+            expiry_str = instrument.format_expiry(expiry_date)
 
         strikes = self._get_strikes_for_range(instrument, day_low, day_high)
         logger.info(
@@ -247,7 +244,7 @@ class OptionDataCollector:
                     continue
 
                 candles = self.angel.get_candle_data(
-                    token_info["symboltoken"], "NFO", "ONE_MINUTE",
+                    token_info["symboltoken"], instrument.option_exchange.value, "ONE_MINUTE",
                     f"{date_str} 09:15", f"{date_str} 15:30",
                 )
                 time_mod.sleep(0.4)  # Rate limit

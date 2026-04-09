@@ -80,16 +80,17 @@ class AngelOneClient:
             self._instrument_master = []
             return self._instrument_master
 
-        # Build NFO symbol -> token index for fast option lookups
+        # Build derivative symbol -> token index for fast option lookups (NFO + BFO)
         for item in self._instrument_master:
-            if item.get("exch_seg") == self.nfo_exchange:
+            if item.get("exch_seg") in (self.nfo_exchange, "BFO"):
                 sym = item.get("symbol", "")
                 if sym:
                     self._nfo_symbol_index[sym] = {
                         "tradingsymbol": sym,
                         "symboltoken": item.get("token", ""),
+                        "exch_seg": item.get("exch_seg", ""),
                     }
-        logger.info("NFO symbol index built: %d entries", len(self._nfo_symbol_index))
+        logger.info("Derivative symbol index built: %d entries (NFO+BFO)", len(self._nfo_symbol_index))
         return self._instrument_master
 
     def get_lot_size(self, symbol_name: str) -> int | None:
