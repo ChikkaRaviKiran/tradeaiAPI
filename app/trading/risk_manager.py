@@ -49,8 +49,15 @@ class RiskManager:
         self.max_concurrent = max_concurrent or settings.max_concurrent_positions
         self.consecutive_loss_limit = consecutive_limit or settings.consecutive_loss_limit
 
-    def can_trade(self, today_trades: list[Trade], open_count: int = 0) -> bool:
-        """Check if a new trade is allowed based on risk rules."""
+    def can_trade(self, today_trades: list[Trade], open_count: int = 0, instrument: str = "", open_trades: list[Trade] | None = None) -> bool:
+        """Check if a new trade is allowed based on risk rules.
+
+        Args:
+            today_trades: All trades taken today (open + closed).
+            open_count: Total open positions across all instruments.
+            instrument: If provided, also enforce per-instrument concurrent limit.
+            open_trades: If provided, list of currently open trades (for per-instrument check).
+        """
         today = datetime.now(_IST).date().isoformat()
         todays = [t for t in today_trades if t.date == today]
 
@@ -59,10 +66,18 @@ class RiskManager:
             logger.warning("Max daily trades reached (%d)", self.max_trades)
             return False
 
-        # Max concurrent positions
+        # Max concurrent positions (global)
         if open_count >= self.max_concurrent:
             logger.warning("Max concurrent positions reached (%d)", self.max_concurrent)
             return False
+
+        # Per-instrument concurrent limit
+        if instrument and open_trades is not None:
+            max_per_inst = settings.max_concurrent_per_instrument
+            inst_open = sum(1 for t in open_trades if t.instrument == instrument)
+            if inst_open >= max_per_inst:
+                logger.warning("Max concurrent per-instrument reached for %s (%d)", instrument, max_per_inst)
+                return False
 
         # Daily loss limit
         daily_pnl = sum(t.pnl or 0 for t in todays if t.status == TradeStatus.CLOSED)
@@ -81,21 +96,22 @@ class RiskManager:
 
         return True
 
-    def compute_position_size(self, entry_price: float, stoploss: float) -> int:
-        """Compute position size based on 1% risk per trade.
+    def compute_position_size(self, entry_price: float, stoploss: float, lot_size: int = 0, allocated_capital: float = 0) -> int:
+        """Compute position size based on risk per trade.
 
-        Risk per trade = capital × risk_per_trade_pct / 100
-        Lots = risk_amount / (entry - stoploss) / lot_size
+        If allocated_capital is provided, uses that instead of total capital.
+        Uses instrument-specific lot_size if provided.
 
         Returns the number of lots (minimum 1).
         """
-        risk_amount = self.capital * (self.risk_per_trade_pct / 100)
+        capital = allocated_capital if allocated_capital > 0 else self.capital
+        risk_amount = capital * (self.risk_per_trade_pct / 100)
         per_unit_risk = abs(entry_price - stoploss)
         if per_unit_risk <= 0:
             return 1
 
-        lot_size = settings.nifty_lot_size
-        max_lots = int(risk_amount / (per_unit_risk * lot_size))
+        ls = lot_size if lot_size > 0 else settings.nifty_lot_size
+        max_lots = int(risk_amount / (per_unit_risk * ls))
         return max(1, max_lots)
 
     def compute_stoploss(self, entry_price: float, sl_pct: float = 0.27) -> float:

@@ -252,6 +252,8 @@ class Orchestrator:
         self._instrument_strategies: dict[str, list] = {}
         # Eval score boost: {(symbol, strategy_name): composite_score}
         self._eval_scores: dict[tuple[str, str], float] = {}
+        # Per-instrument capital allocation: {symbol: allocated_amount}
+        self._instrument_capital: dict[str, float] = {}
 
         # State — per instrument
         self.running = False
@@ -403,6 +405,8 @@ class Orchestrator:
         self._no_trade_day = {}
         self._best_score_today = {}
         self._missed_signals = []
+        self._instrument_capital = {}
+        self._instrument_strategies = {}
         self.snapshot = None
         self._last_heartbeat_cycle = 0
         self._consecutive_no_signal = 0
@@ -731,6 +735,7 @@ class Orchestrator:
                 await self._run_post_market_evaluation()
                 await self._collect_daily_option_data()
                 await self._collect_daily_index_candles()
+                await self._cleanup_old_data()
                 self.running = False
                 logger.info("Trading day complete. Will restart next trading day.")
                 return
@@ -1322,6 +1327,13 @@ class Orchestrator:
                 )
                 logger.info("[%s] Day classified as: %s", symbol, self.day_type.value)
 
+                # 10AM re-selection: re-pick strategies now that we know the day type
+                try:
+                    await self._run_strategy_selection(day_type_str=self.day_type.value)
+                    logger.info("[%s] 10AM strategy re-selection with day_type=%s", symbol, self.day_type.value)
+                except Exception:
+                    logger.exception("10AM strategy re-selection failed")
+
             # 7. Check exits on open trades for this instrument
             await self._check_trade_exits_for(instrument, spot_price)
 
@@ -1331,10 +1343,12 @@ class Orchestrator:
                 self._log_event("gate", f"Past {NO_NEW_ENTRY_AFTER} — no new entries", cycle=cycle, instrument=symbol)
                 return
 
-            # 8b. Global risk check
+            # 8b. Global risk check + per-instrument concurrent limit
             if not self.risk_manager.can_trade(
                 self.paper_trader.all_today_trades,
                 open_count=len(self.paper_trader.open_trades),
+                instrument=symbol,
+                open_trades=self.paper_trader.open_trades,
             ):
                 logger.info("[%s][Cycle %d] Risk limits reached", symbol, cycle)
                 self._log_event("gate", "Risk limits reached — skipping", cycle=cycle, instrument=symbol)
@@ -1381,10 +1395,11 @@ class Orchestrator:
                     cycle=cycle, instrument=symbol,
                 )
 
-            # LOCKED v1.0: Run fixed 5 strategies, filtered by regime
+            # Run strategies — per-instrument selection if available, else defaults
             daily_levels = self._daily_levels.get(symbol)
             signals: list[StrategySignal] = []
-            for strategy in self.strategies:
+            active_strategies = self._instrument_strategies.get(symbol, self.strategies)
+            for strategy in active_strategies:
                 # Regime-strategy filtering: skip strategies that don't fit current regime
                 if not _strategy_compatible_with_regime(strategy, regime):
                     continue
@@ -1857,9 +1872,12 @@ class Orchestrator:
                 expiry or "", best_signal.strike_price, best_signal.option_type.value
             )
 
-            # 14. Position size
+            # 14. Position size — use per-instrument allocated capital
+            allocated_cap = self._instrument_capital.get(symbol, settings.initial_capital / len(self._active_instruments)) if self._active_instruments else settings.initial_capital
             num_lots = self.risk_manager.compute_position_size(
-                decision.entry_price, decision.stoploss
+                decision.entry_price, decision.stoploss,
+                lot_size=instrument.lot_size,
+                allocated_capital=allocated_cap,
             )
 
             # 15. Enter trade (use instrument-specific lot size)
@@ -2897,18 +2915,21 @@ class Orchestrator:
         except Exception:
             logger.exception("Error in pre-market evaluation — will use existing data or config fallback")
 
-    async def _run_strategy_selection(self) -> None:
-        """Select best strategies for today's conditions using StrategySelector.
+    async def _run_strategy_selection(self, day_type_str: str = "") -> None:
+        """Select best strategies per instrument using StrategySelector.
 
-        Runs after pre-market evaluation. Queries strategy_condition_performance
-        to pick strategies with best historical performance for today's conditions.
-        Only selects from the 5 LOCKED strategies.
+        Runs:
+          - Pre-market: uses pre-market conditions (gap, VIX, bias)
+          - 10:00 AM re-selection: includes actual day_type classification
+
+        Populates _instrument_strategies per instrument.
+        Falls back to TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB per instrument.
+        Also computes capital allocation based on win rates.
         """
         try:
             from app.engine.strategy_selector import MarketConditions
             from app.db.models import AsyncSessionLocal
 
-            # Build today's market conditions from available data
             insight = self.pre_market_analyst.latest_insight or {}
             vix_val = 0.0
             for gi in self.global_indices:
@@ -2919,7 +2940,6 @@ class Orchestrator:
             gap_pct = 0.0
             bias_str = insight.get("market_bias", "neutral")
 
-            # Map from strategy DB name → class instance from our locked list
             _LOCKED_NAME_MAP = {
                 "ORB": ORBStrategy,
                 "VWAP_RECLAIM": VWAPReclaimStrategy,
@@ -2929,13 +2949,30 @@ class Orchestrator:
                 "MOMENTUM_BREAKOUT": MomentumBreakoutStrategy,
             }
 
+            _DEFAULT_STRATEGIES = [
+                TrendPullbackStrategy(),
+                MomentumBreakoutStrategy(),
+                ORBStrategy(),
+            ]
+
+            # Per-instrument win rates for capital allocation
+            inst_win_rates: dict[str, float] = {}
+
             for instrument in self._active_instruments:
                 symbol = instrument.symbol
+                # Convert day_type string to enum
+                dt_enum = DayType.PENDING
+                if day_type_str:
+                    try:
+                        dt_enum = DayType(day_type_str)
+                    except ValueError:
+                        dt_enum = DayType.PENDING
                 conditions = MarketConditions(
                     instrument=symbol,
                     gap_pct=gap_pct,
                     vix=vix_val,
                     global_bias=bias_str,
+                    day_type=dt_enum,
                 )
 
                 async with AsyncSessionLocal() as session:
@@ -2953,45 +2990,144 @@ class Orchestrator:
                         symbol, strategy_names, result.condition_key,
                     )
 
-                    # Only use strategies from the locked set
                     selected = []
                     for name in strategy_names:
                         cls = _LOCKED_NAME_MAP.get(name)
                         if cls:
                             selected.append(cls())
                     if selected:
-                        self.strategies = selected
+                        self._instrument_strategies[symbol] = selected
+                        # Avg win rate from selected strategies for capital allocation
+                        avg_wr = sum(p.probability for p in result.selected) / len(result.selected) if result.selected else 50.0
+                        inst_win_rates[symbol] = avg_wr
                         logger.info(
-                            "[%s] Active strategies updated: %s",
-                            symbol, [type(s).__name__ for s in selected],
+                            "[%s] Per-instrument strategies: %s (avg WR=%.1f%%)",
+                            symbol, [type(s).__name__ for s in selected], avg_wr,
                         )
                     else:
+                        self._instrument_strategies[symbol] = list(_DEFAULT_STRATEGIES)
+                        inst_win_rates[symbol] = 50.0
                         self._log_event(
                             "selection",
-                            f"[{symbol}] No locked strategies matched selection — using defaults (TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB)",
+                            f"[{symbol}] No locked strategies matched — defaults (TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB)",
                             instrument=symbol,
                         )
                 else:
+                    self._instrument_strategies[symbol] = list(_DEFAULT_STRATEGIES)
+                    inst_win_rates[symbol] = 50.0
                     self._log_event(
                         "selection",
-                        f"[{symbol}] No condition data — using defaults (TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB)",
+                        f"[{symbol}] No condition data — defaults (TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB)",
                         instrument=symbol,
                     )
 
-            # Send alert with today's strategy selection
+            # Also update shared self.strategies with union of all per-instrument
+            all_strat_classes = set()
+            for strats in self._instrument_strategies.values():
+                for s in strats:
+                    all_strat_classes.add(type(s).__name__)
+            if all_strat_classes:
+                self.strategies = []
+                for name, cls in _LOCKED_NAME_MAP.items():
+                    if cls.__name__ in all_strat_classes:
+                        self.strategies.append(cls())
+
+            # Capital allocation based on win rates
+            self._compute_capital_allocation(inst_win_rates)
+
+            # Send alert
             selections = self.strategy_selector.latest_selections
             if selections:
                 lines = []
                 for sym, sel in selections.items():
                     strats = ", ".join(f"{p.strategy}({p.probability:.0f}%)" for p in sel.selected)
-                    lines.append(f"{sym}: {strats}" if strats else f"{sym}: all 5 defaults")
+                    cap = self._instrument_capital.get(sym, 0)
+                    lines.append(f"{sym}: {strats} | ₹{cap:,.0f}" if strats else f"{sym}: defaults | ₹{cap:,.0f}")
                 await self.alert_manager.send_info(
-                    "STRATEGY SELECTION",
+                    "STRATEGY SELECTION" + (" (10AM re-select)" if day_type_str else ""),
                     "\n".join(lines) + f"\nCondition: {sel.condition_key if sel else 'N/A'}",
                 )
 
         except Exception:
             logger.exception("Strategy selection failed — using default strategies")
+            # Ensure every instrument has defaults
+            for instrument in self._active_instruments:
+                if instrument.symbol not in self._instrument_strategies:
+                    self._instrument_strategies[instrument.symbol] = [
+                        TrendPullbackStrategy(), MomentumBreakoutStrategy(), ORBStrategy(),
+                    ]
+
+    def _compute_capital_allocation(self, inst_win_rates: dict[str, float]) -> None:
+        """Allocate capital between instruments proportional to win rates.
+
+        Higher win-rate instruments get more capital. Minimum 20% per instrument.
+        """
+        total_capital = settings.initial_capital
+        instruments = list(inst_win_rates.keys())
+
+        if not instruments:
+            return
+
+        if len(instruments) == 1:
+            self._instrument_capital[instruments[0]] = total_capital
+            logger.info("Capital allocation: %s = ₹%,.0f (single instrument)", instruments[0], total_capital)
+            return
+
+        # Weight by win rate, with minimum floor of 20%
+        total_wr = sum(inst_win_rates.values())
+        if total_wr <= 0:
+            # Equal split
+            per_inst = total_capital / len(instruments)
+            for sym in instruments:
+                self._instrument_capital[sym] = per_inst
+            return
+
+        MIN_ALLOC_PCT = 0.20  # Each instrument gets at least 20%
+        min_amount = total_capital * MIN_ALLOC_PCT
+        remaining = total_capital - min_amount * len(instruments)
+
+        for sym in instruments:
+            wr_share = inst_win_rates[sym] / total_wr
+            self._instrument_capital[sym] = round(min_amount + remaining * wr_share, 2)
+
+        alloc_str = ", ".join(f"{s}=₹{self._instrument_capital[s]:,.0f}" for s in instruments)
+        logger.info("Capital allocation: %s (total=₹%,.0f)", alloc_str, total_capital)
+
+    async def _cleanup_old_data(self) -> None:
+        """Remove old data from non-essential DB tables after market close.
+
+        Keeps: trades, option_candles, index_candles, daily_reports (permanent).
+        Cleans: market_snapshots, signals, alert_records older than 90 days.
+        """
+        try:
+            from app.db.models import AsyncSessionLocal
+            from sqlalchemy import text as _sql_text
+            cutoff_date = (datetime.now(IST) - timedelta(days=90)).strftime("%Y-%m-%d")
+            logger.info("DB cleanup: removing data older than %s...", cutoff_date)
+
+            async with AsyncSessionLocal() as session:
+                tables = [
+                    ("market_snapshots", "date"),
+                    ("signals", "date"),
+                    ("alert_records", "date"),
+                    ("strategy_condition_performance", "eval_date"),
+                    ("strategy_evaluations", "eval_date"),
+                ]
+                total_deleted = 0
+                for table, col in tables:
+                    result = await session.execute(
+                        _sql_text(f"DELETE FROM {table} WHERE {col} < :cutoff"),
+                        {"cutoff": cutoff_date},
+                    )
+                    count = result.rowcount
+                    total_deleted += count
+                    if count > 0:
+                        logger.info("  %s: deleted %d old rows", table, count)
+                await session.commit()
+
+            logger.info("DB cleanup done: %d total rows removed", total_deleted)
+        except Exception:
+            logger.exception("Error during DB cleanup")
 
     async def _run_post_market_evaluation(self) -> None:
         """Run strategy evaluation after daily report — ranks strategies for next day."""

@@ -36,21 +36,27 @@ from app.engine.feature_engine import FeatureEngine
 from app.engine.regime_detector import RegimeDetector
 from app.strategies.base import BaseStrategy
 from app.strategies.liquidity_sweep import LiquiditySweepStrategy
+from app.strategies.momentum_breakout import MomentumBreakoutStrategy
 from app.strategies.orb import ORBStrategy
 from app.strategies.range_breakout import RangeBreakoutStrategy
 from app.strategies.trend_pullback import TrendPullbackStrategy
 from app.strategies.vwap_reclaim import VWAPReclaimStrategy
+from app.trading.smart_exit import SmartExitEngine, ExitResult
+from app.core.models import DayType as DayTypeEnum, OptionType, StrategyName, Trade, TradeStatus, TechnicalIndicators
+from app.engine.feature_engine import compute_market_structure
+import app.trading.smart_exit as _se_mod
+import app.trading.risk_manager as _rm_mod
 
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
 
 # ── All available strategies ─────────────────────────────────────────────
 
-# LOCKED v1.0: Only evaluate the 5 active strategies
 _STRATEGY_REGISTRY: list[tuple[str, BaseStrategy]] = [
+    ("TREND_PULLBACK", TrendPullbackStrategy()),
+    ("MOMENTUM_BREAKOUT", MomentumBreakoutStrategy()),
     ("ORB", ORBStrategy()),
     ("VWAP_RECLAIM", VWAPReclaimStrategy()),
-    ("TREND_PULLBACK", TrendPullbackStrategy()),
     ("LIQUIDITY_SWEEP", LiquiditySweepStrategy()),
     ("RANGE_BREAKOUT", RangeBreakoutStrategy()),
 ]
@@ -681,16 +687,17 @@ class StrategyEvaluator:
         """Walk through a single day's candles, looking for signal → simulating exit.
 
         Only takes the FIRST signal per day (like live trading).
-        Uses remaining candles after signal to simulate SL/T1/T2/EOD exit.
+
+        Exit simulation priority:
+          1. If DB has option candles for the signal's strike → use SmartExitEngine
+             (production-faithful, same as live trading).
+          2. Otherwise → fall back to spot-based SL/T1/T2 proxy.
         """
         n = len(df)
-        # Start scanning after warmup (bar 30 = ~2.5 hours into session with 5m candles)
-        scan_start = 30
-        # Stop scanning 6 bars before close (30 min buffer)
-        scan_end = max(scan_start + 1, n - 6)
+        scan_start = 30   # warmup bars
+        scan_end = max(scan_start + 1, n - 6)  # 6-bar buffer before close
 
         for i in range(scan_start, scan_end):
-            # Feed strategy the candles up to bar i
             partial_df = df.iloc[: i + 1].copy()
             spot = partial_df.iloc[-1]["close"]
 
@@ -698,71 +705,67 @@ class StrategyEvaluator:
             if signal is None:
                 continue
 
-            # Signal fired! Now walk forward to simulate the trade
+            # ── Signal fired ──────────────────────────────────────────
             entry_bar = df.iloc[i]
-            entry_price = entry_bar["close"]
+            spot_price = float(entry_bar["close"])
             atr = entry_bar.get("atr", 0)
             if atr is None or atr <= 0:
-                atr = entry_price * 0.005  # 0.5% fallback
-
-            # ATR-based SL/targets (same as live)
+                atr = spot_price * 0.005
             option_atr = atr * 0.5
-            sl = round(max(entry_price - 1.5 * option_atr, entry_price * 0.70), 2)
-            t1 = round(entry_price + 2.0 * option_atr, 2)
-            t2 = round(entry_price + 3.5 * option_atr, 2)
 
-            # Walk forward through remaining candles
-            exit_price = entry_price
+            opt_type = signal.option_type.value  # "CE" or "PE"
+
+            # Compute ATM strike
+            strike = round(spot_price / instrument.strike_interval) * instrument.strike_interval
+
+            # Try option candle exit (production-faithful)
+            opt_df = self._load_option_candles_sync(instrument, date_str, strike, opt_type)
+            if opt_df is not None and len(opt_df) >= 10:
+                result = self._simulate_exit_with_smart_engine(
+                    instrument, opt_df, df, entry_bar, strike, opt_type,
+                    strat_name, date_str, option_atr,
+                )
+                if result is not None:
+                    return result
+
+            # ── Fallback: spot-based proxy simulation ─────────────────
+            sl = round(max(spot_price - 1.5 * option_atr, spot_price * 0.70), 2)
+            t1 = round(spot_price + 2.0 * option_atr, 2)
+            t2 = round(spot_price + 3.5 * option_atr, 2)
+
+            exit_price = spot_price
             exit_reason = "eod_close"
 
             for j in range(i + 1, n):
                 bar = df.iloc[j]
-                low = bar["low"]
-                high = bar["high"]
+                low, high = bar["low"], bar["high"]
 
-                # Check stoploss (use low for long positions)
-                if signal.option_type.value == "CE":
-                    # Long call — if underlying drops, option drops
-                    if low <= entry_price - (entry_price - sl):
-                        exit_price = sl
-                        exit_reason = "stoploss"
-                        break
-                    if high >= entry_price + (t2 - entry_price):
-                        exit_price = t2
-                        exit_reason = "target2"
-                        break
-                    if high >= entry_price + (t1 - entry_price):
-                        exit_price = t1
-                        exit_reason = "target1"
-                        break
+                if opt_type == "CE":
+                    if low <= spot_price - (spot_price - sl):
+                        exit_price, exit_reason = sl, "stoploss"; break
+                    if high >= spot_price + (t2 - spot_price):
+                        exit_price, exit_reason = t2, "target2"; break
+                    if high >= spot_price + (t1 - spot_price):
+                        exit_price, exit_reason = t1, "target1"; break
                 else:
-                    # Long put — if underlying rises, option drops
-                    if high >= entry_price + (entry_price - sl):
-                        exit_price = sl
-                        exit_reason = "stoploss"
-                        break
-                    if low <= entry_price - (t2 - entry_price):
-                        exit_price = t2
-                        exit_reason = "target2"
-                        break
-                    if low <= entry_price - (t1 - entry_price):
-                        exit_price = t1
-                        exit_reason = "target1"
-                        break
+                    if high >= spot_price + (spot_price - sl):
+                        exit_price, exit_reason = sl, "stoploss"; break
+                    if low <= spot_price - (t2 - spot_price):
+                        exit_price, exit_reason = t2, "target2"; break
+                    if low <= spot_price - (t1 - spot_price):
+                        exit_price, exit_reason = t1, "target1"; break
 
             if exit_reason == "eod_close":
-                exit_price = df.iloc[-1]["close"]
-                # For EOD, PnL depends on direction
-                if signal.option_type.value == "CE":
-                    # CE profits when underlying rises
-                    movement = (exit_price - entry_price)
-                    exit_price = entry_price + movement * 0.5  # ~delta 0.5
+                last_close = df.iloc[-1]["close"]
+                if opt_type == "CE":
+                    movement = (last_close - spot_price)
+                    exit_price = spot_price + movement * 0.5
                 else:
-                    movement = (entry_price - exit_price)
-                    exit_price = entry_price + movement * 0.5
+                    movement = (spot_price - last_close)
+                    exit_price = spot_price + movement * 0.5
 
-            pnl = (exit_price - entry_price) * instrument.lot_size
-            pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            pnl = (exit_price - spot_price) * instrument.lot_size
+            pnl_pct = ((exit_price - spot_price) / spot_price * 100) if spot_price > 0 else 0
 
             entry_time = ""
             if hasattr(entry_bar, "name"):
@@ -775,9 +778,9 @@ class StrategyEvaluator:
                 date=date_str,
                 instrument=instrument.symbol,
                 strategy=strat_name,
-                option_type=signal.option_type.value,
+                option_type=opt_type,
                 entry_time=entry_time,
-                entry_price=round(entry_price, 2),
+                entry_price=round(spot_price, 2),
                 exit_price=round(exit_price, 2),
                 stoploss=sl,
                 target1=t1,
@@ -788,6 +791,276 @@ class StrategyEvaluator:
             )
 
         return None  # No signal this day
+
+    # ── Option candle helpers ─────────────────────────────────────────────
+
+    def _load_option_candles_sync(
+        self,
+        instrument: InstrumentConfig,
+        date_str: str,
+        strike: float,
+        opt_type: str,
+    ) -> Optional[pd.DataFrame]:
+        """Load option candles from DB for a specific strike/date. Synchronous wrapper."""
+        import asyncio
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Already in async context — use thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    return pool.submit(
+                        asyncio.run, self._load_option_candles(instrument, date_str, strike, opt_type)
+                    ).result(timeout=10)
+            return loop.run_until_complete(
+                self._load_option_candles(instrument, date_str, strike, opt_type)
+            )
+        except RuntimeError:
+            return asyncio.run(self._load_option_candles(instrument, date_str, strike, opt_type))
+        except Exception:
+            return None
+
+    async def _load_option_candles(
+        self,
+        instrument: InstrumentConfig,
+        date_str: str,
+        strike: float,
+        opt_type: str,
+    ) -> Optional[pd.DataFrame]:
+        """Load 1-min option candles from the option_candles DB table."""
+        async with self._session_factory() as session:
+            result = await session.execute(
+                text(
+                    "SELECT timestamp, open, high, low, close, volume "
+                    "FROM option_candles "
+                    "WHERE instrument = :inst AND date = :dt "
+                    "  AND strike = :strike AND option_type = :ot "
+                    "ORDER BY timestamp"
+                ),
+                {"inst": instrument.symbol, "dt": date_str, "strike": strike, "ot": opt_type},
+            )
+            rows = result.fetchall()
+
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("Asia/Kolkata")
+        return df
+
+    def _simulate_exit_with_smart_engine(
+        self,
+        instrument: InstrumentConfig,
+        opt_df: pd.DataFrame,
+        spot_df: pd.DataFrame,
+        entry_bar,
+        strike: float,
+        opt_type: str,
+        strat_name: str,
+        date_str: str,
+        option_atr: float,
+    ) -> Optional[EvalTrade]:
+        """Simulate trade exit using SmartExitEngine.evaluate() on real option candles.
+
+        This is production-faithful: same engine, same exit hierarchy.
+        datetime.now() is monkey-patched per bar so grace period / time exits work.
+        """
+        from datetime import time as dtime
+
+        smart_exit = SmartExitEngine()
+
+        # Build entry from the option candle at signal time
+        entry_ts = entry_bar.name
+        if hasattr(entry_ts, 'tz_localize') and entry_ts.tz is None:
+            entry_ts = entry_ts.tz_localize("Asia/Kolkata")
+
+        # Find option candle at or after entry time
+        entry_opt_idx = None
+        for idx in range(len(opt_df)):
+            if opt_df.index[idx] >= entry_ts:
+                entry_opt_idx = idx
+                break
+        if entry_opt_idx is None:
+            return None
+
+        entry_opt_price = float(opt_df.iloc[entry_opt_idx]["close"])
+        if entry_opt_price <= 0:
+            return None
+
+        # ATR-based SL/targets (same as production orchestrator)
+        sl = round(max(entry_opt_price - 1.5 * option_atr, entry_opt_price * 0.70), 2)
+        t1 = round(entry_opt_price + 2.0 * option_atr, 2)
+        t2 = round(entry_opt_price + 3.5 * option_atr, 2)
+
+        # Build Trade object (same schema as production)
+        entry_dt = opt_df.index[entry_opt_idx].to_pydatetime()
+        if entry_dt.tzinfo is None:
+            entry_dt = _IST.localize(entry_dt)
+
+        trade = Trade(
+            trade_id=f"EVAL-{date_str}-{strat_name[:4]}",
+            instrument=instrument.symbol,
+            engine="v2",
+            date=date_str,
+            time=entry_dt.strftime("%H:%M:%S"),
+            symbol=f"{instrument.symbol}{int(strike)}{opt_type}",
+            strike=strike,
+            option_type=OptionType.CALL if opt_type == "CE" else OptionType.PUT,
+            strategy=StrategyName(strat_name),
+            entry_price=entry_opt_price,
+            stoploss=sl,
+            target1=t1,
+            target2=t2,
+            status=TradeStatus.OPEN,
+            lot_size=instrument.lot_size,
+            entry_datetime=entry_dt,
+            max_hold_minutes=120,
+        )
+
+        # Day type from spot data
+        day_type = DayTypeEnum.UNCLEAR
+
+        original_dt_se = _se_mod.datetime
+        original_dt_rm = _rm_mod.datetime
+
+        try:
+            for idx in range(entry_opt_idx + 1, len(opt_df)):
+                bar = opt_df.iloc[idx]
+                bar_time = opt_df.index[idx]
+                ltp = float(bar["close"])
+                bar_high = float(bar["high"])
+
+                # Get spot price at this timestamp
+                spot_price = 0.0
+                rsi_val = 50.0
+                candidates = spot_df[spot_df.index <= bar_time]
+                if len(candidates) > 0:
+                    spot_row = candidates.iloc[-1]
+                    spot_price = float(spot_row["close"])
+                    rsi_raw = spot_row.get("rsi")
+                    if rsi_raw is not None and not pd.isna(rsi_raw):
+                        rsi_val = float(rsi_raw)
+
+                snap = MarketSnapshot(
+                    instrument=instrument.symbol,
+                    price=spot_price,
+                    indicators=TechnicalIndicators(rsi=rsi_val),
+                )
+
+                # Monkey-patch datetime.now() for this bar
+                bar_dt = bar_time.to_pydatetime()
+                if bar_dt.tzinfo is None:
+                    bar_dt = _IST.localize(bar_dt)
+
+                class _FakeDatetime(type(original_dt_se)):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return bar_dt
+
+                _se_mod.datetime = _FakeDatetime
+                _rm_mod.datetime = _FakeDatetime
+
+                result = smart_exit.evaluate(
+                    trade=trade,
+                    current_ltp=ltp,
+                    snap=snap,
+                    day_type=day_type,
+                    spot_price=spot_price,
+                    candle_closed=True,
+                    option_atr=option_atr,
+                )
+
+                _se_mod.datetime = original_dt_se
+                _rm_mod.datetime = original_dt_rm
+
+                # Target check on bar high (production checks on tick)
+                if not result.should_exit:
+                    if bar_high >= trade.target2:
+                        result = ExitResult(
+                            should_exit=True, exit_type="target2",
+                            exit_price=trade.target2,
+                            reason=f"T2 hit: high={bar_high:.2f}",
+                        )
+                    elif bar_high >= trade.target1:
+                        result = ExitResult(
+                            should_exit=True, exit_type="target1",
+                            exit_price=trade.target1,
+                            reason=f"T1 hit: high={bar_high:.2f}",
+                        )
+
+                # Update trailing SL
+                if result.new_stoploss is not None and not result.should_exit:
+                    trade.stoploss = result.new_stoploss
+
+                if result.should_exit:
+                    exit_price = result.exit_price
+                    pnl = (exit_price - entry_opt_price) * instrument.lot_size
+                    pnl_pct = ((exit_price - entry_opt_price) / entry_opt_price * 100) if entry_opt_price > 0 else 0
+                    return EvalTrade(
+                        date=date_str,
+                        instrument=instrument.symbol,
+                        strategy=strat_name,
+                        option_type=opt_type,
+                        entry_time=str(entry_dt),
+                        entry_price=round(entry_opt_price, 2),
+                        exit_price=round(exit_price, 2),
+                        stoploss=sl,
+                        target1=t1,
+                        target2=t2,
+                        pnl=round(pnl, 2),
+                        pnl_pct=round(pnl_pct, 2),
+                        exit_reason=result.exit_type,
+                    )
+
+                # EOD forced close
+                bt = bar_time.time() if hasattr(bar_time, 'time') else bar_time.to_pydatetime().time()
+                if bt >= dtime(15, 10):
+                    exit_price = ltp
+                    pnl = (exit_price - entry_opt_price) * instrument.lot_size
+                    pnl_pct = ((exit_price - entry_opt_price) / entry_opt_price * 100) if entry_opt_price > 0 else 0
+                    return EvalTrade(
+                        date=date_str,
+                        instrument=instrument.symbol,
+                        strategy=strat_name,
+                        option_type=opt_type,
+                        entry_time=str(entry_dt),
+                        entry_price=round(entry_opt_price, 2),
+                        exit_price=round(exit_price, 2),
+                        stoploss=sl,
+                        target1=t1,
+                        target2=t2,
+                        pnl=round(pnl, 2),
+                        pnl_pct=round(pnl_pct, 2),
+                        exit_reason="eod_close",
+                    )
+
+        finally:
+            _se_mod.datetime = original_dt_se
+            _rm_mod.datetime = original_dt_rm
+
+        # If we ran out of option candles, use last close
+        last_ltp = float(opt_df.iloc[-1]["close"])
+        pnl = (last_ltp - entry_opt_price) * instrument.lot_size
+        pnl_pct = ((last_ltp - entry_opt_price) / entry_opt_price * 100) if entry_opt_price > 0 else 0
+        return EvalTrade(
+            date=date_str,
+            instrument=instrument.symbol,
+            strategy=strat_name,
+            option_type=opt_type,
+            entry_time=str(entry_dt),
+            entry_price=round(entry_opt_price, 2),
+            exit_price=round(last_ltp, 2),
+            stoploss=sl,
+            target1=t1,
+            target2=t2,
+            pnl=round(pnl, 2),
+            pnl_pct=round(pnl_pct, 2),
+            exit_reason="eod_close",
+        )
 
     def _get_trades_for(
         self,

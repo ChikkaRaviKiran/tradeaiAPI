@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pyotp
 import pytz
@@ -993,3 +993,225 @@ async def re_authenticate_broker():
     if success:
         return {"success": True, "message": "Re-authenticated successfully"}
     return {"success": False, "error": "Authentication failed — check logs for details"}
+
+
+# ── Strategy Analytics & Today's Plan ─────────────────────────────────────
+
+@app.get("/api/strategy-analytics")
+async def get_strategy_analytics():
+    """Comprehensive strategy performance data for the dashboard.
+
+    Returns:
+        - Per-strategy per-instrument historical backtest metrics
+        - Evaluation history (last 30 days)
+        - Today's trading plan (strategies, capital allocation)
+        - Overall system stats
+    """
+    from app.db.models import AsyncSessionLocal
+    from sqlalchemy import text as _sql_text
+
+    orch = _state.get("orchestrator")
+    today = datetime.now(_IST).strftime("%Y-%m-%d")
+
+    result = {
+        "today": today,
+        "today_plan": {},
+        "strategy_rankings": [],
+        "condition_performance": [],
+        "eval_history": [],
+        "trade_stats": {},
+        "data_coverage": {},
+    }
+
+    try:
+        async with AsyncSessionLocal() as session:
+            # 1. Latest strategy evaluation rankings
+            rows = await session.execute(
+                _sql_text(
+                    "SELECT eval_date, instrument, strategy, rank, win_rate, "
+                    "profit_factor, sharpe_ratio, total_pnl, total_trades, "
+                    "avg_pnl, max_drawdown, composite_score, signal_frequency, eval_days "
+                    "FROM strategy_evaluations "
+                    "WHERE eval_date = (SELECT MAX(eval_date) FROM strategy_evaluations) "
+                    "ORDER BY rank"
+                )
+            )
+            for r in rows:
+                result["strategy_rankings"].append({
+                    "eval_date": r[0],
+                    "instrument": r[1],
+                    "strategy": r[2],
+                    "rank": r[3],
+                    "win_rate": round(r[4], 1),
+                    "profit_factor": round(r[5], 2),
+                    "sharpe_ratio": round(r[6], 2),
+                    "total_pnl": round(r[7], 2),
+                    "total_trades": r[8],
+                    "avg_pnl": round(r[9], 2),
+                    "max_drawdown": round(r[10], 2),
+                    "composite_score": round(r[11], 1),
+                    "signal_frequency": round(r[12], 3),
+                    "eval_days": r[13],
+                })
+
+            # 2. Best condition performance per strategy (latest eval, top conditions)
+            rows = await session.execute(
+                _sql_text(
+                    "SELECT instrument, strategy, condition_key, day_type, "
+                    "gap_bucket, vix_bucket, total_trades, win_rate, avg_pnl, "
+                    "profit_factor, composite_score, best_entry_window, probability, lookback_days "
+                    "FROM strategy_condition_performance "
+                    "WHERE eval_date = (SELECT MAX(eval_date) FROM strategy_condition_performance) "
+                    "  AND condition_key NOT LIKE 'any%%' "
+                    "  AND total_trades >= 3 "
+                    "ORDER BY composite_score DESC "
+                    "LIMIT 50"
+                )
+            )
+            for r in rows:
+                result["condition_performance"].append({
+                    "instrument": r[0],
+                    "strategy": r[1],
+                    "condition_key": r[2],
+                    "day_type": r[3],
+                    "gap_bucket": r[4],
+                    "vix_bucket": r[5],
+                    "total_trades": r[6],
+                    "win_rate": round(r[7], 1),
+                    "avg_pnl": round(r[8], 2),
+                    "profit_factor": round(r[9], 2),
+                    "composite_score": round(r[10], 1),
+                    "best_entry_window": r[11],
+                    "probability": round(r[12], 1),
+                    "lookback_days": r[13],
+                })
+
+            # 3. Evaluation history — composite scores over last 30 days
+            rows = await session.execute(
+                _sql_text(
+                    "SELECT eval_date, instrument, strategy, composite_score, "
+                    "win_rate, profit_factor, total_trades "
+                    "FROM strategy_evaluations "
+                    "WHERE eval_date >= :cutoff "
+                    "ORDER BY eval_date DESC, rank"
+                ),
+                {"cutoff": (datetime.now(_IST) - timedelta(days=30)).strftime("%Y-%m-%d")},
+            )
+            for r in rows:
+                result["eval_history"].append({
+                    "eval_date": r[0],
+                    "instrument": r[1],
+                    "strategy": r[2],
+                    "composite_score": round(r[3], 1),
+                    "win_rate": round(r[4], 1),
+                    "profit_factor": round(r[5], 2),
+                    "total_trades": r[6],
+                })
+
+            # 4. Trade stats from actual trades (all time)
+            rows = await session.execute(
+                _sql_text(
+                    "SELECT instrument, strategy, "
+                    "COUNT(*) as total, "
+                    "SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, "
+                    "COALESCE(SUM(pnl), 0) as total_pnl, "
+                    "COALESCE(AVG(pnl), 0) as avg_pnl, "
+                    "MIN(date) as first_trade, MAX(date) as last_trade "
+                    "FROM trades WHERE status = 'closed' "
+                    "GROUP BY instrument, strategy "
+                    "ORDER BY total_pnl DESC"
+                )
+            )
+            trade_stats = []
+            for r in rows:
+                total = r[2]
+                wins = r[3]
+                trade_stats.append({
+                    "instrument": r[0],
+                    "strategy": r[1],
+                    "total_trades": total,
+                    "wins": wins,
+                    "win_rate": round(wins / total * 100, 1) if total else 0,
+                    "total_pnl": round(r[4], 2),
+                    "avg_pnl": round(r[5], 2),
+                    "first_trade": r[6],
+                    "last_trade": r[7],
+                })
+            result["trade_stats"] = trade_stats
+
+            # 5. Data coverage — how many days of index/option candles
+            rows = await session.execute(
+                _sql_text(
+                    "SELECT instrument, COUNT(DISTINCT date) as days, "
+                    "MIN(date) as from_date, MAX(date) as to_date "
+                    "FROM index_candles GROUP BY instrument"
+                )
+            )
+            for r in rows:
+                result["data_coverage"][r[0]] = {
+                    "index_candle_days": r[1],
+                    "from": r[2],
+                    "to": r[3],
+                }
+
+            rows = await session.execute(
+                _sql_text(
+                    "SELECT instrument, COUNT(DISTINCT date) as days, "
+                    "MIN(date) as from_date, MAX(date) as to_date "
+                    "FROM option_candles GROUP BY instrument"
+                )
+            )
+            for r in rows:
+                sym = r[0]
+                if sym not in result["data_coverage"]:
+                    result["data_coverage"][sym] = {}
+                result["data_coverage"][sym]["option_candle_days"] = r[1]
+                result["data_coverage"][sym]["option_from"] = r[2]
+                result["data_coverage"][sym]["option_to"] = r[3]
+
+    except Exception:
+        logger.exception("Error fetching strategy analytics")
+
+    # 6. Today's plan from orchestrator
+    if orch:
+        plan = {}
+        for inst in getattr(orch, "_active_instruments", []):
+            sym = inst.symbol
+            strats = getattr(orch, "_instrument_strategies", {}).get(sym, [])
+            strat_names = [type(s).__name__.replace("Strategy", "").upper().replace("_", "_") for s in strats]
+            # Clean up names
+            clean_names = []
+            for s in strats:
+                name = type(s).__name__
+                # Map class names to DB strategy names
+                name_map = {
+                    "TrendPullbackStrategy": "TREND_PULLBACK",
+                    "MomentumBreakoutStrategy": "MOMENTUM_BREAKOUT",
+                    "ORBStrategy": "ORB",
+                    "VWAPReclaimStrategy": "VWAP_RECLAIM",
+                    "RangeBreakoutStrategy": "RANGE_BREAKOUT",
+                    "LiquiditySweepStrategy": "LIQUIDITY_SWEEP",
+                }
+                clean_names.append(name_map.get(name, name))
+
+            cap = getattr(orch, "_instrument_capital", {}).get(sym, 0)
+            plan[sym] = {
+                "strategies": clean_names,
+                "allocated_capital": round(cap, 0),
+                "lot_size": inst.lot_size,
+            }
+
+        day_type = "pending"
+        if hasattr(orch, "day_type") and orch.day_type:
+            day_type = orch.day_type.value
+
+        result["today_plan"] = {
+            "instruments": plan,
+            "day_type": day_type,
+            "total_capital": settings.initial_capital,
+            "max_concurrent": settings.max_concurrent_positions,
+            "max_per_instrument": settings.max_concurrent_per_instrument,
+            "max_trades_per_day": settings.max_trades_per_day,
+        }
+
+    return result

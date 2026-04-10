@@ -40,7 +40,8 @@ class Settings(BaseSettings):
     max_trades_per_day: int = Field(default=3, alias="MAX_TRADES_PER_DAY")  # LOCKED v1.0
     max_daily_loss_pct: float = Field(default=3.0, alias="MAX_DAILY_LOSS_PCT")
     risk_per_trade_pct: float = Field(default=1.0, alias="RISK_PER_TRADE_PCT")
-    max_concurrent_positions: int = Field(default=1, alias="MAX_CONCURRENT_POSITIONS")  # LOCKED v1.0 — 1 at a time on same underlying
+    max_concurrent_positions: int = Field(default=2, alias="MAX_CONCURRENT_POSITIONS")  # Total across all instruments
+    max_concurrent_per_instrument: int = Field(default=1, alias="MAX_CONCURRENT_PER_INSTRUMENT")  # Per-index limit
     consecutive_loss_limit: int = Field(default=3, alias="CONSECUTIVE_LOSS_LIMIT")
     nifty_lot_size: int = Field(default=65, alias="NIFTY_LOT_SIZE")
 
