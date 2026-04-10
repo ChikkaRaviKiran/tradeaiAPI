@@ -56,6 +56,7 @@ from app.strategies.base import BaseStrategy
 from app.strategies.liquidity_sweep import LiquiditySweepStrategy
 from app.strategies.orb import ORBStrategy
 from app.strategies.range_breakout import RangeBreakoutStrategy
+from app.strategies.momentum_breakout import MomentumBreakoutStrategy
 from app.strategies.trend_pullback import TrendPullbackStrategy
 from app.strategies.vwap_reclaim import VWAPReclaimStrategy
 from app.trading.history_logger import HistoryLogger
@@ -233,12 +234,11 @@ class Orchestrator:
         self.strategy_selector = StrategySelector()
 
         # LOCKED v1.0: Only 5 strategies — do NOT change for 10-15 trading days
+        # Default to top 3 — selector overrides with DB data if available
         self.strategies: list[BaseStrategy] = [
-            ORBStrategy(),
-            VWAPReclaimStrategy(),
             TrendPullbackStrategy(),
-            RangeBreakoutStrategy(),
-            LiquiditySweepStrategy(),
+            MomentumBreakoutStrategy(),
+            ORBStrategy(),
         ]
 
         # Unified engine components
@@ -411,13 +411,12 @@ class Orchestrator:
         # Unified engine reset
         self.day_type = DayType.PENDING
         self.day_classified = False
-        # Reset strategies to defaults — selector will update pre-market
+        # Reset strategies to defaults — top 3 proven performers
+        # Selector will override pre-market if DB has enough condition data
         self.strategies = [
-            ORBStrategy(),
-            VWAPReclaimStrategy(),
             TrendPullbackStrategy(),
-            RangeBreakoutStrategy(),
-            LiquiditySweepStrategy(),
+            MomentumBreakoutStrategy(),
+            ORBStrategy(),
         ]
         self.running = False
         logger.info("Daily state reset complete")
@@ -2927,6 +2926,7 @@ class Orchestrator:
                 "TREND_PULLBACK": TrendPullbackStrategy,
                 "RANGE_BREAKOUT": RangeBreakoutStrategy,
                 "LIQUIDITY_SWEEP": LiquiditySweepStrategy,
+                "MOMENTUM_BREAKOUT": MomentumBreakoutStrategy,
             }
 
             for instrument in self._active_instruments:
@@ -2968,13 +2968,13 @@ class Orchestrator:
                     else:
                         self._log_event(
                             "selection",
-                            f"[{symbol}] No locked strategies matched selection — keeping all 5",
+                            f"[{symbol}] No locked strategies matched selection — using defaults (TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB)",
                             instrument=symbol,
                         )
                 else:
                     self._log_event(
                         "selection",
-                        f"[{symbol}] No condition data — using all 5 locked strategies",
+                        f"[{symbol}] No condition data — using defaults (TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB)",
                         instrument=symbol,
                     )
 

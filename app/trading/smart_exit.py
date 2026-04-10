@@ -377,6 +377,7 @@ class SmartExitEngine:
                 "VWAP_RECLAIM": (0.35, 18.0, 3),     # Moderate-wide — reclaims need room
                 "RANGE_BREAKOUT": (0.40, 18.0, 3),   # Moderate — breakouts need confirmation
                 "LIQUIDITY_SWEEP": (0.30, 20.0, 4),  # Wide — reversals are messy initially
+                "MOMENTUM_BREAKOUT": (0.35, 18.0, 5), # Moderate — momentum needs room
             }
             if strategy_name in strategy_configs:
                 trail_f, trail_act, grace = strategy_configs[strategy_name]
