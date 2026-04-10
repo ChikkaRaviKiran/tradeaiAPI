@@ -81,7 +81,7 @@ PRE_CLOSE = dtime(15, 20)
 REPORT_TIME = dtime(15, 30)
 GLOBAL_FETCH_TIME = dtime(9, 0)
 LOAD_TIME = dtime(8, 45)
-NO_NEW_ENTRY_AFTER = dtime(14, 30)  # No new trades in last hour — high chop zone
+NO_NEW_ENTRY_AFTER = dtime(10, 45)  # Best trades are 09:30-10:45; after this win rate drops sharply
 
 LOOP_INTERVAL_SECONDS = 60  # 1-minute analysis cycle
 
@@ -1525,10 +1525,10 @@ class Orchestrator:
                 )
                 return
 
-            ranked = [(s, sc, sr) for s, sc, sr in all_scored if sc >= 45][:2]
+            ranked = [(s, sc, sr) for s, sc, sr in all_scored if sc >= 65][:2]
 
             if not ranked:
-                self._log_event("score", "No signal scored >= 45 — NO TRADE", cycle=cycle, instrument=symbol)
+                self._log_event("score", "No signal scored >= 65 — NO TRADE", cycle=cycle, instrument=symbol)
                 # Log missed signals with spot price for later target-hit analysis
                 for sig, sc, _ in all_scored:
                     self._missed_signals.append({
