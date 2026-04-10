@@ -7,6 +7,7 @@ from datetime import datetime
 import pytz
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Float,
@@ -60,6 +61,10 @@ class TradeRecord(Base):
     reason = Column(Text, nullable=True)
     exit_type = Column(String(20), nullable=True)  # V2: stoploss/target/time_exit/thesis_break/trailing/eod
     day_type = Column(String(10), nullable=True)  # V2: trend/range/volatile/unclear
+    # FIX 5: Partial exit tracking
+    partial_exit_done = Column(Boolean, default=False, nullable=False, server_default="false")
+    partial_pnl = Column(Float, default=0.0, nullable=False, server_default="0")
+    original_lot_size = Column(Integer, default=0, nullable=False, server_default="0")
     created_at = Column(DateTime, default=_now_ist)
     updated_at = Column(DateTime, default=_now_ist, onupdate=_now_ist)
 
@@ -377,6 +382,10 @@ async def init_db() -> None:
             # Strategy condition performance indexes
             "CREATE INDEX IF NOT EXISTS ix_scp_lookup ON strategy_condition_performance (instrument, strategy, condition_key)",
             "CREATE INDEX IF NOT EXISTS ix_scp_eval_date ON strategy_condition_performance (eval_date)",
+            # FIX 5: Partial exit columns
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS partial_exit_done BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS partial_pnl FLOAT DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS original_lot_size INTEGER DEFAULT 0",
         ]
         for sql in migrations:
             try:

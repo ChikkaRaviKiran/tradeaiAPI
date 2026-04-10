@@ -1024,8 +1024,15 @@ async def get_strategy_analytics():
     }
 
     try:
+        # Determine active instruments to filter results
+        active_syms = settings.get_active_instrument_list()
+        if not active_syms:
+            # Fallback: use enabled instruments from registry
+            from app.core.instruments import get_enabled_instruments
+            active_syms = [i.symbol for i in get_enabled_instruments()]
+
         async with AsyncSessionLocal() as session:
-            # 1. Latest strategy evaluation rankings
+            # 1. Latest strategy evaluation rankings (filtered to active instruments)
             rows = await session.execute(
                 _sql_text(
                     "SELECT eval_date, instrument, strategy, rank, win_rate, "
@@ -1033,8 +1040,10 @@ async def get_strategy_analytics():
                     "avg_pnl, max_drawdown, composite_score, signal_frequency, eval_days "
                     "FROM strategy_evaluations "
                     "WHERE eval_date = (SELECT MAX(eval_date) FROM strategy_evaluations) "
+                    "  AND instrument = ANY(:instruments) "
                     "ORDER BY rank"
-                )
+                ),
+                {"instruments": active_syms},
             )
             for r in rows:
                 result["strategy_rankings"].append({
@@ -1062,11 +1071,13 @@ async def get_strategy_analytics():
                     "profit_factor, composite_score, best_entry_window, probability, lookback_days "
                     "FROM strategy_condition_performance "
                     "WHERE eval_date = (SELECT MAX(eval_date) FROM strategy_condition_performance) "
+                    "  AND instrument = ANY(:instruments) "
                     "  AND condition_key NOT LIKE 'any%%' "
                     "  AND total_trades >= 3 "
                     "ORDER BY composite_score DESC "
                     "LIMIT 50"
-                )
+                ),
+                {"instruments": active_syms},
             )
             for r in rows:
                 result["condition_performance"].append({
@@ -1086,16 +1097,17 @@ async def get_strategy_analytics():
                     "lookback_days": r[13],
                 })
 
-            # 3. Evaluation history — composite scores over last 30 days
+            # 3. Evaluation history — composite scores over last 30 days (active instruments only)
             rows = await session.execute(
                 _sql_text(
                     "SELECT eval_date, instrument, strategy, composite_score, "
                     "win_rate, profit_factor, total_trades "
                     "FROM strategy_evaluations "
                     "WHERE eval_date >= :cutoff "
+                    "  AND instrument = ANY(:instruments) "
                     "ORDER BY eval_date DESC, rank"
                 ),
-                {"cutoff": (datetime.now(_IST) - timedelta(days=30)).strftime("%Y-%m-%d")},
+                {"cutoff": (datetime.now(_IST) - timedelta(days=30)).strftime("%Y-%m-%d"), "instruments": active_syms},
             )
             for r in rows:
                 result["eval_history"].append({

@@ -194,6 +194,10 @@ class Trade(BaseModel):
     max_hold_minutes: int = 0  # 0 = no time limit (V1), >0 = V2 time exit
     exit_type: Optional[str] = None  # stoploss/target/time_exit/thesis_break/trailing/eod
     day_type: Optional[str] = None  # Day classification when trade was taken
+    # FIX 5: Partial exit tracking
+    partial_exit_done: bool = False  # True after 50% exit at T1
+    partial_pnl: float = 0.0  # PnL realized from partial exit
+    original_lot_size: int = 0  # Original lot size before partial exit
 
 
 # ── Market Snapshot ───────────────────────────────────────────────────────────

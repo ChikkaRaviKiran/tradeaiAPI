@@ -729,9 +729,11 @@ class StrategyEvaluator:
                     return result
 
             # ── Fallback: spot-based proxy simulation ─────────────────
-            sl = round(max(spot_price - 1.5 * option_atr, spot_price * 0.70), 2)
-            t1 = round(spot_price + 2.0 * option_atr, 2)
-            t2 = round(spot_price + 3.5 * option_atr, 2)
+            # Match production orchestrator: SL = 2.0× ATR, floor 25% max loss
+            # T1 = 2.5× ATR, T2 = 4.0× ATR
+            sl = round(max(spot_price - 2.0 * option_atr, spot_price * 0.75), 2)
+            t1 = round(spot_price + 2.5 * option_atr, 2)
+            t2 = round(spot_price + 4.0 * option_atr, 2)
 
             exit_price = spot_price
             exit_reason = "eod_close"
@@ -891,10 +893,11 @@ class StrategyEvaluator:
         if entry_opt_price <= 0:
             return None
 
-        # ATR-based SL/targets (same as production orchestrator)
-        sl = round(max(entry_opt_price - 1.5 * option_atr, entry_opt_price * 0.70), 2)
-        t1 = round(entry_opt_price + 2.0 * option_atr, 2)
-        t2 = round(entry_opt_price + 3.5 * option_atr, 2)
+        # ATR-based SL/targets — match production orchestrator
+        # SL = 2.0× ATR, floor 25% max loss; T1 = 2.5× ATR, T2 = 4.0× ATR
+        sl = round(max(entry_opt_price - 2.0 * option_atr, entry_opt_price * 0.75), 2)
+        t1 = round(entry_opt_price + 2.5 * option_atr, 2)
+        t2 = round(entry_opt_price + 4.0 * option_atr, 2)
 
         # Build Trade object (same schema as production)
         entry_dt = opt_df.index[entry_opt_idx].to_pydatetime()
@@ -918,7 +921,7 @@ class StrategyEvaluator:
             status=TradeStatus.OPEN,
             lot_size=instrument.lot_size,
             entry_datetime=entry_dt,
-            max_hold_minutes=120,
+            max_hold_minutes=settings.v2_max_hold_minutes,
         )
 
         # Day type from spot data

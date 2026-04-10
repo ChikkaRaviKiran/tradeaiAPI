@@ -206,9 +206,11 @@ class PaperTradingEngine:
             trade.exit_price = trade.entry_price
 
         trade.exit_time = datetime.now(_IST).strftime("%H:%M:%S")
-        trade.pnl = round(
+        # FIX 5: Include partial exit PnL in total
+        remaining_pnl = round(
             (trade.exit_price - trade.entry_price) * trade.lot_size, 2
         )
+        trade.pnl = round(remaining_pnl + trade.partial_pnl, 2)
         trade.status = TradeStatus.CLOSED
         trade.reason = reason  # Store exit reason (overrides AI entry reason)
 

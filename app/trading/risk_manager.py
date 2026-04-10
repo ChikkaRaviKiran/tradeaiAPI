@@ -3,8 +3,8 @@
 SRS Rules:
     Max risk per trade: 1% of capital
     Max daily loss: 3% of capital
-    Max positions: 3 concurrent trades
-    Max trades per day: 5
+    Max positions: 2 concurrent trades (1 per instrument)
+    Max trades per day: 3
     Consecutive loss limit: 3
     Position sizing: Automatic based on risk per trade
 """
@@ -30,8 +30,8 @@ class RiskManager:
     Rules:
         Max risk per trade: 1% of capital
         Max daily loss: 3% of capital
-        Max trades per day: 5
-        Max concurrent positions: 3
+        Max trades per day: 3
+        Max concurrent positions: 2 (1 per instrument)
         Consecutive loss limit: 3
     """
 

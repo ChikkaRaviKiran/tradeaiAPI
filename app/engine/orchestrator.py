@@ -1587,6 +1587,81 @@ class Orchestrator:
             best_score_result = ranked[0][2]
             best_signal.score = best_score
 
+            # ── FIX 3: Retest entry filter ──────────────────────────────────
+            # For breakout strategies, reject "chasing" entries where price has
+            # already moved far past breakout level. Wait for pullback retest.
+            # The strategy will naturally re-fire on the pullback.
+            _BREAKOUT_STRATEGIES = {"ORB", "MOMENTUM_BREAKOUT", "RANGE_BREAKOUT"}
+            strategy_name = best_signal.strategy.value if hasattr(best_signal.strategy, 'value') else str(best_signal.strategy)
+            if strategy_name in _BREAKOUT_STRATEGIES:
+                bo_level = _extract_breakout_level(best_signal)
+                if bo_level is not None and bo_level > 0 and spot_price > 0:
+                    is_call = best_signal.option_type == OptionType.CALL
+                    chase_dist_pct = abs(spot_price - bo_level) / bo_level * 100
+                    # If price is > 0.30% past breakout level, it's chasing the move
+                    if chase_dist_pct > 0.30:
+                        # Issue 3: Allow momentum entry in strong trends
+                        # If ADX > 28 AND volume > 1.8× avg → trend is real, not chasing
+                        adx_val = indicators.adx
+                        vol_ratio = best_signal.details.get("volume_ratio", 0)
+                        strong_trend = (adx_val is not None and adx_val > 28 and vol_ratio > 1.8)
+                        if strong_trend:
+                            logger.info(
+                                "[%s][Cycle %d] RETEST BYPASS: %s chasing %.2f%% but ADX=%.1f vol=%.1f× — strong trend, allowing",
+                                symbol, cycle, strategy_name, chase_dist_pct, adx_val, vol_ratio,
+                            )
+                            self._log_event(
+                                "gate",
+                                f"RETEST BYPASS: {strategy_name} chasing but ADX={adx_val:.1f} vol={vol_ratio:.1f}× — strong trend allowed",
+                                cycle=cycle, instrument=symbol,
+                            )
+                        else:
+                            logger.info(
+                                "[%s][Cycle %d] RETEST FILTER: %s %s price %.2f is %.2f%% past breakout %.2f — waiting for pullback",
+                                symbol, cycle, strategy_name, best_signal.option_type.value,
+                                spot_price, chase_dist_pct, bo_level,
+                            )
+                            self._log_event(
+                                "gate",
+                                f"RETEST FILTER: {strategy_name} chasing ({chase_dist_pct:.2f}% past breakout) — wait for pullback",
+                                cycle=cycle, instrument=symbol,
+                            )
+                            return
+
+            # ── FIX 6: Fake move filter ─────────────────────────────────────
+            # Reject entry if the breakout candle is already exhausted (big move done)
+            # or RSI shows the move is already overextended.
+            atr_check = indicators.atr
+            if atr_check and atr_check > 0:
+                last_candle = df_today.iloc[-1]
+                candle_range = last_candle["high"] - last_candle["low"]
+                if candle_range > 1.2 * atr_check:
+                    logger.info(
+                        "[%s][Cycle %d] FAKE MOVE FILTER: candle range %.2f > 1.2×ATR (%.2f) — exhausted move, skipping",
+                        symbol, cycle, candle_range, 1.2 * atr_check,
+                    )
+                    self._log_event(
+                        "gate",
+                        f"FAKE MOVE FILTER: candle range {candle_range:.2f} > 1.2×ATR — move exhausted",
+                        cycle=cycle, instrument=symbol,
+                    )
+                    return
+            # RSI exhaustion check: CALL entry when RSI > 68 or PUT entry when RSI < 32
+            rsi_val = indicators.rsi
+            if rsi_val is not None:
+                is_call_signal = best_signal.option_type == OptionType.CALL
+                if (is_call_signal and rsi_val > 68) or (not is_call_signal and rsi_val < 32):
+                    logger.info(
+                        "[%s][Cycle %d] FAKE MOVE FILTER: RSI=%.1f already exhausted for %s — skipping",
+                        symbol, cycle, rsi_val, best_signal.option_type.value,
+                    )
+                    self._log_event(
+                        "gate",
+                        f"FAKE MOVE FILTER: RSI={rsi_val:.1f} exhausted for {best_signal.option_type.value}",
+                        cycle=cycle, instrument=symbol,
+                    )
+                    return
+
             # Position sizing by score (LOCKED v1.0)
             if best_score >= 75:
                 score_risk_pct = 1.5
@@ -1721,14 +1796,25 @@ class Orchestrator:
                     option_sl_distance = spot_distance * 0.5
                     structure_sl = entry_price - option_sl_distance
 
-            # ATR-based SL as fallback
+            # Issue 1: Dynamic ATR multiplier based on day type
+            # TREND → tighter (1.5–2.0× ATR), VOLATILE/expiry → wider (2.0–3.5× ATR)
+            _dt = self.day_type if self.day_classified else DayType.PENDING
+            _is_expiry = snap.is_expiry_day if snap else False
+            if _dt == DayType.VOLATILE or _is_expiry:
+                atr_min_mult, atr_max_mult = 2.0, 3.5  # Volatile/expiry: wide SL
+            elif _dt == DayType.TREND:
+                atr_min_mult, atr_max_mult = 1.5, 2.5  # Trend: tighter OK
+            else:
+                atr_min_mult, atr_max_mult = 1.5, 3.0  # Default/Range/Pending
+
+            # ATR-based SL as fallback — widened to survive stop-hunting
             atr_sl = entry_price - (2.0 * option_atr)
-            pct_sl = entry_price * 0.85  # 15% max loss floor
+            pct_sl = entry_price * 0.75  # 25% max loss floor
 
             if structure_sl is not None and structure_sl > 0:
-                # Use structure SL but cap: no wider than 2.5×ATR, no tighter than 1.2×ATR
-                min_sl = entry_price - (2.5 * option_atr)  # Max risk cap
-                max_sl = entry_price - (1.2 * option_atr)  # Min breathing room
+                # Use structure SL but cap within dynamic ATR range
+                min_sl = entry_price - (atr_max_mult * option_atr)  # Max risk cap
+                max_sl = entry_price - (atr_min_mult * option_atr)  # Min breathing room
                 structure_sl = max(min_sl, min(structure_sl, max_sl))
                 best_signal.stoploss = round(max(structure_sl, pct_sl), 2)
                 logger.info(
@@ -2434,6 +2520,29 @@ class Orchestrator:
                     trade.stoploss = result.new_stoploss
 
             if result.should_exit:
+                # FIX 5: Partial exit at T1 — exit 50%, keep rest trailing
+                if result.exit_type == "partial_target1":
+                    half_lots = trade.lot_size // 2
+                    if half_lots > 0:
+                        # Record partial PnL
+                        partial_pnl = (result.exit_price - trade.entry_price) * half_lots
+                        trade.partial_pnl = round(partial_pnl, 2)
+                        trade.original_lot_size = trade.lot_size
+                        trade.lot_size -= half_lots
+                        trade.partial_exit_done = True
+                        # Move SL to breakeven for remaining position
+                        trade.stoploss = max(trade.stoploss, trade.entry_price)
+                        logger.info(
+                            "[V1] PARTIAL EXIT: %s | 50%% exited at ₹%.2f | Partial PnL=₹%.2f | Remaining lots=%d | SL→breakeven",
+                            trade.symbol, result.exit_price, partial_pnl, trade.lot_size,
+                        )
+                        self._log_event(
+                            "exit",
+                            f"PARTIAL T1: 50% exited at ₹{result.exit_price:.2f}, PnL=₹{partial_pnl:.2f}, remaining={trade.lot_size} lots",
+                            cycle=0, instrument=instrument.symbol,
+                        )
+                    continue  # Don't close the trade — keep riding rest
+
                 trade.exit_price = result.exit_price
                 trade.exit_type = result.exit_type
                 self.paper_trader._close_trade(trade, result.exit_type)

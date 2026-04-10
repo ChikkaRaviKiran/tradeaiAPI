@@ -146,11 +146,11 @@ class BacktestEngine:
         if atr <= 0:
             atr = entry_price * 0.01  # fallback 1%
 
-        # ATR-based SL/targets (mimic live logic)
+        # ATR-based SL/targets (match production orchestrator)
         option_atr = atr * 0.5
-        sl = round(max(entry_price - 1.5 * option_atr, entry_price * 0.70), 2)
-        t1 = round(entry_price + 2.0 * option_atr, 2)
-        t2 = round(entry_price + 3.5 * option_atr, 2)
+        sl = round(max(entry_price - 2.0 * option_atr, entry_price * 0.75), 2)
+        t1 = round(entry_price + 2.5 * option_atr, 2)
+        t2 = round(entry_price + 4.0 * option_atr, 2)
 
         # Walk forward from entry to end of day
         exit_price = entry_price

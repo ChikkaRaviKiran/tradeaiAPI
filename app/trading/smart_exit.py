@@ -62,7 +62,7 @@ class ExitConfig:
     use_close_based_sl: bool = True     # Close-based SL — only exit on candle close (was False)
     catastrophic_atr_mult: float = 3.0  # Immediate SL if drop > this × ATR
     grace_period_minutes: int = 3       # No trailing SL adjustment in first N minutes (new)
-    sl_confirm_candles: int = 2         # Require N consecutive candle closes below SL before exit
+    sl_confirm_candles: int = 3         # FIX 4: Require 3 consecutive candle closes below SL (was 2)
 
 
 class SmartExitEngine:
@@ -144,11 +144,19 @@ class SmartExitEngine:
         # ── Grace period: block ALL SL exits except catastrophic ────────
         # During the first N minutes, ORB/TREND trades face violent washouts
         # that recover. Only exit if drop is truly catastrophic (>3×ATR).
+        # FIX 2: SL Delay Activation — grace ends when EITHER:
+        #   a) grace_period_minutes elapsed, OR
+        #   b) price moved +5% in your favor (SL activates to protect gains)
         in_grace = False
         if cfg.grace_period_minutes > 0 and trade.entry_datetime is not None:
             now = datetime.now(_IST)
             elapsed_min = (now - trade.entry_datetime).total_seconds() / 60
-            in_grace = elapsed_min < cfg.grace_period_minutes
+            time_grace_over = elapsed_min >= cfg.grace_period_minutes
+            # Profit-based grace exit: if +5% in favor, SL should activate to protect
+            profit_pct = (ltp - trade.entry_price) / trade.entry_price * 100 if trade.entry_price > 0 else 0
+            profit_grace_over = profit_pct >= 5.0
+            # Grace is active only if NEITHER condition is met
+            in_grace = not time_grace_over and not profit_grace_over
 
         # Catastrophic exit: immediate if drop > 3× ATR (regardless of grace/candle close)
         if option_atr > 0:
@@ -165,8 +173,21 @@ class SmartExitEngine:
         if in_grace:
             return ExitResult()
 
-        # Close-based SL with 2-candle confirmation:
-        # First candle close below SL = warning. Second consecutive = exit.
+        # Issue 4: Big opposite candle override — exit immediately if a single
+        # candle drops > 1.5× ATR (real reversal, not noise). Skips multi-candle wait.
+        if candle_closed and option_atr > 0 and trade.entry_price > 0:
+            candle_drop = trade.entry_price - ltp  # positive = loss
+            if ltp <= trade.stoploss and candle_drop > 1.5 * option_atr:
+                SmartExitEngine._sl_breach_counts.pop(trade.trade_id, None)
+                return ExitResult(
+                    should_exit=True,
+                    exit_type="stoploss",
+                    exit_price=ltp,
+                    reason=f"BIG CANDLE SL: drop {candle_drop:.2f} > 1.5×ATR ({1.5*option_atr:.2f}) — immediate exit",
+                )
+
+        # Close-based SL with 3-candle confirmation:
+        # First candle close below SL = warning. Third consecutive = exit.
         # This survives single-candle washouts/stop-hunts.
         if cfg.use_close_based_sl:
             tid = trade.trade_id
@@ -337,13 +358,27 @@ class SmartExitEngine:
                 exit_price=ltp,
                 reason=f"T2 hit: {ltp:.2f} >= {trade.target2:.2f}",
             )
-        if ltp >= trade.target1:
+        # FIX 5: Partial exit at T1 — exit 50%, keep riding the rest
+        if ltp >= trade.target1 and not trade.partial_exit_done:
             return ExitResult(
                 should_exit=True,
-                exit_type="target1",
+                exit_type="partial_target1",
                 exit_price=ltp,
-                reason=f"T1 hit: {ltp:.2f} >= {trade.target1:.2f}",
+                reason=f"PARTIAL T1: {ltp:.2f} >= {trade.target1:.2f} — exit 50%, trail rest",
             )
+        # Issue 2: Time-based partial exit
+        # If held 20+ min and profit > 10% but hasn't reached T1 → partial exit
+        if not trade.partial_exit_done and trade.entry_datetime is not None and trade.entry_price > 0:
+            now = datetime.now(_IST)
+            elapsed_min = (now - trade.entry_datetime).total_seconds() / 60
+            profit_pct = (ltp - trade.entry_price) / trade.entry_price * 100
+            if elapsed_min >= 20 and profit_pct >= 10.0:
+                return ExitResult(
+                    should_exit=True,
+                    exit_type="partial_target1",
+                    exit_price=ltp,
+                    reason=f"TIME PARTIAL: {elapsed_min:.0f}min held, profit {profit_pct:.1f}% >= 10% — exit 50%, trail rest",
+                )
         return ExitResult()
 
     # ── Config builder ───────────────────────────────────────────────────
@@ -364,7 +399,7 @@ class SmartExitEngine:
             trail_factor=0.40,            # Wider trail — capture more of the move
             max_hold_minutes=settings.v2_max_hold_minutes,
             use_close_based_sl=True,      # Close-based SL by default
-            grace_period_minutes=3,       # No trailing first 3 min
+            grace_period_minutes=5,       # FIX 2: Min 5 min grace for all strategies (was 3)
         )
 
         # Strategy-specific trailing factors (wider than before)
@@ -373,11 +408,11 @@ class SmartExitEngine:
             # Strategy-specific trail configs: (trail_factor, trail_activation_pct, grace_minutes)
             strategy_configs = {
                 "ORB": (0.50, 15.0, 10),             # ORB = 10 min grace for breakout retest/washout
-                "TREND_PULLBACK": (0.25, 20.0, 5),   # Widest trail — let trend run fully
-                "VWAP_RECLAIM": (0.35, 18.0, 3),     # Moderate-wide — reclaims need room
-                "RANGE_BREAKOUT": (0.40, 18.0, 3),   # Moderate — breakouts need confirmation
-                "LIQUIDITY_SWEEP": (0.30, 20.0, 4),  # Wide — reversals are messy initially
-                "MOMENTUM_BREAKOUT": (0.35, 18.0, 5), # Moderate — momentum needs room
+                "TREND_PULLBACK": (0.25, 20.0, 7),   # Widest trail — let trend run fully
+                "VWAP_RECLAIM": (0.35, 18.0, 5),     # FIX 2: min 5 min grace (was 3)
+                "RANGE_BREAKOUT": (0.40, 18.0, 5),   # FIX 2: min 5 min grace (was 3)
+                "LIQUIDITY_SWEEP": (0.30, 20.0, 5),  # FIX 2: min 5 min grace (was 4)
+                "MOMENTUM_BREAKOUT": (0.35, 18.0, 7), # FIX 2: widened grace (was 5)
             }
             if strategy_name in strategy_configs:
                 trail_f, trail_act, grace = strategy_configs[strategy_name]
