@@ -247,6 +247,8 @@ class Orchestrator:
 
         # Active instruments — resolved from evaluation or config
         self._active_instruments: list[InstrumentConfig] = []
+        # Per-instrument strategy whitelist from evaluation
+        self._instrument_strategies: dict[str, list] = {}
         # Eval score boost: {(symbol, strategy_name): composite_score}
         self._eval_scores: dict[tuple[str, str], float] = {}
 
