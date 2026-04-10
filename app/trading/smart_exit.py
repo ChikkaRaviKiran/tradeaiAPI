@@ -54,12 +54,14 @@ class ExitConfig:
 
     stoploss_pct: float = 20.0          # Max loss %
     quick_target_pct: float = 25.0      # T1 %
-    breakeven_trigger_pct: float = 8.0  # Move SL to entry after this % profit
-    trail_factor: float = 0.50          # Trail SL at this fraction of profit
+    breakeven_trigger_pct: float = 12.0 # Move SL to entry after this % profit (was 8% — too early)
+    trail_activation_pct: float = 18.0  # Start trailing only after this % profit (new)
+    trail_factor: float = 0.40          # Trail SL at this fraction of profit (was 0.50 — too tight)
     max_hold_minutes: int = 120         # LOCKED v1.0: Time-based exit limit
     thesis_break_buffer: float = 0.0015 # 0.15% buffer for breakout fail
-    use_close_based_sl: bool = False     # Tick-based SL — exit immediately when breached
+    use_close_based_sl: bool = True     # Close-based SL — only exit on candle close (was False)
     catastrophic_atr_mult: float = 3.0  # Immediate SL if drop > this × ATR
+    grace_period_minutes: int = 3       # No trailing SL adjustment in first N minutes (new)
 
 
 class SmartExitEngine:
@@ -247,11 +249,24 @@ class SmartExitEngine:
     def _manage_trailing(
         self, trade: Trade, ltp: float, cfg: ExitConfig
     ) -> ExitResult:
-        """Breakeven move + trailing stoploss."""
+        """Breakeven move + trailing stoploss with grace period.
+
+        Phases:
+        1. Grace period (first N minutes): No SL movement at all — let trade breathe
+        2. Breakeven move: Once profit >= breakeven_trigger_pct, move SL to entry
+        3. Trailing: Once profit >= trail_activation_pct, trail at configured factor
+        """
         if trade.entry_price <= 0:
             return ExitResult()
 
         profit_pct = (ltp - trade.entry_price) / trade.entry_price * 100
+
+        # Grace period — no trailing in first N minutes after entry
+        if cfg.grace_period_minutes > 0 and trade.entry_datetime is not None:
+            now = datetime.now(_IST)
+            elapsed_min = (now - trade.entry_datetime).total_seconds() / 60
+            if elapsed_min < cfg.grace_period_minutes:
+                return ExitResult()
 
         # Phase 1: Move SL to breakeven at trigger percentage
         if profit_pct >= cfg.breakeven_trigger_pct:
@@ -262,14 +277,16 @@ class SmartExitEngine:
                     reason=f"Breakeven: profit {profit_pct:.1f}% >= {cfg.breakeven_trigger_pct}%",
                 )
 
-        # Phase 2: Trail at configured factor once at breakeven
-        if trade.stoploss >= trade.entry_price and profit_pct > 0:
+        # Phase 2: Trail at configured factor only after trail_activation_pct
+        if (
+            trade.stoploss >= trade.entry_price
+            and profit_pct >= cfg.trail_activation_pct
+        ):
             trail_sl = trade.entry_price + (ltp - trade.entry_price) * cfg.trail_factor
             if trail_sl > trade.stoploss:
-                # Update trailing SL (exit happens in orchestrator on next tick when LTP <= new SL)
                 return ExitResult(
                     new_stoploss=round(trail_sl, 2),
-                    reason=f"Trail SL updated to {trail_sl:.2f} ({cfg.trail_factor*100:.0f}% of profit)",
+                    reason=f"Trail SL updated to {trail_sl:.2f} ({cfg.trail_factor*100:.0f}% of profit, activated at {cfg.trail_activation_pct}%)",
                 )
 
         return ExitResult()
@@ -304,42 +321,54 @@ class SmartExitEngine:
         base = ExitConfig(
             stoploss_pct=settings.v2_stoploss_pct,
             quick_target_pct=settings.v2_quick_target_pct,
-            breakeven_trigger_pct=8.0,  # Earlier breakeven (was 12%)
-            trail_factor=0.50,
+            breakeven_trigger_pct=12.0,   # Later breakeven — let trade breathe
+            trail_activation_pct=18.0,    # Start trailing only after solid profit
+            trail_factor=0.40,            # Wider trail — capture more of the move
             max_hold_minutes=settings.v2_max_hold_minutes,
+            use_close_based_sl=True,      # Close-based SL by default
+            grace_period_minutes=3,       # No trailing first 3 min
         )
 
-        # Strategy-specific trailing factors
+        # Strategy-specific trailing factors (wider than before)
         if trade and hasattr(trade, 'strategy'):
             strategy_name = trade.strategy.value if hasattr(trade.strategy, 'value') else str(trade.strategy)
-            # LOCKED v1.0: Strategy-specific trailing factors
-            strategy_trails = {
-                "ORB": 0.65,                # Tight trail — ORB moves are sharp
-                "TREND_PULLBACK": 0.30,     # Wide trail — let trend run
-                "VWAP_RECLAIM": 0.45,       # Moderate
-                "RANGE_BREAKOUT": 0.50,     # Moderate-tight
-                "LIQUIDITY_SWEEP": 0.40,    # Wide — reversals need room
+            # Strategy-specific trail configs: (trail_factor, trail_activation_pct, grace_minutes)
+            strategy_configs = {
+                "ORB": (0.50, 15.0, 2),              # ORB = sharp moves, moderate trail
+                "TREND_PULLBACK": (0.25, 20.0, 5),   # Widest trail — let trend run fully
+                "VWAP_RECLAIM": (0.35, 18.0, 3),     # Moderate-wide — reclaims need room
+                "RANGE_BREAKOUT": (0.40, 18.0, 3),   # Moderate — breakouts need confirmation
+                "LIQUIDITY_SWEEP": (0.30, 20.0, 4),  # Wide — reversals are messy initially
             }
-            if strategy_name in strategy_trails:
-                base.trail_factor = strategy_trails[strategy_name]
+            if strategy_name in strategy_configs:
+                trail_f, trail_act, grace = strategy_configs[strategy_name]
+                base.trail_factor = trail_f
+                base.trail_activation_pct = trail_act
+                base.grace_period_minutes = grace
 
         if day_type == DayType.TREND:
             # Let winners run on trend days
-            base.trail_factor = min(base.trail_factor, 0.40)  # Don't override strategy if already wider
+            base.trail_factor = min(base.trail_factor, 0.30)  # Even wider on trend days
+            base.trail_activation_pct = max(base.trail_activation_pct, 20.0)  # Delay trailing
             base.max_hold_minutes = int(base.max_hold_minutes * 1.3)  # Hold longer
-            base.breakeven_trigger_pct = 7.2  # Slightly earlier on trend days
+            base.breakeven_trigger_pct = 10.0  # Earlier breakeven OK on trend days (safety net)
+            base.grace_period_minutes = max(base.grace_period_minutes, 5)  # More grace
 
         elif day_type == DayType.RANGE:
             # Quick in-and-out on range days
-            base.trail_factor = max(base.trail_factor, 0.60)  # Tighter trail
+            base.trail_factor = max(base.trail_factor, 0.50)  # Tighter trail
+            base.trail_activation_pct = 15.0  # Trail sooner
             base.max_hold_minutes = int(base.max_hold_minutes * 0.7)  # Shorter hold
             base.quick_target_pct *= 0.8       # Lower T1 target
-            base.breakeven_trigger_pct = 5.6   # Even earlier on range days
+            base.breakeven_trigger_pct = 8.0   # Earlier on range days
+            base.grace_period_minutes = 2      # Less grace
 
         elif day_type == DayType.VOLATILE:
             # Wider stops but faster breakeven on volatile days
             base.stoploss_pct *= 1.2           # Wider SL
-            base.breakeven_trigger_pct = 5.6   # Earlier breakeven
-            base.trail_factor = min(base.trail_factor, 0.45)  # Moderate trail
+            base.breakeven_trigger_pct = 8.0   # Earlier breakeven on volatile days (protect capital)
+            base.trail_factor = min(base.trail_factor, 0.35)  # Moderate-wide trail
+            base.trail_activation_pct = 15.0   # Trail sooner (volatility = fast moves)
+            base.grace_period_minutes = 2      # Less grace
 
         return base

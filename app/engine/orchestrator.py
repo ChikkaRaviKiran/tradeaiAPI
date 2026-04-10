@@ -277,8 +277,8 @@ class Orchestrator:
         self._sl_cooldowns: dict[tuple[str, str], datetime] = {}
         # Duplicate strike guard: set of (symbol, strike, option_type) traded today
         self._traded_strikes_today: set[tuple[str, float, str]] = {}
-        # Daily SL circuit breaker: if first trade hit full stoploss, stop for the day
-        self._daily_sl_hit: dict[str, bool] = {}  # {symbol: True if SL hit today}
+        # Daily SL circuit breaker: stop after 2 consecutive SL hits per symbol
+        self._daily_sl_hit: dict[str, int] = {}  # {symbol: count of SL hits today}
         # No Trade Day guard: if no signal > 55 by 11:30, skip rest of day
         self._no_trade_day: dict[str, bool] = {}  # {symbol: True if dead day}
         self._best_score_today: dict[str, float] = {}  # track highest score per symbol
@@ -1315,10 +1315,11 @@ class Orchestrator:
                 self._log_event("gate", "Risk limits reached — skipping", cycle=cycle, instrument=symbol)
                 return
 
-            # 8c. Daily SL circuit breaker — if any trade today hit full stoploss, stop trading
-            if self._daily_sl_hit.get(symbol, False):
-                logger.info("[%s][Cycle %d] Daily SL circuit breaker active — no more trades", symbol, cycle)
-                self._log_event("gate", "SL circuit breaker — no more trades today", cycle=cycle, instrument=symbol)
+            # 8c. Daily SL circuit breaker — after 2 consecutive SL hits, stop trading
+            daily_sl_count = self._daily_sl_hit.get(symbol, 0)
+            if daily_sl_count >= 2:
+                logger.info("[%s][Cycle %d] Daily SL circuit breaker active (%d SL hits) — no more trades", symbol, cycle, daily_sl_count)
+                self._log_event("gate", f"SL circuit breaker — {daily_sl_count} SL hits today, stopping", cycle=cycle, instrument=symbol)
                 return
 
             # 8d. No Trade Day guard — if no signal scored > 55 by 11:30, skip rest of day
@@ -1643,13 +1644,48 @@ class Orchestrator:
                     f"Score: {best_score:.0f}",
                 )
                 return
-            # ATR-based SL/targets — R:R fix: tighter SL, wider targets
+            # Structure-aware SL/targets — place SL beyond market structure, not blind ATR
             option_atr = atr * 0.5  # ATM delta ~0.5 scales spot ATR to option premium
             best_signal.entry_price = entry_price
-            # SL = min(2.0 × ATR, 15% of premium) — cap losses, floor at 85% of entry
+
+            # --- Structure-based SL ---
+            # Use swing low/high from market structure as anchor, with ATR buffer
+            is_call = best_signal.option_type == OptionType.CALL
+            structure_sl = None
+            if structure:
+                swings = structure.get("swing_lows" if is_call else "swing_highs", [])
+                if swings:
+                    # Use nearest swing level as structural SL anchor
+                    anchor_price = swings[-1][1]  # Most recent swing low/high (spot price)
+                    # Add 0.1% buffer beyond structure level
+                    buffer = anchor_price * 0.001
+                    if is_call:
+                        spot_sl = anchor_price - buffer  # Below swing low
+                    else:
+                        spot_sl = anchor_price + buffer  # Above swing high
+                    # Convert spot SL to option premium SL (delta ~0.5)
+                    spot_distance = abs(spot_price - spot_sl)
+                    option_sl_distance = spot_distance * 0.5
+                    structure_sl = entry_price - option_sl_distance
+
+            # ATR-based SL as fallback
             atr_sl = entry_price - (2.0 * option_atr)
-            pct_sl = entry_price * 0.85  # 15% max loss
-            best_signal.stoploss = round(max(atr_sl, pct_sl), 2)
+            pct_sl = entry_price * 0.85  # 15% max loss floor
+
+            if structure_sl is not None and structure_sl > 0:
+                # Use structure SL but cap: no wider than 2.5×ATR, no tighter than 1.2×ATR
+                min_sl = entry_price - (2.5 * option_atr)  # Max risk cap
+                max_sl = entry_price - (1.2 * option_atr)  # Min breathing room
+                structure_sl = max(min_sl, min(structure_sl, max_sl))
+                best_signal.stoploss = round(max(structure_sl, pct_sl), 2)
+                logger.info(
+                    "[%s] STRUCTURE SL: %.2f (swing-based) vs ATR SL: %.2f",
+                    symbol, best_signal.stoploss, max(atr_sl, pct_sl),
+                )
+            else:
+                # Fallback to ATR-based SL
+                best_signal.stoploss = round(max(atr_sl, pct_sl), 2)
+
             # T1 = 2.5× ATR, T2 = 4× ATR — reward must exceed risk
             best_signal.target1 = round(entry_price + (2.5 * option_atr), 2)
             best_signal.target2 = round(entry_price + (4.0 * option_atr), 2)
@@ -2443,12 +2479,13 @@ class Orchestrator:
                 if result.exit_type in ("stoploss", "hard_stoploss"):
                     cooldown_key = (instrument_symbol, trade.option_type.value if trade.option_type else "")
                     self._sl_cooldowns[cooldown_key] = datetime.now() + timedelta(minutes=15)
-                    # Daily SL circuit breaker — stop trading this instrument today
-                    self._daily_sl_hit[instrument_symbol] = True
+                    # Daily SL counter — stop trading after 2 SL hits
+                    self._daily_sl_hit[instrument_symbol] = self._daily_sl_hit.get(instrument_symbol, 0) + 1
                     logger.info(
-                        "[%s] SL cooldown set for %s direction until %s | Daily SL circuit breaker ACTIVE",
+                        "[%s] SL cooldown set for %s direction until %s | SL hit count: %d",
                         instrument_symbol, cooldown_key[1],
                         self._sl_cooldowns[cooldown_key].strftime("%H:%M"),
+                        self._daily_sl_hit[instrument_symbol],
                     )
 
     # ── V2 Engine ─────────────────────────────────────────────────────────
@@ -2751,8 +2788,8 @@ class Orchestrator:
                 if result.exit_type in ("stoploss", "hard_stoploss"):
                     cooldown_key = (instrument.symbol, trade.option_type.value if hasattr(trade, 'option_type') and trade.option_type else "")
                     self._sl_cooldowns[cooldown_key] = datetime.now() + timedelta(minutes=15)
-                    # Daily SL circuit breaker
-                    self._daily_sl_hit[instrument.symbol] = True
+                    # Daily SL counter — stop trading after 2 SL hits
+                    self._daily_sl_hit[instrument.symbol] = self._daily_sl_hit.get(instrument.symbol, 0) + 1
 
     async def _close_all_trades(self) -> None:
         """Close all open trades at 15:20 (both V1 and V2)."""

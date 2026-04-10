@@ -105,8 +105,10 @@ class PaperTradingEngine:
     def check_exits(self, current_prices: dict[str, float]) -> list[Trade]:
         """Check all open trades against current prices for exit conditions.
 
-        Includes trailing stoploss: once price moves 50% toward T1, SL moves to
-        breakeven. After that, SL trails at 40% of the profit from entry.
+        Trailing SL phases:
+        1. Grace period (first 3 min): no SL movement
+        2. Once price moves 50% toward T1: SL moves to breakeven
+        3. Once price moves 75% toward T1: SL trails at 35% of profit
 
         Args:
             current_prices: Symbol → current LTP mapping.
@@ -115,6 +117,7 @@ class PaperTradingEngine:
             List of trades that were just closed.
         """
         closed_now: list[Trade] = []
+        now = datetime.now(_IST)
 
         for trade in list(self.open_trades):
             symbol_key = trade.symbol
@@ -122,15 +125,38 @@ class PaperTradingEngine:
             if current_ltp is None:
                 continue
 
+            # Grace period — no trailing in first 3 minutes
+            if trade.entry_datetime is not None:
+                elapsed_min = (now - trade.entry_datetime).total_seconds() / 60
+                if elapsed_min < 3:
+                    # Only check hard SL and targets during grace period
+                    exit_reason = None
+                    if current_ltp <= trade.stoploss:
+                        exit_reason = "stoploss"
+                        trade.exit_price = current_ltp
+                    elif current_ltp >= trade.target2:
+                        exit_reason = "target2"
+                        trade.exit_price = current_ltp
+                    elif current_ltp >= trade.target1:
+                        exit_reason = "target1"
+                        trade.exit_price = current_ltp
+                    if exit_reason:
+                        self._close_trade(trade, exit_reason)
+                        closed_now.append(trade)
+                    continue
+
             # Trailing stoploss logic
             move_to_t1 = trade.target1 - trade.entry_price
             current_profit = current_ltp - trade.entry_price
 
             if move_to_t1 > 0 and current_profit > 0:
-                # Once price has moved 50% toward T1, move SL to breakeven
+                # Phase 1: Once price has moved 50% toward T1, move SL to breakeven
                 if current_profit >= move_to_t1 * 0.5:
-                    breakeven_sl = trade.entry_price + (current_profit * 0.4)  # Trail at 40% of profit
-                    new_sl = max(trade.entry_price, breakeven_sl)  # Never below breakeven
+                    new_sl = trade.entry_price  # Breakeven
+                    # Phase 2: Once 75% toward T1, trail at 35% of profit (was 40%)
+                    if current_profit >= move_to_t1 * 0.75:
+                        new_sl = trade.entry_price + (current_profit * 0.35)
+                    new_sl = max(new_sl, trade.stoploss)  # Never lower the SL
                     if new_sl > trade.stoploss:
                         logger.debug(
                             "TRAILING SL: %s | Old=%.2f | New=%.2f | LTP=%.2f",
