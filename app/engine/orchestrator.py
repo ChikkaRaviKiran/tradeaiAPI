@@ -321,6 +321,22 @@ class Orchestrator:
 
     async def start(self) -> None:
         """Main entry point — runs forever, restarting each trading day."""
+        # One-time cleanup: purge stale strategy_condition_performance data
+        # from before the exit logic fix (2026-04-10). Old data used broken
+        # tick-based SL which distorts win rates and strategy picks.
+        try:
+            from app.db.models import AsyncSessionLocal
+            from sqlalchemy import text as _text
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    _text("DELETE FROM strategy_condition_performance WHERE eval_date < '2026-04-10'")
+                )
+                await session.commit()
+                if result.rowcount > 0:
+                    logger.info("Purged %d stale strategy_condition_performance rows (pre exit-fix)", result.rowcount)
+        except Exception:
+            logger.warning("Could not purge stale strategy_condition_performance — table may not exist yet")
+
         # Load previous evaluation from DB on cold start
         try:
             await self.eval_scheduler.load_latest_from_db()
@@ -396,7 +412,13 @@ class Orchestrator:
         self.day_type = DayType.PENDING
         self.day_classified = False
         # Reset strategies to defaults — selector will update pre-market
-        self.strategies = [TrendPullbackStrategy(), MomentumBreakoutStrategy()]
+        self.strategies = [
+            ORBStrategy(),
+            VWAPReclaimStrategy(),
+            TrendPullbackStrategy(),
+            RangeBreakoutStrategy(),
+            LiquiditySweepStrategy(),
+        ]
         self.running = False
         logger.info("Daily state reset complete")
 
