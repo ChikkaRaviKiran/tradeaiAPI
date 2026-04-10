@@ -41,6 +41,7 @@ from app.core.models import (
     OptionsMetrics,
     StrategySignal,
     TechnicalIndicators,
+    TradeStatus,
     DayType,
 )
 from app.data.angelone_client import AngelOneClient
@@ -279,6 +280,8 @@ class Orchestrator:
         self._traded_strikes_today: set[tuple[str, float, str]] = {}
         # Daily SL circuit breaker: stop after 2 consecutive SL hits per symbol
         self._daily_sl_hit: dict[str, int] = {}  # {symbol: count of SL hits today}
+        # ORB trade limit: max 1 ORB per day per instrument (avoid doubling down)
+        self._orb_trades_today: dict[str, int] = {}  # {symbol: count of ORB trades today}
         # No Trade Day guard: if no signal > 55 by 11:30, skip rest of day
         self._no_trade_day: dict[str, bool] = {}  # {symbol: True if dead day}
         self._best_score_today: dict[str, float] = {}  # track highest score per symbol
@@ -380,6 +383,7 @@ class Orchestrator:
         self._sl_cooldowns = {}
         self._traded_strikes_today = set()
         self._daily_sl_hit = {}
+        self._orb_trades_today = {}
         self._no_trade_day = {}
         self._best_score_today = {}
         self._missed_signals = []
@@ -1590,6 +1594,19 @@ class Orchestrator:
                 )
                 return
 
+            # 10d. ORB trade limit — max 1 ORB per day per instrument
+            if best_signal.strategy.value == "ORB" and self._orb_trades_today.get(symbol, 0) >= 1:
+                logger.info(
+                    "[%s][Cycle %d] ORB already traded once today — skipping",
+                    symbol, cycle,
+                )
+                self._log_event(
+                    "gate",
+                    "ORB limit: max 1 ORB trade per day reached",
+                    cycle=cycle, instrument=symbol,
+                )
+                return
+
             # 11. Fetch option premium (with bid-ask spread)
             option_quote = await self._fetch_option_quote_for(instrument, best_signal, expiry)
             if option_quote is None or option_quote["ltp"] <= 0:
@@ -1838,6 +1855,9 @@ class Orchestrator:
             self._traded_strikes_today.add(
                 (symbol, best_signal.strike_price, best_signal.option_type.value)
             )
+            # Track ORB trades per day — max 1 allowed
+            if best_signal.strategy.value == "ORB":
+                self._orb_trades_today[symbol] = self._orb_trades_today.get(symbol, 0) + 1
 
             # 15b. Place real order if live trading
             if not settings.paper_trading:
@@ -2341,13 +2361,62 @@ class Orchestrator:
                     trade.pnl or 0,
                 )
 
-        closed = self.paper_trader.check_exits(current_prices)
-        for trade in closed:
-            # Place live sell order if not paper trading
-            if not settings.paper_trading:
-                await self._place_live_exit(instrument, trade)
-            await self.trade_logger.log_trade(trade)
-            await self.alert_manager.send_exit_alert(trade)
+        # Use SmartExitEngine instead of paper_trader.check_exits()
+        # paper_trader.check_exits() uses tick-based SL (exits on wick touch)
+        # SmartExitEngine uses close-based SL with grace period and 2-candle confirmation
+        snap = self.snapshots.get(instrument.symbol)
+        for trade in list(inst_trades):
+            if trade.status != TradeStatus.OPEN:
+                continue
+            ltp = current_prices.get(trade.symbol)
+            if ltp is None or snap is None:
+                continue
+
+            atr = snap.indicators.atr if snap.indicators else None
+            opt_atr = (atr or 0) * 0.5
+
+            result = self.smart_exit.evaluate(
+                trade=trade,
+                current_ltp=ltp,
+                snap=snap,
+                day_type=self.day_type if self.day_classified else DayType.PENDING,
+                spot_price=spot_price,
+                candle_closed=True,
+                option_atr=opt_atr,
+            )
+
+            # Update trailing SL
+            if result.new_stoploss is not None and not result.should_exit:
+                if result.new_stoploss > trade.stoploss:
+                    logger.info(
+                        "[V1] SL UPDATE: %s | Old=%.2f -> New=%.2f | %s",
+                        trade.symbol, trade.stoploss, result.new_stoploss, result.reason,
+                    )
+                    trade.stoploss = result.new_stoploss
+
+            if result.should_exit:
+                trade.exit_price = result.exit_price
+                trade.exit_type = result.exit_type
+                self.paper_trader._close_trade(trade, result.exit_type)
+                if not settings.paper_trading:
+                    await self._place_live_exit(instrument, trade)
+                await self.trade_logger.log_trade(trade)
+                await self.alert_manager.send_exit_alert(trade)
+                logger.info(
+                    "[V1] EXIT [%s]: %s | PnL=%.2f | %s",
+                    result.exit_type, trade.symbol, trade.pnl or 0, result.reason,
+                )
+                # Record re-entry cooldown on stoploss exits (15 min)
+                if result.exit_type in ("stoploss", "hard_stoploss"):
+                    cooldown_key = (instrument.symbol, trade.option_type.value if trade.option_type else "")
+                    self._sl_cooldowns[cooldown_key] = datetime.now() + timedelta(minutes=15)
+                    self._daily_sl_hit[instrument.symbol] = self._daily_sl_hit.get(instrument.symbol, 0) + 1
+                    logger.info(
+                        "[%s] SL cooldown set for %s direction until %s | SL hit count: %d",
+                        instrument.symbol, cooldown_key[1],
+                        self._sl_cooldowns[cooldown_key].strftime("%H:%M"),
+                        self._daily_sl_hit[instrument.symbol],
+                    )
 
     async def _fetch_global_data(self) -> None:
         """Fetch and analyze global market indices, FII/DII, and breadth."""
@@ -2411,81 +2480,6 @@ class Orchestrator:
                 if expiry:
                     self._options_metrics[inst.symbol] = await self._update_options_chain_for(
                         inst, spot_price, expiry
-                    )
-
-    async def _check_trade_exits(self, spot_price: float) -> None:
-        """Check all open V1 trades using SmartExitEngine for exit decisions."""
-        if not self.paper_trader.open_trades:
-            return
-
-        current_prices: dict[str, float] = {}
-        for trade in self.paper_trader.open_trades:
-            token_info = self.client._search_symbol(trade.symbol)
-            if token_info:
-                ltp = self.client.get_ltp(
-                    "NFO",
-                    token_info.get("tradingsymbol", ""),
-                    token_info.get("symboltoken", ""),
-                )
-                if ltp:
-                    current_prices[trade.symbol] = ltp
-
-        # Use SmartExitEngine for V1 trades (same as V2)
-        for trade in list(self.paper_trader.open_trades):
-            ltp = current_prices.get(trade.symbol)
-            if ltp is None:
-                continue
-
-            # Get snapshot for this trade's instrument
-            instrument_symbol = getattr(trade, 'instrument', None) or 'NIFTY'
-            snap = self.snapshots.get(instrument_symbol)
-            if not snap:
-                continue
-
-            # Compute option ATR from spot ATR
-            atr = snap.indicators.atr if snap.indicators else None
-            opt_atr = (atr or 0) * 0.5  # ATM delta ~0.5
-
-            result = self.smart_exit.evaluate(
-                trade=trade,
-                current_ltp=ltp,
-                snap=snap,
-                day_type=self.day_type if self.day_classified else DayType.PENDING,
-                spot_price=spot_price,
-                candle_closed=True,  # V1 runs once per candle close
-                option_atr=opt_atr,
-            )
-
-            # Update trailing SL
-            if result.new_stoploss is not None and not result.should_exit:
-                if result.new_stoploss > trade.stoploss:
-                    logger.debug(
-                        "[V1] SL UPDATE: %s | Old=%.2f -> New=%.2f | %s",
-                        trade.symbol, trade.stoploss, result.new_stoploss, result.reason,
-                    )
-                    trade.stoploss = result.new_stoploss
-
-            if result.should_exit:
-                trade.exit_price = result.exit_price
-                trade.exit_type = result.exit_type
-                self.paper_trader._close_trade(trade, result.exit_type)
-                await self.trade_logger.log_trade(trade)
-                await self.alert_manager.send_exit_alert(trade)
-                logger.info(
-                    "[V1] EXIT [%s]: %s | PnL=%.2f | %s",
-                    result.exit_type, trade.symbol, trade.pnl or 0, result.reason,
-                )
-                # Record re-entry cooldown on stoploss exits (15 min)
-                if result.exit_type in ("stoploss", "hard_stoploss"):
-                    cooldown_key = (instrument_symbol, trade.option_type.value if trade.option_type else "")
-                    self._sl_cooldowns[cooldown_key] = datetime.now() + timedelta(minutes=15)
-                    # Daily SL counter — stop trading after 2 SL hits
-                    self._daily_sl_hit[instrument_symbol] = self._daily_sl_hit.get(instrument_symbol, 0) + 1
-                    logger.info(
-                        "[%s] SL cooldown set for %s direction until %s | SL hit count: %d",
-                        instrument_symbol, cooldown_key[1],
-                        self._sl_cooldowns[cooldown_key].strftime("%H:%M"),
-                        self._daily_sl_hit[instrument_symbol],
                     )
 
     # ── V2 Engine ─────────────────────────────────────────────────────────

@@ -62,6 +62,7 @@ class ExitConfig:
     use_close_based_sl: bool = True     # Close-based SL — only exit on candle close (was False)
     catastrophic_atr_mult: float = 3.0  # Immediate SL if drop > this × ATR
     grace_period_minutes: int = 3       # No trailing SL adjustment in first N minutes (new)
+    sl_confirm_candles: int = 2         # Require N consecutive candle closes below SL before exit
 
 
 class SmartExitEngine:
@@ -70,6 +71,9 @@ class SmartExitEngine:
     This engine does NOT close trades directly — it returns ExitResult
     objects that the orchestrator acts on. This keeps concerns separated.
     """
+
+    # Track consecutive candle closes below SL per trade
+    _sl_breach_counts: dict[str, int] = {}
 
     def evaluate(
         self,
@@ -137,7 +141,16 @@ class SmartExitEngine:
     # ── Exit checks ──────────────────────────────────────────────────────
 
     def _check_hard_stoploss(self, trade: Trade, ltp: float, cfg: ExitConfig, candle_closed: bool = False, option_atr: float = 0.0) -> ExitResult:
-        # Catastrophic exit: immediate if drop > 3× ATR (regardless of candle close)
+        # ── Grace period: block ALL SL exits except catastrophic ────────
+        # During the first N minutes, ORB/TREND trades face violent washouts
+        # that recover. Only exit if drop is truly catastrophic (>3×ATR).
+        in_grace = False
+        if cfg.grace_period_minutes > 0 and trade.entry_datetime is not None:
+            now = datetime.now(_IST)
+            elapsed_min = (now - trade.entry_datetime).total_seconds() / 60
+            in_grace = elapsed_min < cfg.grace_period_minutes
+
+        # Catastrophic exit: immediate if drop > 3× ATR (regardless of grace/candle close)
         if option_atr > 0:
             catastrophic_level = trade.entry_price - (cfg.catastrophic_atr_mult * option_atr)
             if ltp <= catastrophic_level:
@@ -148,15 +161,40 @@ class SmartExitEngine:
                     reason=f"CATASTROPHIC SL: {ltp:.2f} <= {catastrophic_level:.2f} (>{cfg.catastrophic_atr_mult:.0f}×ATR below entry)",
                 )
 
-        # Close-based SL: only exit if the 1-min candle CLOSED below SL
+        # During grace period, skip all normal SL checks — let trade breathe
+        if in_grace:
+            return ExitResult()
+
+        # Close-based SL with 2-candle confirmation:
+        # First candle close below SL = warning. Second consecutive = exit.
+        # This survives single-candle washouts/stop-hunts.
         if cfg.use_close_based_sl:
+            tid = trade.trade_id
             if candle_closed and ltp <= trade.stoploss:
-                return ExitResult(
-                    should_exit=True,
-                    exit_type="stoploss",
-                    exit_price=ltp,
-                    reason=f"Close-based SL hit at {ltp:.2f} (SL={trade.stoploss:.2f})",
-                )
+                breach_count = SmartExitEngine._sl_breach_counts.get(tid, 0) + 1
+                SmartExitEngine._sl_breach_counts[tid] = breach_count
+                if breach_count >= cfg.sl_confirm_candles:
+                    SmartExitEngine._sl_breach_counts.pop(tid, None)
+                    return ExitResult(
+                        should_exit=True,
+                        exit_type="stoploss",
+                        exit_price=ltp,
+                        reason=f"Close-based SL confirmed ({breach_count} candles below SL={trade.stoploss:.2f})",
+                    )
+                else:
+                    logger.info(
+                        "SL BREACH %d/%d: %s LTP=%.2f < SL=%.2f — waiting for confirmation",
+                        breach_count, cfg.sl_confirm_candles, trade.symbol, ltp, trade.stoploss,
+                    )
+                    return ExitResult()
+            elif candle_closed and ltp > trade.stoploss:
+                # Price recovered above SL — reset breach counter
+                if tid in SmartExitEngine._sl_breach_counts:
+                    logger.info(
+                        "SL BREACH RESET: %s recovered above SL (LTP=%.2f > SL=%.2f)",
+                        trade.symbol, ltp, trade.stoploss,
+                    )
+                    SmartExitEngine._sl_breach_counts.pop(tid, None)
             return ExitResult()
 
         # Legacy tick-based SL
@@ -334,7 +372,7 @@ class SmartExitEngine:
             strategy_name = trade.strategy.value if hasattr(trade.strategy, 'value') else str(trade.strategy)
             # Strategy-specific trail configs: (trail_factor, trail_activation_pct, grace_minutes)
             strategy_configs = {
-                "ORB": (0.50, 15.0, 2),              # ORB = sharp moves, moderate trail
+                "ORB": (0.50, 15.0, 10),             # ORB = 10 min grace for breakout retest/washout
                 "TREND_PULLBACK": (0.25, 20.0, 5),   # Widest trail — let trend run fully
                 "VWAP_RECLAIM": (0.35, 18.0, 3),     # Moderate-wide — reclaims need room
                 "RANGE_BREAKOUT": (0.40, 18.0, 3),   # Moderate — breakouts need confirmation
