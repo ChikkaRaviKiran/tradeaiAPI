@@ -178,7 +178,7 @@ class DhanOptionFetcher:
             "expiryCode": 1,  # NOTE: DhanHQ treats 0 as missing, use 1 (near expiry)
             "strike": strike_label,
             "drvOptionType": option_type,
-            "requiredData": ["open", "high", "low", "close", "volume", "strike", "spot"],
+            "requiredData": ["open", "high", "low", "close", "volume", "strike", "spot", "oi", "iv"],
             "fromDate": from_date,
             "toDate": to_date,
         }
@@ -232,6 +232,9 @@ class DhanOptionFetcher:
         closes = side_data.get("close", [])
         volumes = side_data.get("volume", [])
         strikes = side_data.get("strike", [])
+        spots = side_data.get("spot", [])
+        ois = side_data.get("oi", [])
+        ivs = side_data.get("iv", [])
 
         if not timestamps:
             return []
@@ -260,6 +263,9 @@ class DhanOptionFetcher:
                 "low": lows[i] if i < len(lows) else 0,
                 "close": closes[i] if i < len(closes) else 0,
                 "volume": volumes[i] if i < len(volumes) else 0,
+                "oi": ois[i] if i < len(ois) else None,
+                "iv": ivs[i] if i < len(ivs) else None,
+                "spot": spots[i] if i < len(spots) else None,
             })
         return candles
 
@@ -273,15 +279,18 @@ class DhanOptionFetcher:
             before = await session.execute(text("SELECT count(*) FROM option_candles"))
             count_before = before.scalar()
 
-            # Use INSERT ... ON CONFLICT DO NOTHING for idempotency
+            # Use INSERT ... ON CONFLICT DO UPDATE to backfill oi/iv/spot
             insert_sql = text("""
                 INSERT INTO option_candles
                     (instrument, expiry, strike, option_type, trading_symbol,
-                     date, timestamp, open, high, low, close, volume)
+                     date, timestamp, open, high, low, close, volume, oi, iv, spot)
                 VALUES
                     (:instrument, :expiry, :strike, :option_type, :trading_symbol,
-                     :date, :timestamp, :open, :high, :low, :close, :volume)
-                ON CONFLICT (trading_symbol, timestamp) DO NOTHING
+                     :date, :timestamp, :open, :high, :low, :close, :volume, :oi, :iv, :spot)
+                ON CONFLICT (trading_symbol, timestamp) DO UPDATE SET
+                    oi = COALESCE(EXCLUDED.oi, option_candles.oi),
+                    iv = COALESCE(EXCLUDED.iv, option_candles.iv),
+                    spot = COALESCE(EXCLUDED.spot, option_candles.spot)
             """)
             # Batch in chunks of 1000
             chunk_size = 1000
@@ -492,6 +501,7 @@ async def _main():
     parser.add_argument("--days", type=int, default=90, help="Days to fetch (default: 90)")
     parser.add_argument("--today", action="store_true", help="Fetch today's data only")
     parser.add_argument("--backfill-chunk", action="store_true", help="Fetch one 30-day backfill chunk")
+    parser.add_argument("--refetch", action="store_true", help="Re-fetch existing data (resets progress, used to backfill oi/iv/spot)")
     parser.add_argument("--token", type=str, default=None, help="DhanHQ access token (overrides env)")
     parser.add_argument("--instruments", type=str, default=None, help="Comma-separated instruments (e.g. NIFTY,SENSEX)")
     args = parser.parse_args()
@@ -499,6 +509,12 @@ async def _main():
     instruments = args.instruments.split(",") if args.instruments else None
 
     fetcher = DhanOptionFetcher(token=args.token)
+
+    # --refetch: clear progress so batch re-downloads everything
+    if args.refetch:
+        logger.info("REFETCH mode: clearing progress to re-download with oi/iv/spot")
+        fetcher._progress = {}
+        fetcher._save_progress()
 
     try:
         if args.today:

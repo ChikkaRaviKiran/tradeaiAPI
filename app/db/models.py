@@ -280,6 +280,9 @@ class OptionCandle(Base):
     low = Column(Float, nullable=False)
     close = Column(Float, nullable=False)
     volume = Column(Integer, nullable=False, default=0)
+    oi = Column(Integer, nullable=True)                           # Open interest from DhanHQ
+    iv = Column(Float, nullable=True)                             # Implied volatility from DhanHQ
+    spot = Column(Float, nullable=True)                           # Underlying spot price from DhanHQ
     created_at = Column(DateTime, default=_now_ist)
 
 
