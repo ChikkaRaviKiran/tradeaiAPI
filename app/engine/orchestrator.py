@@ -734,6 +734,7 @@ class Orchestrator:
                 await self._generate_daily_report()
                 await self._run_post_market_evaluation()
                 await self._collect_daily_option_data()
+                await self._collect_dhan_option_data()
                 await self._collect_daily_index_candles()
                 await self._cleanup_old_data()
                 self.running = False
@@ -3273,6 +3274,32 @@ class Orchestrator:
         except Exception:
             logger.exception("Error collecting daily option data")
 
+        # DhanHQ expired options: fetch today + backfill one chunk
+        await self._collect_dhan_option_data()
+
+    async def _collect_dhan_option_data(self) -> None:
+        """Fetch today's expired option candles from DhanHQ + one backfill chunk."""
+        try:
+            from app.data.dhan_option_fetcher import DhanOptionFetcher
+            dhan_token = getattr(settings, "dhan_access_token", "")
+            if not dhan_token:
+                logger.debug("DHAN_ACCESS_TOKEN not set, skipping DhanHQ fetch")
+                return
+            fetcher = DhanOptionFetcher(token=dhan_token)
+            # Fetch today's data
+            logger.info("DhanHQ: fetching today's expired option data...")
+            today_results = await fetcher.fetch_today()
+            today_total = sum(r["candles_inserted"] for r in today_results)
+            logger.info("DhanHQ today: %d new candles", today_total)
+            # Backfill one 30-day chunk going further back
+            logger.info("DhanHQ: running one backfill chunk...")
+            backfill_results = await fetcher.fetch_backfill_chunk()
+            bf_total = sum(r["candles_inserted"] for r in backfill_results)
+            logger.info("DhanHQ backfill: %d new candles", bf_total)
+            await fetcher.cleanup()
+        except Exception:
+            logger.exception("Error in DhanHQ option data collection")
+
     async def _collect_daily_index_candles(self) -> None:
         """Collect today's 1-min index candles to DB for strategy evaluation."""
         try:
@@ -3283,6 +3310,27 @@ class Orchestrator:
             logger.info("Index candle collection done")
         except Exception:
             logger.exception("Error collecting daily index candles")
+
+    async def _collect_dhan_option_data(self) -> None:
+        """Fetch today's expired option candles from DhanHQ + one backfill chunk."""
+        try:
+            from app.data.dhan_option_fetcher import DhanOptionFetcher
+            if not getattr(settings, "dhan_access_token", ""):
+                logger.debug("DhanHQ not configured, skipping expired option fetch")
+                return
+            logger.info("Starting DhanHQ option data collection...")
+            fetcher = DhanOptionFetcher()
+            # 1. Fetch today's data
+            today_results = await fetcher.fetch_today()
+            today_total = sum(r.get("candles_inserted", 0) for r in today_results)
+            logger.info("DhanHQ today: %d new candles", today_total)
+            # 2. Fetch one backfill chunk (30 days further back)
+            backfill_results = await fetcher.fetch_backfill_chunk()
+            backfill_total = sum(r.get("candles_inserted", 0) for r in backfill_results)
+            logger.info("DhanHQ backfill: %d new candles", backfill_total)
+            await fetcher.cleanup()
+        except Exception:
+            logger.exception("Error in DhanHQ option data collection")
 
     # NOTE: No hardcoded expiry day fallback — expiry dates come exclusively from
     # SmartAPI instrument master via get_nearest_weekly_expiry(). If the instrument

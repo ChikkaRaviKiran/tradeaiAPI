@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4", alias="OPENAI_MODEL")
 
+    # DhanHQ (expired options data only)
+    dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
+
     # Telegram
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
@@ -83,6 +86,10 @@ class Settings(BaseSettings):
 
     # Bid-Ask / Liquidity
     max_spread_pct: float = Field(default=3.0, alias="MAX_SPREAD_PCT")  # Skip if bid-ask spread > this %
+
+    # DhanHQ (expired options data)
+    dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
+    dhan_client_id: str = Field(default="", alias="DHAN_CLIENT_ID")
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

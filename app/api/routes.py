@@ -1227,3 +1227,136 @@ async def get_strategy_analytics():
         }
 
     return result
+
+
+# ── Backtest Endpoints ────────────────────────────────────────────────────
+
+@app.post("/api/backtest/run")
+async def api_run_backtest(body: dict):
+    """Launch a new backtest simulation.
+
+    Body:
+        start_date: str (YYYY-MM-DD) — required
+        end_date: str (YYYY-MM-DD) — required
+        instruments: list[str] | null — optional, defaults to enabled instruments
+        strategies: list[str] | null — optional, defaults to all
+    """
+    from app.backtest.runner import run_backtest
+
+    start = body.get("start_date")
+    end = body.get("end_date")
+    if not start or not end:
+        raise HTTPException(status_code=400, detail="start_date and end_date are required")
+
+    # Validate date format
+    try:
+        datetime.strptime(start, "%Y-%m-%d")
+        datetime.strptime(end, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must be YYYY-MM-DD format")
+
+    if start > end:
+        raise HTTPException(status_code=400, detail="start_date must be before end_date")
+
+    instruments = body.get("instruments")
+    strategies = body.get("strategies")
+
+    job_id = await run_backtest(start, end, instruments, strategies)
+    return {"job_id": job_id, "status": "started"}
+
+
+@app.get("/api/backtest/status/{job_id}")
+async def api_backtest_status(job_id: str):
+    """Get the progress of a running backtest."""
+    from app.backtest.runner import get_job_progress, get_job_result
+
+    progress = get_job_progress(job_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    resp = {
+        "job_id": progress.job_id,
+        "status": progress.status,
+        "total_days": progress.total_days,
+        "processed_days": progress.processed_days,
+        "current_date": progress.current_date,
+        "message": progress.message,
+        "error": progress.error,
+    }
+
+    if progress.status == "completed":
+        result = get_job_result(job_id)
+        if result:
+            resp["result"] = {
+                "start_date": result.start_date,
+                "end_date": result.end_date,
+                "instruments": result.instruments,
+                "initial_capital": result.initial_capital,
+                "ending_capital": result.ending_capital,
+                "total_pnl": result.total_pnl,
+                "return_pct": result.return_pct,
+                "total_trades": result.total_trades,
+                "winners": result.winners,
+                "losers": result.losers,
+                "win_rate": result.win_rate,
+                "profit_factor": result.profit_factor,
+                "sharpe_ratio": result.sharpe_ratio,
+                "max_drawdown": result.max_drawdown,
+                "max_drawdown_pct": result.max_drawdown_pct,
+                "trades": result.trades,
+                "equity_curve": result.equity_curve,
+                "config_used": result.config_used,
+            }
+
+    return resp
+
+
+@app.get("/api/backtest/export/{job_id}")
+async def api_backtest_export(job_id: str):
+    """Download backtest results as Excel file."""
+    from fastapi.responses import Response
+    from app.backtest.runner import generate_excel, get_job_progress
+
+    progress = get_job_progress(job_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if progress.status != "completed":
+        raise HTTPException(status_code=400, detail="Backtest not yet completed")
+
+    excel_bytes = generate_excel(job_id)
+    if not excel_bytes:
+        raise HTTPException(status_code=404, detail="No trades to export")
+
+    filename = f"backtest_{job_id}_{progress.current_date}.xlsx"
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/backtest/jobs")
+async def api_backtest_jobs():
+    """List all backtest jobs."""
+    from app.backtest.runner import list_jobs
+    return list_jobs()
+
+
+@app.get("/api/backtest/config")
+async def api_backtest_config():
+    """Return current production config for display in UI."""
+    from app.core.instruments import get_enabled_instruments
+    from app.backtest.runner import ALL_STRATEGIES
+
+    enabled = get_enabled_instruments()
+    return {
+        "initial_capital": settings.initial_capital,
+        "max_trades_per_day": settings.max_trades_per_day,
+        "max_concurrent_positions": settings.max_concurrent_positions,
+        "max_concurrent_per_instrument": settings.max_concurrent_per_instrument,
+        "max_daily_loss_pct": settings.max_daily_loss_pct,
+        "consecutive_loss_limit": settings.consecutive_loss_limit,
+        "risk_per_trade_pct": settings.risk_per_trade_pct,
+        "instruments": [{"symbol": i.symbol, "name": i.display_name, "lot_size": i.lot_size} for i in enabled],
+        "strategies": list(ALL_STRATEGIES.keys()),
+    }
