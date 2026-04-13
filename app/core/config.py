@@ -97,6 +97,20 @@ class Settings(BaseSettings):
     mob_low_score_risk_pct: float = Field(default=0.5, alias="MOB_LOW_SCORE_RISK_PCT")
     mob_high_score_threshold: int = Field(default=3, alias="MOB_HIGH_SCORE_THRESHOLD")
 
+    # MOB Range-Bound Filter
+    mob_range_filter_enabled: bool = Field(default=True, alias="MOB_RANGE_FILTER_ENABLED")
+    mob_range_adx_threshold: float = Field(default=18.0, alias="MOB_RANGE_ADX_THRESHOLD")
+    mob_range_opening_pct: float = Field(default=0.4, alias="MOB_RANGE_OPENING_PCT")  # Opening range as % of spot
+    mob_range_vwap_crosses: int = Field(default=4, alias="MOB_RANGE_VWAP_CROSSES")  # Min VWAP crossings to flag range
+    mob_range_min_signals: int = Field(default=2, alias="MOB_RANGE_MIN_SIGNALS")  # Need N of 3 signals to skip
+    mob_range_check_bars: int = Field(default=30, alias="MOB_RANGE_CHECK_BARS")  # Bars for opening session check (~9:45)
+
+    # MOB Risk Management
+    mob_daily_sl_stop: bool = Field(default=True, alias="MOB_DAILY_SL_STOP")  # Stop after first SL hit of the day
+    mob_cooldown_loss_days: int = Field(default=3, alias="MOB_COOLDOWN_LOSS_DAYS")  # Consecutive loss days before cooldown
+    mob_cooldown_skip_days: int = Field(default=2, alias="MOB_COOLDOWN_SKIP_DAYS")  # Trading days to skip during cooldown
+    mob_min_premium: float = Field(default=50.0, alias="MOB_MIN_PREMIUM")  # Min option premium to enter
+
     # Bid-Ask / Liquidity
     max_spread_pct: float = Field(default=3.0, alias="MAX_SPREAD_PCT")  # Skip if bid-ask spread > this %
 

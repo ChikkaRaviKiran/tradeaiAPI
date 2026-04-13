@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
-from app.core.holidays import is_market_holiday
+from app.core.holidays import compute_weekly_expiry, is_market_holiday
 from app.db.models import Base
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ DHAN_INSTRUMENTS = {
         "instrument": "OPTIDX",
         "expiryFlag": "WEEK",
         "maxStrikes": 5,     # ATM ±5 (11 positions)
-        "expiryWeekday": 3,  # Thursday
+        "expiryWeekday": 1,  # Tuesday
         "strikeInterval": 50,
     },
     "SENSEX": {
@@ -70,7 +70,7 @@ DHAN_INSTRUMENTS = {
         "instrument": "OPTIDX",
         "expiryFlag": "WEEK",
         "maxStrikes": 3,     # ATM ±3 (7 positions)
-        "expiryWeekday": 4,  # Friday
+        "expiryWeekday": 3,  # Thursday
         "strikeInterval": 100,
     },
 }
@@ -208,10 +208,7 @@ class DhanOptionFetcher:
 
     @staticmethod
     def _compute_weekly_expiry(dt: date, expiry_weekday: int) -> date:
-        days_ahead = (expiry_weekday - dt.weekday()) % 7
-        if days_ahead == 0:
-            return dt
-        return dt + timedelta(days=days_ahead)
+        return compute_weekly_expiry(dt, expiry_weekday)
 
     def _parse_candles(
         self,

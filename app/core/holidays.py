@@ -163,3 +163,25 @@ def previous_trading_date(d: date) -> date:
     while is_market_holiday(candidate):
         candidate -= timedelta(days=1)
     return candidate
+
+
+def compute_weekly_expiry(dt: date, expiry_weekday: int) -> date:
+    """Compute the weekly expiry for a given trade date, adjusted for holidays.
+
+    Finds the next occurrence of ``expiry_weekday`` on or after ``dt``.
+    If that date falls on a market holiday or weekend, the expiry moves to
+    the **previous** trading day (exchange rule).
+
+    Args:
+        dt: The trade / reference date.
+        expiry_weekday: Target weekday (0=Mon … 4=Fri).  NIFTY=1 (Tue), SENSEX=3 (Thu).
+
+    Returns:
+        The actual expiry date after holiday adjustment.
+    """
+    days_ahead = (expiry_weekday - dt.weekday()) % 7
+    candidate = dt if days_ahead == 0 else dt + timedelta(days=days_ahead)
+    # If the normal expiry day is a holiday, exchange shifts to the previous trading day
+    while is_market_holiday(candidate):
+        candidate -= timedelta(days=1)
+    return candidate

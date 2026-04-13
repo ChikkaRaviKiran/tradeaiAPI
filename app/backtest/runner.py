@@ -24,10 +24,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.config import settings
+from app.core.holidays import compute_weekly_expiry
 from app.core.instruments import get_enabled_instruments
 from app.core.models import OptionsMetrics
 from app.engine.feature_engine import FeatureEngine
-from app.strategies.momentum_option_buying import MomentumOptionBuyingStrategy
+from app.strategies.momentum_option_buying import MomentumOptionBuyingStrategy, is_range_bound_session
 
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
@@ -251,16 +252,32 @@ def _simulate_mob_day(dt, data, option_cache, instruments_cfg,
     mob_trades_today = 0
     mob_consecutive_losses = 0
     instrument_traded_today = set()
+    sl_hit_today = False  # Daily SL stop flag
 
     for symbol in instrument_symbols:
         instrument = instruments_cfg[symbol]
         if dt not in data.get(symbol, {}):
             continue
 
+        # Daily SL stop: skip remaining instruments after first stoploss
+        if settings.mob_daily_sl_stop and sl_hit_today:
+            break
+
         df = data[symbol][dt].copy()
         df = fe.compute_indicators(df)
 
         if len(df) < 15:
+            continue
+
+        # ── Range-bound filter: skip if session looks choppy ──
+        if settings.mob_range_filter_enabled and is_range_bound_session(
+            df, float(df.iloc[min(settings.mob_range_check_bars - 1, len(df) - 1)]["close"]),
+            adx_threshold=settings.mob_range_adx_threshold,
+            opening_range_pct=settings.mob_range_opening_pct,
+            vwap_cross_limit=settings.mob_range_vwap_crosses,
+            min_signals=settings.mob_range_min_signals,
+            check_bars=settings.mob_range_check_bars,
+        ):
             continue
 
         for bar_idx in range(14, len(df)):
@@ -282,6 +299,12 @@ def _simulate_mob_day(dt, data, option_cache, instruments_cfg,
 
             opt_type = signal.option_type.value
             strike = round(spot / instrument.strike_interval) * instrument.strike_interval
+
+            # Compute expiry and trading symbol (holiday-aware)
+            trade_date = datetime.strptime(dt, "%Y-%m-%d").date() if isinstance(dt, str) else dt
+            expiry_date = compute_weekly_expiry(trade_date, instrument.expiry_weekday)
+            expiry_str = instrument.format_expiry(expiry_date)
+            trading_symbol = instrument.build_option_symbol(expiry_str, strike, opt_type)
 
             opt_key = (symbol, dt, float(strike), opt_type)
             opt_df = option_cache.get(opt_key)
@@ -311,6 +334,10 @@ def _simulate_mob_day(dt, data, option_cache, instruments_cfg,
 
             # Slippage
             entry_price = round(raw_entry * (1 + MOB_SLIPPAGE_PCT / 100), 2)
+
+            # Min premium filter
+            if entry_price < settings.mob_min_premium:
+                continue
 
             # SL & Targets
             one_r = entry_price * MOB_SL_PCT
@@ -349,6 +376,7 @@ def _simulate_mob_day(dt, data, option_cache, instruments_cfg,
             trade = {
                 "Date": dt,
                 "Instrument": symbol,
+                "Symbol": trading_symbol,
                 "Strategy": "MOMENTUM_OPTION_BUYING",
                 "Direction": opt_type,
                 "Score": mob_score,
@@ -380,6 +408,10 @@ def _simulate_mob_day(dt, data, option_cache, instruments_cfg,
                 mob_consecutive_losses += 1
             else:
                 mob_consecutive_losses = 0
+
+            # Flag stoploss hit for daily SL stop
+            if exit_reason == "stoploss":
+                sl_hit_today = True
 
     return day_trades, capital
 
@@ -456,11 +488,24 @@ async def _run_backtest_task(
         all_trades = []
         equity_curve = []
         capital = STARTING_CAPITAL
+        consecutive_loss_days = 0
+        cooldown_remaining = 0
 
         for day_idx, dt in enumerate(trading_dates):
             progress.processed_days = day_idx + 1
             progress.current_date = dt
             progress.message = f"Day {day_idx + 1}/{len(trading_dates)}: {dt}"
+
+            # Consecutive losing day cooldown
+            if cooldown_remaining > 0:
+                cooldown_remaining -= 1
+                equity_curve.append({
+                    "Date": dt,
+                    "PnL": 0,
+                    "Capital": round(capital, 2),
+                    "Trades": 0,
+                })
+                continue
 
             day_trades, capital = _simulate_mob_day(
                 dt, data, option_cache, instruments_cfg,
@@ -468,6 +513,18 @@ async def _run_backtest_task(
             )
 
             day_pnl = sum(t["PnL"] for t in day_trades)
+
+            # Track consecutive loss days for cooldown
+            if day_trades:
+                any_win = any(t["PnL"] > 0 for t in day_trades)
+                if any_win:
+                    consecutive_loss_days = 0
+                else:
+                    consecutive_loss_days += 1
+                    if consecutive_loss_days >= settings.mob_cooldown_loss_days:
+                        cooldown_remaining = settings.mob_cooldown_skip_days
+                        consecutive_loss_days = 0
+
             equity_curve.append({
                 "Date": dt,
                 "PnL": round(day_pnl, 2),
@@ -571,7 +628,7 @@ def generate_excel(job_id: str) -> Optional[bytes]:
     edf = pd.DataFrame(result.equity_curve)
 
     display_cols = [
-        "Date", "Instrument", "Strategy", "Direction", "Score",
+        "Date", "Instrument", "Symbol", "Strategy", "Direction", "Score",
         "Entry Time", "Exit Time", "Strike", "Entry Price", "Exit Price",
         "Stop Loss", "Target 1", "Target 2", "Lots", "Lot Size",
         "PnL", "PnL %", "Exit Reason", "Result", "Risk %", "Data Source",

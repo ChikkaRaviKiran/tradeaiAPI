@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
+from app.core.holidays import compute_weekly_expiry
 from app.core.instruments import get_enabled_instruments, InstrumentConfig
 from app.data.angelone_client import AngelOneClient
 from app.db.models import Base, OptionCandle
@@ -109,17 +110,14 @@ class OptionDataCollector:
         return strikes
 
     @staticmethod
-    def _compute_weekly_expiry(dt: date) -> date:
-        """Compute the weekly expiry date (Thursday) for a given trade date.
+    def _compute_weekly_expiry(dt: date, expiry_weekday: int = 1) -> date:
+        """Compute the weekly expiry date for a given trade date.
 
-        Weekly options expire on Thursday. For any date, find the nearest
-        Thursday on or after that date.
+        NIFTY expires Tuesday (weekday=1), SENSEX expires Thursday (weekday=3).
+        Finds the nearest expiry day on or after the given date.
+        If that day is a market holiday, shifts to the previous trading day.
         """
-        # Thursday = weekday 3
-        days_ahead = (3 - dt.weekday()) % 7
-        if days_ahead == 0:
-            return dt
-        return dt + timedelta(days=days_ahead)
+        return compute_weekly_expiry(dt, expiry_weekday)
 
     async def _save_candles(
         self,
@@ -217,9 +215,9 @@ class OptionDataCollector:
             return stats
         day_low, day_high = day_range
 
-        # Get expiry — compute algorithmically (nearest Thursday)
+        # Get expiry — compute per instrument weekday
         if expiry_str is None:
-            expiry_date = self._compute_weekly_expiry(dt)
+            expiry_date = self._compute_weekly_expiry(dt, instrument.expiry_weekday)
             expiry_str = instrument.format_expiry(expiry_date)
 
         strikes = self._get_strikes_for_range(instrument, day_low, day_high)

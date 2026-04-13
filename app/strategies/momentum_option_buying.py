@@ -53,6 +53,52 @@ MOMENTUM_MULTIPLIER = 1.3
 MIN_AVG_RANGE_PCT = 0.015  # 0.015% of price
 
 
+def is_range_bound_session(df: pd.DataFrame, spot_price: float,
+                           adx_threshold: float = 18.0,
+                           opening_range_pct: float = 0.4,
+                           vwap_cross_limit: int = 4,
+                           min_signals: int = 2,
+                           check_bars: int = 30) -> bool:
+    """Detect range-bound session using first N bars of the day.
+
+    Checks 3 signals:
+      1. ADX < threshold (no directional trend)
+      2. Opening range < X% of spot (tight range)
+      3. Price crossed VWAP >= N times (oscillating around mean)
+
+    Returns True if `min_signals` of 3 say range-bound → skip MOB.
+    """
+    if len(df) < check_bars:
+        return False  # Not enough data yet, allow trading
+
+    window = df.iloc[:check_bars]
+    range_signals = 0
+
+    # Signal 1: ADX at check_bars mark
+    adx_val = df.iloc[check_bars - 1].get("adx")
+    if adx_val is not None and not pd.isna(adx_val) and adx_val < adx_threshold:
+        range_signals += 1
+
+    # Signal 2: Opening range as % of spot
+    opening_high = float(window["high"].max())
+    opening_low = float(window["low"].min())
+    opening_range = (opening_high - opening_low) / spot_price * 100 if spot_price > 0 else 0
+    if opening_range < opening_range_pct:
+        range_signals += 1
+
+    # Signal 3: VWAP crossings in the window
+    vwap_series = window.get("vwap")
+    if vwap_series is not None and not vwap_series.isna().all():
+        closes = window["close"].values.astype(float)
+        vwaps = vwap_series.values.astype(float)
+        above = closes > vwaps
+        crossings = int(np.sum(np.diff(above.astype(int)) != 0))
+        if crossings >= vwap_cross_limit:
+            range_signals += 1
+
+    return range_signals >= min_signals
+
+
 class MomentumOptionBuyingStrategy(BaseStrategy):
     """Momentum Option Buying — catches strong directional moves with pullback confirmation."""
 

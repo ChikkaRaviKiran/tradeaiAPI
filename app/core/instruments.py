@@ -46,6 +46,7 @@ class InstrumentConfig:
     is_index: bool = False    # True for indices (no direct volume)
     enabled: bool = True      # Whether this instrument is active
     option_exchange: Exchange = Exchange.NFO  # Exchange for option contracts (NFO, BFO)
+    expiry_weekday: int = 1   # Weekly expiry day: 0=Mon,1=Tue,2=Wed,3=Thu,4=Fri (NIFTY=Tue, SENSEX=Thu)
 
     def nearest_strike(self, price: float, option_type: str = "CE") -> float:
         """Round price to nearest valid strike for this instrument."""
@@ -91,6 +92,7 @@ NIFTY = InstrumentConfig(
     futures_symbol_prefix="NIFTY",
     option_symbol_prefix="NIFTY",
     is_index=True,
+    expiry_weekday=1,  # Tuesday
 )
 
 BANKNIFTY = InstrumentConfig(
@@ -148,6 +150,7 @@ SENSEX = InstrumentConfig(
     is_index=True,
     enabled=True,
     option_exchange=Exchange.BFO,
+    expiry_weekday=3,  # Thursday
 )
 
 # ── Stock definitions (equity options on NSE) ────────────────────────────
