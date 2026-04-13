@@ -114,6 +114,7 @@ jobs:
 
             # Pull backend image (clean stale state from interrupted pulls)
             sudo docker system prune -f 2>/dev/null || true
+            sudo rm -rf /var/lib/docker/containerd/daemon/io.containerd.content.v1.content/ingest/* 2>/dev/null || true
             echo "Pulling ${BACKEND_IMAGE}:${BACKEND_TAG}"
             sudo docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}"
 
