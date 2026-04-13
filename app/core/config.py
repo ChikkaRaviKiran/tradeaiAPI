@@ -84,6 +84,19 @@ class Settings(BaseSettings):
     v2_skip_unclear_days: bool = Field(default=True, alias="V2_SKIP_UNCLEAR_DAYS")
     v2_openai_model: str = Field(default="gpt-4o-mini", alias="V2_OPENAI_MODEL")
 
+    # MOB (Momentum Option Buying) Backtest Parameters
+    mob_max_trades_per_day: int = Field(default=2, alias="MOB_MAX_TRADES_PER_DAY")
+    mob_consecutive_loss_stop: int = Field(default=2, alias="MOB_CONSECUTIVE_LOSS_STOP")
+    mob_slippage_pct: float = Field(default=1.0, alias="MOB_SLIPPAGE_PCT")
+    mob_sl_pct: float = Field(default=0.20, alias="MOB_SL_PCT")
+    mob_brokerage_per_lot: float = Field(default=40.0, alias="MOB_BROKERAGE_PER_LOT")
+    mob_eod_exit_hour: int = Field(default=15, alias="MOB_EOD_EXIT_HOUR")
+    mob_eod_exit_minute: int = Field(default=10, alias="MOB_EOD_EXIT_MINUTE")
+    mob_starting_capital: float = Field(default=100000.0, alias="MOB_STARTING_CAPITAL")
+    mob_high_score_risk_pct: float = Field(default=1.0, alias="MOB_HIGH_SCORE_RISK_PCT")
+    mob_low_score_risk_pct: float = Field(default=0.5, alias="MOB_LOW_SCORE_RISK_PCT")
+    mob_high_score_threshold: int = Field(default=3, alias="MOB_HIGH_SCORE_THRESHOLD")
+
     # Bid-Ask / Liquidity
     max_spread_pct: float = Field(default=3.0, alias="MAX_SPREAD_PCT")  # Skip if bid-ask spread > this %
 

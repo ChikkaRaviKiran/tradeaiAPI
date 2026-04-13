@@ -1344,19 +1344,17 @@ async def api_backtest_jobs():
 
 @app.get("/api/backtest/config")
 async def api_backtest_config():
-    """Return current production config for display in UI."""
+    """Return MOB strategy config for display in UI."""
     from app.core.instruments import get_enabled_instruments
-    from app.backtest.runner import ALL_STRATEGIES
+    from app.backtest.runner import ALL_STRATEGIES, MOB_SL_PCT, MOB_MAX_TRADES_PER_DAY, MOB_SLIPPAGE_PCT
 
     enabled = get_enabled_instruments()
     return {
-        "initial_capital": settings.initial_capital,
-        "max_trades_per_day": settings.max_trades_per_day,
-        "max_concurrent_positions": settings.max_concurrent_positions,
-        "max_concurrent_per_instrument": settings.max_concurrent_per_instrument,
-        "max_daily_loss_pct": settings.max_daily_loss_pct,
-        "consecutive_loss_limit": settings.consecutive_loss_limit,
-        "risk_per_trade_pct": settings.risk_per_trade_pct,
+        "strategy": "MOMENTUM_OPTION_BUYING",
+        "initial_capital": 100_000,
+        "sl_pct": MOB_SL_PCT * 100,
+        "slippage_pct": MOB_SLIPPAGE_PCT,
+        "max_trades_per_day": MOB_MAX_TRADES_PER_DAY,
         "instruments": [{"symbol": i.symbol, "name": i.display_name, "lot_size": i.lot_size} for i in enabled],
         "strategies": list(ALL_STRATEGIES.keys()),
     }

@@ -60,6 +60,8 @@ class StrategyName(str, enum.Enum):
     VWAP_PULLBACK = "VWAP_PULLBACK"        # V2: VWAP pullback on trend days
     GEX_BOUNCE = "GEX_BOUNCE"              # V2: GEX level bounce on range days
     RSI_EXTREME = "RSI_EXTREME"            # V2: RSI extreme reversal on volatile days
+    # Momentum Option Buying Engine
+    MOMENTUM_OPTION_BUYING = "MOMENTUM_OPTION_BUYING"  # Simple momentum + VWAP + pullback
     # Adaptive market structure strategy
     ADAPTIVE = "ADAPTIVE"                  # Context-aware adaptive entry
 
