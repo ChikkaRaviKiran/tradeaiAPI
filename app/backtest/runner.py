@@ -39,6 +39,7 @@ _IST = pytz.timezone("Asia/Kolkata")
 # Only MOB strategy is active — all others disabled
 ALL_STRATEGIES = {
     "MOMENTUM_OPTION_BUYING": MomentumOptionBuyingStrategy,
+    "RANGE_BREAKOUT": None,  # Handled separately via _run_rb_backtest_task
 }
 
 # ── MOB parameters (from settings, overridable via env vars) ──────────
