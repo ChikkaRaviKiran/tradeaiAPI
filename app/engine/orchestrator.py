@@ -82,18 +82,20 @@ PRE_CLOSE = dtime(15, 20)
 REPORT_TIME = dtime(15, 30)
 GLOBAL_FETCH_TIME = dtime(9, 0)
 LOAD_TIME = dtime(8, 45)
-NO_NEW_ENTRY_AFTER = dtime(10, 45)  # Best trades are 09:30-10:45; after this win rate drops sharply
+NO_NEW_ENTRY_AFTER = dtime(12, 0)  # RB trades in 09:45-10:15 and 11:00-12:00 windows
+
+# RANGE_BREAKOUT time windows — only enter during these periods (backtest-proven edge)
+_RB_ALLOWED_WINDOWS = [
+    (dtime(9, 45), dtime(10, 15)),
+    (dtime(11, 0), dtime(12, 0)),
+]
 
 LOOP_INTERVAL_SECONDS = 60  # 1-minute analysis cycle
 
-# LOCKED v1.0: Regime-strategy compatibility for 5 strategies
-# Only 3 regimes returned: TRENDING, RANGE_BOUND, HIGH_VOLATILITY
+# RB-only mode: regime compat disabled — RB self-selects via ADX/range conditions
 _REGIME_STRATEGY_COMPAT: dict[str, set[MarketRegime]] = {
-    "ORBStrategy": {MarketRegime.TRENDING, MarketRegime.HIGH_VOLATILITY},
-    "RangeBreakoutStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.TRENDING},
-    "VWAPReclaimStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.TRENDING},
-    "TrendPullbackStrategy": {MarketRegime.TRENDING},
-    "LiquiditySweepStrategy": {MarketRegime.RANGE_BOUND, MarketRegime.HIGH_VOLATILITY},
+    # Allow RangeBreakoutStrategy in ALL regimes
+    "RangeBreakoutStrategy": {MarketRegime.TRENDING, MarketRegime.RANGE_BOUND, MarketRegime.HIGH_VOLATILITY},
 }
 
 
@@ -233,12 +235,9 @@ class Orchestrator:
         from app.engine.strategy_selector import StrategySelector
         self.strategy_selector = StrategySelector()
 
-        # LOCKED v1.0: Only 5 strategies — do NOT change for 10-15 trading days
-        # Default to top 3 — selector overrides with DB data if available
+        # RB-ONLY MODE: Only RangeBreakout strategy active
         self.strategies: list[BaseStrategy] = [
-            TrendPullbackStrategy(),
-            MomentumBreakoutStrategy(),
-            ORBStrategy(),
+            RangeBreakoutStrategy(),
         ]
 
         # Unified engine components
@@ -1338,10 +1337,19 @@ class Orchestrator:
             # 7. Check exits on open trades for this instrument
             await self._check_trade_exits_for(instrument, spot_price)
 
-            # 8. Time-of-day circuit breaker — no new entries after 14:30
+            # 8. Time-of-day circuit breaker — no new entries after cutoff
             if now.time() >= NO_NEW_ENTRY_AFTER:
                 logger.debug("[%s][Cycle %d] After %s — no new entries", symbol, cycle, NO_NEW_ENTRY_AFTER)
                 self._log_event("gate", f"Past {NO_NEW_ENTRY_AFTER} — no new entries", cycle=cycle, instrument=symbol)
+                return
+
+            # 8a. RB time window filter — only enter during proven windows
+            current_time = now.time()
+            in_allowed_window = any(
+                start <= current_time <= end for start, end in _RB_ALLOWED_WINDOWS
+            )
+            if not in_allowed_window:
+                logger.debug("[%s][Cycle %d] Outside RB allowed windows — no new entries", symbol, cycle)
                 return
 
             # 8b. Global risk check + per-instrument concurrent limit
@@ -1761,74 +1769,18 @@ class Orchestrator:
                 best_signal.option_type.value, option_ltp, best_bid, best_ask, spread_pct,
             )
 
-            # Set ATR-based SL/targets
-            atr = indicators.atr
-            if atr is None or atr <= 0:
-                logger.warning("[%s] ATR unavailable — cannot compute SL/targets, skipping", symbol)
-                self._log_event("gate", "ATR unavailable — SL/targets cannot be computed", cycle=cycle, instrument=symbol)
-                await self.alert_manager.send_info(
-                    f"SIGNAL BLOCKED — {symbol} {best_signal.strategy.value}",
-                    f"Reason: ATR not available for position sizing\n"
-                    f"Strike: {int(best_signal.strike_price)} {best_signal.option_type.value}\n"
-                    f"Score: {best_score:.0f}",
-                )
-                return
-            # Structure-aware SL/targets — place SL beyond market structure, not blind ATR
-            option_atr = atr * 0.5  # ATM delta ~0.5 scales spot ATR to option premium
+            # Set uniform 20% SL/targets (aligned with backtest-proven exit framework)
+            # SL = 20% below entry (1R), T1 = +1R (SL→breakeven), T2 = +2R (lock 1R)
             best_signal.entry_price = entry_price
+            sl_amount = round(entry_price * 0.20, 2)  # 1R = 20% of entry
+            best_signal.stoploss = round(entry_price - sl_amount, 2)
+            best_signal.target1 = round(entry_price + sl_amount, 2)      # +1R
+            best_signal.target2 = round(entry_price + 2 * sl_amount, 2)  # +2R
 
-            # --- Structure-based SL ---
-            # Use swing low/high from market structure as anchor, with ATR buffer
-            is_call = best_signal.option_type == OptionType.CALL
-            structure_sl = None
-            if structure:
-                swings = structure.get("swing_lows" if is_call else "swing_highs", [])
-                if swings:
-                    # Use nearest swing level as structural SL anchor
-                    anchor_price = swings[-1][1]  # Most recent swing low/high (spot price)
-                    # Add 0.1% buffer beyond structure level
-                    buffer = anchor_price * 0.001
-                    if is_call:
-                        spot_sl = anchor_price - buffer  # Below swing low
-                    else:
-                        spot_sl = anchor_price + buffer  # Above swing high
-                    # Convert spot SL to option premium SL (delta ~0.5)
-                    spot_distance = abs(spot_price - spot_sl)
-                    option_sl_distance = spot_distance * 0.5
-                    structure_sl = entry_price - option_sl_distance
-
-            # Issue 1: Dynamic ATR multiplier based on day type
-            # TREND → tighter (1.5–2.0× ATR), VOLATILE/expiry → wider (2.0–3.5× ATR)
-            _dt = self.day_type if self.day_classified else DayType.PENDING
-            _is_expiry = snap.is_expiry_day if snap else False
-            if _dt == DayType.VOLATILE or _is_expiry:
-                atr_min_mult, atr_max_mult = 2.0, 3.5  # Volatile/expiry: wide SL
-            elif _dt == DayType.TREND:
-                atr_min_mult, atr_max_mult = 1.5, 2.5  # Trend: tighter OK
-            else:
-                atr_min_mult, atr_max_mult = 1.5, 3.0  # Default/Range/Pending
-
-            # ATR-based SL as fallback — widened to survive stop-hunting
-            atr_sl = entry_price - (2.0 * option_atr)
-            pct_sl = entry_price * 0.75  # 25% max loss floor
-
-            if structure_sl is not None and structure_sl > 0:
-                # Use structure SL but cap within dynamic ATR range
-                min_sl = entry_price - (atr_max_mult * option_atr)  # Max risk cap
-                max_sl = entry_price - (atr_min_mult * option_atr)  # Min breathing room
-                structure_sl = max(min_sl, min(structure_sl, max_sl))
-                best_signal.stoploss = round(max(structure_sl, pct_sl), 2)
-                logger.info(
-                    "[%s] STRUCTURE SL: %.2f (swing-based) vs ATR SL: %.2f",
-                    symbol, best_signal.stoploss, max(atr_sl, pct_sl),
-                )
-            else:
-                # Fallback to ATR-based SL
-                best_signal.stoploss = round(max(atr_sl, pct_sl), 2)
-
-            # T1 = 2.5× ATR, T2 = 4× ATR — reward must exceed risk
-            best_signal.target1 = round(entry_price + (2.5 * option_atr), 2)
-            best_signal.target2 = round(entry_price + (4.0 * option_atr), 2)
+            logger.info(
+                "[%s] UNIFORM SL: entry=%.2f SL=%.2f (-20%%) T1=%.2f (+1R) T2=%.2f (+2R)",
+                symbol, entry_price, best_signal.stoploss, best_signal.target1, best_signal.target2,
+            )
 
             # 12. AI — LOG ONLY (never blocks trades)
             #   Score + Rank + Risk control is the decision layer.
@@ -3026,146 +2978,38 @@ class Orchestrator:
             logger.exception("Error in pre-market evaluation — will use existing data or config fallback")
 
     async def _run_strategy_selection(self, day_type_str: str = "") -> None:
-        """Select best strategies per instrument using StrategySelector.
+        """RB-only mode: always use RangeBreakoutStrategy for all instruments.
 
-        Runs:
-          - Pre-market: uses pre-market conditions (gap, VIX, bias)
-          - 10:00 AM re-selection: includes actual day_type classification
-
-        Populates _instrument_strategies per instrument.
-        Falls back to TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB per instrument.
-        Also computes capital allocation based on win rates.
+        Ignores DB-based strategy selection — always returns RANGE_BREAKOUT.
         """
         try:
-            from app.engine.strategy_selector import MarketConditions
-            from app.db.models import AsyncSessionLocal
-
-            insight = self.pre_market_analyst.latest_insight or {}
-            vix_val = 0.0
-            for gi in self.global_indices:
-                if hasattr(gi, 'symbol') and 'VIX' in gi.symbol.upper():
-                    vix_val = gi.last_price if hasattr(gi, 'last_price') else 0.0
-                    break
-
-            gap_pct = 0.0
-            bias_str = insight.get("market_bias", "neutral")
-
-            _LOCKED_NAME_MAP = {
-                "ORB": ORBStrategy,
-                "VWAP_RECLAIM": VWAPReclaimStrategy,
-                "TREND_PULLBACK": TrendPullbackStrategy,
-                "RANGE_BREAKOUT": RangeBreakoutStrategy,
-                "LIQUIDITY_SWEEP": LiquiditySweepStrategy,
-                "MOMENTUM_BREAKOUT": MomentumBreakoutStrategy,
-            }
-
-            _DEFAULT_STRATEGIES = [
-                TrendPullbackStrategy(),
-                MomentumBreakoutStrategy(),
-                ORBStrategy(),
-            ]
-
-            # Per-instrument win rates for capital allocation
-            inst_win_rates: dict[str, float] = {}
+            rb_strategy = [RangeBreakoutStrategy()]
 
             for instrument in self._active_instruments:
                 symbol = instrument.symbol
-                # Convert day_type string to enum
-                dt_enum = DayType.PENDING
-                if day_type_str:
-                    try:
-                        dt_enum = DayType(day_type_str)
-                    except ValueError:
-                        dt_enum = DayType.PENDING
-                conditions = MarketConditions(
+                self._instrument_strategies[symbol] = list(rb_strategy)
+                self._instrument_capital[symbol] = settings.initial_capital / max(len(self._active_instruments), 1)
+                self._log_event(
+                    "selection",
+                    f"[{symbol}] RB-only mode: RANGE_BREAKOUT",
                     instrument=symbol,
-                    gap_pct=gap_pct,
-                    vix=vix_val,
-                    global_bias=bias_str,
-                    day_type=dt_enum,
                 )
+                logger.info("[%s] Strategy: RANGE_BREAKOUT (RB-only mode)", symbol)
 
-                async with AsyncSessionLocal() as session:
-                    result = await self.strategy_selector.select(session, conditions)
+            self.strategies = list(rb_strategy)
 
-                if result.selected:
-                    strategy_names = result.strategy_names()
-                    self._log_event(
-                        "selection",
-                        f"[{symbol}] Strategies selected: {', '.join(f'{p.strategy}({p.probability:.0f}%)' for p in result.selected)}",
-                        instrument=symbol,
-                    )
-                    logger.info(
-                        "[%s] Strategy selection: %s (condition=%s)",
-                        symbol, strategy_names, result.condition_key,
-                    )
-
-                    selected = []
-                    for name in strategy_names:
-                        cls = _LOCKED_NAME_MAP.get(name)
-                        if cls:
-                            selected.append(cls())
-                    if selected:
-                        self._instrument_strategies[symbol] = selected
-                        # Avg win rate from selected strategies for capital allocation
-                        avg_wr = sum(p.probability for p in result.selected) / len(result.selected) if result.selected else 50.0
-                        inst_win_rates[symbol] = avg_wr
-                        logger.info(
-                            "[%s] Per-instrument strategies: %s (avg WR=%.1f%%)",
-                            symbol, [type(s).__name__ for s in selected], avg_wr,
-                        )
-                    else:
-                        self._instrument_strategies[symbol] = list(_DEFAULT_STRATEGIES)
-                        inst_win_rates[symbol] = 50.0
-                        self._log_event(
-                            "selection",
-                            f"[{symbol}] No locked strategies matched — defaults (TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB)",
-                            instrument=symbol,
-                        )
-                else:
-                    self._instrument_strategies[symbol] = list(_DEFAULT_STRATEGIES)
-                    inst_win_rates[symbol] = 50.0
-                    self._log_event(
-                        "selection",
-                        f"[{symbol}] No condition data — defaults (TREND_PULLBACK + MOMENTUM_BREAKOUT + ORB)",
-                        instrument=symbol,
-                    )
-
-            # Also update shared self.strategies with union of all per-instrument
-            all_strat_classes = set()
-            for strats in self._instrument_strategies.values():
-                for s in strats:
-                    all_strat_classes.add(type(s).__name__)
-            if all_strat_classes:
-                self.strategies = []
-                for name, cls in _LOCKED_NAME_MAP.items():
-                    if cls.__name__ in all_strat_classes:
-                        self.strategies.append(cls())
-
-            # Capital allocation based on win rates
-            self._compute_capital_allocation(inst_win_rates)
-
-            # Send alert
-            selections = self.strategy_selector.latest_selections
-            if selections:
-                lines = []
-                for sym, sel in selections.items():
-                    strats = ", ".join(f"{p.strategy}({p.probability:.0f}%)" for p in sel.selected)
-                    cap = self._instrument_capital.get(sym, 0)
-                    lines.append(f"{sym}: {strats} | ₹{cap:,.0f}" if strats else f"{sym}: defaults | ₹{cap:,.0f}")
-                await self.alert_manager.send_info(
-                    "STRATEGY SELECTION" + (" (10AM re-select)" if day_type_str else ""),
-                    "\n".join(lines) + f"\nCondition: {sel.condition_key if sel else 'N/A'}",
-                )
+            await self.alert_manager.send_info(
+                "STRATEGY SELECTION — RB ONLY" + (" (10AM re-select)" if day_type_str else ""),
+                "\n".join(
+                    f"{inst.symbol}: RANGE_BREAKOUT | ₹{self._instrument_capital.get(inst.symbol, 0):,.0f}"
+                    for inst in self._active_instruments
+                ),
+            )
 
         except Exception:
-            logger.exception("Strategy selection failed — using default strategies")
-            # Ensure every instrument has defaults
+            logger.exception("Strategy selection failed — using RB default")
             for instrument in self._active_instruments:
-                if instrument.symbol not in self._instrument_strategies:
-                    self._instrument_strategies[instrument.symbol] = [
-                        TrendPullbackStrategy(), MomentumBreakoutStrategy(), ORBStrategy(),
-                    ]
+                self._instrument_strategies[instrument.symbol] = [RangeBreakoutStrategy()]
 
     def _compute_capital_allocation(self, inst_win_rates: dict[str, float]) -> None:
         """Allocate capital between instruments proportional to win rates.

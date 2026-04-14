@@ -42,6 +42,9 @@ class DayType(str, enum.Enum):
     TREND = "trend"
     RANGE = "range"
     VOLATILE = "volatile"
+    NARROW_RANGE = "narrow_range"
+    GAP_AND_GO = "gap_and_go"
+    REVERSAL = "reversal"
     UNCLEAR = "unclear"
     PENDING = "pending"  # Not yet classified (before 10:00)
 
@@ -64,6 +67,8 @@ class StrategyName(str, enum.Enum):
     MOMENTUM_OPTION_BUYING = "MOMENTUM_OPTION_BUYING"  # Simple momentum + VWAP + pullback
     # Adaptive market structure strategy
     ADAPTIVE = "ADAPTIVE"                  # Context-aware adaptive entry
+    # ORB + VWAP directional strategy
+    ORB_VWAP = "ORB_VWAP"                  # Opening Range Breakout + VWAP filter
 
 
 # ── Market Data Models ─────────────────────────────────────────────────────────

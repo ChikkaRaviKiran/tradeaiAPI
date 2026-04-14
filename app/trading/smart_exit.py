@@ -384,65 +384,21 @@ class SmartExitEngine:
     # ── Config builder ───────────────────────────────────────────────────
 
     def _build_config(self, day_type: DayType, trade: Optional[Trade] = None) -> ExitConfig:
-        """Build exit config adjusted for day type and strategy.
+        """Build exit config for RB-only mode with uniform 20% SL framework.
 
-        - TREND days: wider trail (let winners run), longer hold time
-        - RANGE days: tighter targets, faster exits
-        - VOLATILE days: wider SL, quicker breakeven
-        - Strategy-specific trailing factors
+        Aligned with backtest: 20% SL (1R), T1 at +1R → SL→breakeven, T2 at +2R → lock 1R.
+        Day-type adjustments removed — uniform exits proven across all regimes.
         """
         base = ExitConfig(
-            stoploss_pct=settings.v2_stoploss_pct,
-            quick_target_pct=settings.v2_quick_target_pct,
-            breakeven_trigger_pct=12.0,   # Later breakeven — let trade breathe
-            trail_activation_pct=18.0,    # Start trailing only after solid profit
-            trail_factor=0.40,            # Wider trail — capture more of the move
+            stoploss_pct=20.0,                # Uniform 20% SL = 1R
+            quick_target_pct=20.0,            # T1 at +1R (same as SL distance)
+            breakeven_trigger_pct=20.0,       # Move SL to breakeven when +1R hit
+            trail_activation_pct=30.0,        # Start trailing after +1.5R
+            trail_factor=0.50,                # Lock 50% of unrealized profit
             max_hold_minutes=settings.v2_max_hold_minutes,
-            use_close_based_sl=True,      # Close-based SL by default
-            grace_period_minutes=5,       # FIX 2: Min 5 min grace for all strategies (was 3)
+            use_close_based_sl=True,
+            grace_period_minutes=5,
+            sl_confirm_candles=3,
         )
-
-        # Strategy-specific trailing factors (wider than before)
-        if trade and hasattr(trade, 'strategy'):
-            strategy_name = trade.strategy.value if hasattr(trade.strategy, 'value') else str(trade.strategy)
-            # Strategy-specific trail configs: (trail_factor, trail_activation_pct, grace_minutes)
-            strategy_configs = {
-                "ORB": (0.50, 15.0, 10),             # ORB = 10 min grace for breakout retest/washout
-                "TREND_PULLBACK": (0.25, 20.0, 7),   # Widest trail — let trend run fully
-                "VWAP_RECLAIM": (0.35, 18.0, 5),     # FIX 2: min 5 min grace (was 3)
-                "RANGE_BREAKOUT": (0.40, 18.0, 5),   # FIX 2: min 5 min grace (was 3)
-                "LIQUIDITY_SWEEP": (0.30, 20.0, 5),  # FIX 2: min 5 min grace (was 4)
-                "MOMENTUM_BREAKOUT": (0.35, 18.0, 7), # FIX 2: widened grace (was 5)
-            }
-            if strategy_name in strategy_configs:
-                trail_f, trail_act, grace = strategy_configs[strategy_name]
-                base.trail_factor = trail_f
-                base.trail_activation_pct = trail_act
-                base.grace_period_minutes = grace
-
-        if day_type == DayType.TREND:
-            # Let winners run on trend days
-            base.trail_factor = min(base.trail_factor, 0.30)  # Even wider on trend days
-            base.trail_activation_pct = max(base.trail_activation_pct, 20.0)  # Delay trailing
-            base.max_hold_minutes = int(base.max_hold_minutes * 1.3)  # Hold longer
-            base.breakeven_trigger_pct = 10.0  # Earlier breakeven OK on trend days (safety net)
-            base.grace_period_minutes = max(base.grace_period_minutes, 5)  # More grace
-
-        elif day_type == DayType.RANGE:
-            # Quick in-and-out on range days
-            base.trail_factor = max(base.trail_factor, 0.50)  # Tighter trail
-            base.trail_activation_pct = 15.0  # Trail sooner
-            base.max_hold_minutes = int(base.max_hold_minutes * 0.7)  # Shorter hold
-            base.quick_target_pct *= 0.8       # Lower T1 target
-            base.breakeven_trigger_pct = 8.0   # Earlier on range days
-            base.grace_period_minutes = 2      # Less grace
-
-        elif day_type == DayType.VOLATILE:
-            # Wider stops but faster breakeven on volatile days
-            base.stoploss_pct *= 1.2           # Wider SL
-            base.breakeven_trigger_pct = 8.0   # Earlier breakeven on volatile days (protect capital)
-            base.trail_factor = min(base.trail_factor, 0.35)  # Moderate-wide trail
-            base.trail_activation_pct = 15.0   # Trail sooner (volatility = fast moves)
-            base.grace_period_minutes = 2      # Less grace
 
         return base

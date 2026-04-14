@@ -49,6 +49,12 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     await init_db()
 
+    import os
+    if os.environ.get("SKIP_ORCHESTRATOR") == "1":
+        logger.info("SKIP_ORCHESTRATOR=1 — skipping orchestrator (backtest-only mode)")
+        yield
+        return
+
     # Start orchestrator as a background task in the SAME event loop
     # (avoids asyncpg "Future attached to a different loop" errors)
     from app.engine.orchestrator import Orchestrator

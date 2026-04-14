@@ -88,14 +88,14 @@ class Settings(BaseSettings):
     mob_max_trades_per_day: int = Field(default=2, alias="MOB_MAX_TRADES_PER_DAY")
     mob_consecutive_loss_stop: int = Field(default=2, alias="MOB_CONSECUTIVE_LOSS_STOP")
     mob_slippage_pct: float = Field(default=1.0, alias="MOB_SLIPPAGE_PCT")
-    mob_sl_pct: float = Field(default=0.20, alias="MOB_SL_PCT")
+    mob_sl_pct: float = Field(default=0.15, alias="MOB_SL_PCT")  # Tightened from 20% to 15% in v2
     mob_brokerage_per_lot: float = Field(default=40.0, alias="MOB_BROKERAGE_PER_LOT")
     mob_eod_exit_hour: int = Field(default=15, alias="MOB_EOD_EXIT_HOUR")
     mob_eod_exit_minute: int = Field(default=10, alias="MOB_EOD_EXIT_MINUTE")
     mob_starting_capital: float = Field(default=100000.0, alias="MOB_STARTING_CAPITAL")
     mob_high_score_risk_pct: float = Field(default=1.0, alias="MOB_HIGH_SCORE_RISK_PCT")
     mob_low_score_risk_pct: float = Field(default=0.5, alias="MOB_LOW_SCORE_RISK_PCT")
-    mob_high_score_threshold: int = Field(default=3, alias="MOB_HIGH_SCORE_THRESHOLD")
+    mob_high_score_threshold: int = Field(default=4, alias="MOB_HIGH_SCORE_THRESHOLD")  # v2: score 4+ = full risk (was 3)
 
     # MOB Range-Bound Filter
     mob_range_filter_enabled: bool = Field(default=True, alias="MOB_RANGE_FILTER_ENABLED")
@@ -108,8 +108,36 @@ class Settings(BaseSettings):
     # MOB Risk Management
     mob_daily_sl_stop: bool = Field(default=True, alias="MOB_DAILY_SL_STOP")  # Stop after first SL hit of the day
     mob_cooldown_loss_days: int = Field(default=3, alias="MOB_COOLDOWN_LOSS_DAYS")  # Consecutive loss days before cooldown
-    mob_cooldown_skip_days: int = Field(default=2, alias="MOB_COOLDOWN_SKIP_DAYS")  # Trading days to skip during cooldown
+    mob_cooldown_skip_days: int = Field(default=0, alias="MOB_COOLDOWN_SKIP_DAYS")  # Trading days to skip during cooldown (0=disabled)
     mob_min_premium: float = Field(default=50.0, alias="MOB_MIN_PREMIUM")  # Min option premium to enter
+
+    # MOB v2 Enhanced Parameters
+    mob_afternoon_enabled: bool = Field(default=False, alias="MOB_AFTERNOON_ENABLED")  # Afternoon window (default off for higher edge)
+    mob_max_hold_bars: int = Field(default=45, alias="MOB_MAX_HOLD_BARS")  # Exit if no T1 within N bars
+    mob_exit_slippage_pct: float = Field(default=0.5, alias="MOB_EXIT_SLIPPAGE_PCT")  # Exit slippage %
+    mob_t1_partial_pct: float = Field(default=0.50, alias="MOB_T1_PARTIAL_PCT")  # % of lots to exit at T1
+    mob_direction_alignment: bool = Field(default=True, alias="MOB_DIRECTION_ALIGNMENT")  # Require NIFTY/SENSEX same direction
+
+    # ORB+VWAP Backtest Parameters
+    orb_sl_type: str = Field(default="structural", alias="ORB_SL_TYPE")  # structural (ORB opposite end) or pct
+    orb_sl_pct: float = Field(default=0.15, alias="ORB_SL_PCT")  # Fallback SL if structural too wide
+    orb_rr_ratio: float = Field(default=2.5, alias="ORB_RR_RATIO")  # Reward:Risk ratio for target
+    orb_max_trades_per_day: int = Field(default=1, alias="ORB_MAX_TRADES_PER_DAY")  # 1 trade per day per instrument
+    orb_slippage_pct: float = Field(default=1.0, alias="ORB_SLIPPAGE_PCT")  # Entry slippage %
+    orb_exit_slippage_pct: float = Field(default=0.5, alias="ORB_EXIT_SLIPPAGE_PCT")  # Exit slippage %
+    orb_brokerage_per_lot: float = Field(default=40.0, alias="ORB_BROKERAGE_PER_LOT")
+    orb_starting_capital: float = Field(default=100000.0, alias="ORB_STARTING_CAPITAL")
+    orb_risk_pct: float = Field(default=1.0, alias="ORB_RISK_PCT")  # Risk % per trade
+    orb_min_range_pct: float = Field(default=0.3, alias="ORB_MIN_RANGE_PCT")  # Min ORB range as % of spot
+    orb_max_range_atr_mult: float = Field(default=15.0, alias="ORB_MAX_RANGE_ATR_MULT")  # Max ORB range as 1-min ATR multiple
+    orb_entry_window_end_hour: int = Field(default=11, alias="ORB_ENTRY_WINDOW_END_HOUR")  # No entries after
+    orb_entry_window_end_min: int = Field(default=30, alias="ORB_ENTRY_WINDOW_END_MIN")
+    orb_eod_exit_hour: int = Field(default=15, alias="ORB_EOD_EXIT_HOUR")
+    orb_eod_exit_minute: int = Field(default=10, alias="ORB_EOD_EXIT_MINUTE")
+    orb_vwap_exit_enabled: bool = Field(default=False, alias="ORB_VWAP_EXIT_ENABLED")  # VWAP cross exit disabled  # Exit on VWAP cross
+    orb_direction_lock: bool = Field(default=True, alias="ORB_DIRECTION_LOCK")  # First break locks direction
+    orb_trail_after_target: bool = Field(default=True, alias="ORB_TRAIL_AFTER_TARGET")  # Trail SL after target hit
+    orb_min_premium: float = Field(default=50.0, alias="ORB_MIN_PREMIUM")  # Min option premium
 
     # Bid-Ask / Liquidity
     max_spread_pct: float = Field(default=3.0, alias="MAX_SPREAD_PCT")  # Skip if bid-ask spread > this %

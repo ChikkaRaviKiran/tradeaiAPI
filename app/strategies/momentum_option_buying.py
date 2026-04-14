@@ -1,7 +1,9 @@
-"""Momentum Option Buying Engine (Final v1).
+"""Momentum Option Buying Engine (v2 — Enhanced).
 
-Core objective: Catch strong intraday moves using simple rules.
+Core objective: Catch strong intraday moves using confluence-based rules.
 → Low trade count, small losses, occasional big wins.
+→ v2 adds: EMA trend alignment, RSI filter, volume confirmation,
+   better scoring with momentum quality differentiation.
 
 Entry conditions:
   1. Market filter: avg range of last 10 candles must exceed threshold (no sideways)
@@ -9,17 +11,20 @@ Entry conditions:
   3. VWAP direction: price > VWAP → UP (CE), price < VWAP → DOWN (PE)
   4. Breakout/breakdown of recent 10-candle high/low
   5. Pullback confirmation: wait 1 candle pullback, next candle continues in direction
+  6. EMA trend alignment: EMA9 > EMA20 for calls, EMA9 < EMA20 for puts
+  7. RSI filter: 35-70 for calls, 30-65 for puts (avoid extremes)
+  8. Volume confirmation: momentum candle volume > 1.2× avg volume
 
-Time windows: 09:20–11:30, 14:30–15:15
+Time windows: 09:30–11:30 (morning only — afternoon dropped for higher edge)
 
-Scoring (simple):
+Scoring (enhanced 0-6):
   - Momentum present: +1
   - Clear VWAP direction: +1
-  - ATM option available: +1
-  → score 3 = full qty, score 2 = half qty, else skip
-
-Stop loss: 1R = max(recent swing distance, 12% of entry)
-Target: +1R → move SL to cost, +2R → book 50%, rest trail previous candle
+  - EMA trend aligned: +1
+  - Strong momentum (ratio > 1.8×): +1
+  - RSI in sweet spot: +1
+  - Volume confirmation: +1
+  → score >= 4 = full qty, score 3 = half qty, else skip
 """
 
 from __future__ import annotations
@@ -36,9 +41,10 @@ from app.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-# Time windows
+# Time windows — morning only for higher edge
 MORNING_START = dtime(9, 30)
 MORNING_END = dtime(11, 30)
+# Afternoon window disabled by default (configurable via settings)
 AFTERNOON_START = dtime(14, 30)
 AFTERNOON_END = dtime(15, 15)
 
@@ -46,11 +52,22 @@ AFTERNOON_END = dtime(15, 15)
 RANGE_LOOKBACK = 10
 
 # Momentum multiplier: current candle range must exceed this × avg range
-MOMENTUM_MULTIPLIER = 1.3
+MOMENTUM_MULTIPLIER = 1.5  # Raised from 1.3 to filter weaker signals
+
+# Strong momentum threshold for bonus score
+STRONG_MOMENTUM_MULTIPLIER = 1.8
 
 # Minimum avg range as fraction of price (filters dead markets)
-# Computed from typical NIFTY/SENSEX intraday movement
 MIN_AVG_RANGE_PCT = 0.015  # 0.015% of price
+
+# RSI boundaries for entry
+CALL_RSI_MIN = 35.0
+CALL_RSI_MAX = 70.0
+PUT_RSI_MIN = 30.0
+PUT_RSI_MAX = 65.0
+
+# Volume confirmation multiplier
+VOLUME_CONFIRM_MULTIPLIER = 1.2
 
 
 def is_range_bound_session(df: pd.DataFrame, spot_price: float,
@@ -100,7 +117,11 @@ def is_range_bound_session(df: pd.DataFrame, spot_price: float,
 
 
 class MomentumOptionBuyingStrategy(BaseStrategy):
-    """Momentum Option Buying — catches strong directional moves with pullback confirmation."""
+    """Momentum Option Buying v2 — catches strong directional moves with
+    pullback confirmation and multi-factor confluence scoring."""
+
+    def __init__(self, afternoon_enabled: bool = False):
+        self.afternoon_enabled = afternoon_enabled
 
     def evaluate(
         self,
@@ -120,14 +141,12 @@ class MomentumOptionBuyingStrategy(BaseStrategy):
         if hasattr(last_time, "time"):
             t = last_time.time()
             in_morning = MORNING_START <= t <= MORNING_END
-            in_afternoon = AFTERNOON_START <= t <= AFTERNOON_END
+            in_afternoon = self.afternoon_enabled and (AFTERNOON_START <= t <= AFTERNOON_END)
             if not in_morning and not in_afternoon:
                 return None
 
         # ── STEP 1: Market filter — skip sideways ──
-        # Use the 10 candles BEFORE the momentum candle (which is at -3)
-        # Momentum = df.iloc[-3], Pullback = df.iloc[-2], Confirmation = df.iloc[-1]
-        lookback_end = -3  # exclude momentum candle, pullback, and confirmation
+        lookback_end = -3
         lookback_start = lookback_end - RANGE_LOOKBACK
         lookback_candles = df.iloc[lookback_start:lookback_end]
 
@@ -137,17 +156,16 @@ class MomentumOptionBuyingStrategy(BaseStrategy):
         candle_ranges = lookback_candles["high"] - lookback_candles["low"]
         avg_range = float(candle_ranges.mean())
 
-        # Dynamic threshold: skip if avg range is too small relative to price
         threshold = spot_price * MIN_AVG_RANGE_PCT / 100
         if avg_range < threshold:
             return None
 
         # ── STEP 2: Momentum detection ──
-        # The "momentum candle" is 3 bars back (before pullback + confirmation)
         momentum_candle = df.iloc[-3]
         momentum_range = float(momentum_candle["high"]) - float(momentum_candle["low"])
+        momentum_ratio = momentum_range / avg_range if avg_range > 0 else 0
 
-        has_momentum = momentum_range > MOMENTUM_MULTIPLIER * avg_range
+        has_momentum = momentum_ratio > MOMENTUM_MULTIPLIER
         if not has_momentum:
             return None
 
@@ -172,34 +190,66 @@ class MomentumOptionBuyingStrategy(BaseStrategy):
         momentum_close = float(momentum_candle["close"])
         momentum_open = float(momentum_candle["open"])
 
-        # ── Pullback confirmation (STEP 3 continued) ──
+        # ── Pullback confirmation ──
         pullback_candle = df.iloc[-2]
         confirm_candle = df.iloc[-1]
 
         pb_close = float(pullback_candle["close"])
         pb_open = float(pullback_candle["open"])
-        pb_high = float(pullback_candle["high"])
-        pb_low = float(pullback_candle["low"])
         conf_close = float(confirm_candle["close"])
         conf_open = float(confirm_candle["open"])
+
+        # ── Extract indicators for confluence (computed by FeatureEngine) ──
+        ema9 = df.iloc[-1].get("ema9")
+        ema20 = df.iloc[-1].get("ema20")
+        rsi = df.iloc[-1].get("rsi")
+        mom_volume = momentum_candle.get("volume", 0)
+        avg_vol = df.iloc[-1].get("avg_volume_10", 0)
+
+        # Safe numeric conversion
+        ema9 = float(ema9) if ema9 is not None and not pd.isna(ema9) else None
+        ema20 = float(ema20) if ema20 is not None and not pd.isna(ema20) else None
+        rsi = float(rsi) if rsi is not None and not pd.isna(rsi) else None
+        mom_volume = float(mom_volume) if mom_volume is not None and not pd.isna(mom_volume) else 0
+        avg_vol = float(avg_vol) if avg_vol is not None and not pd.isna(avg_vol) else 0
 
         # ── CALL setup ──
         if (
             direction == "UP"
-            and momentum_close > recent_high          # breakout
-            and momentum_close > momentum_open         # bullish momentum candle
-            and pb_close <= pb_open                    # pullback candle is bearish or doji
-            and conf_close > conf_open                 # confirmation candle is bullish
+            and momentum_close > recent_high
+            and momentum_close > momentum_open
+            and pb_close <= pb_open
+            and conf_close > conf_open
         ):
-            # ── Scoring ──
-            score = 0
-            if has_momentum:
-                score += 1
-            if direction == "UP":
-                score += 1
-            score += 1  # ATM option (always selecting ATM)
+            # ── EMA trend alignment filter (hard gate) ──
+            if ema9 is not None and ema20 is not None and ema9 < ema20:
+                return None  # Short-term trend not aligned with call
 
-            if score < 2:
+            # ── Enhanced Scoring (0-6) ──
+            score = 1  # Base: has_momentum (always true here)
+            score += 1  # VWAP direction confirmed
+
+            # +1 for EMA trend alignment
+            ema_aligned = ema9 is not None and ema20 is not None and ema9 > ema20
+            if ema_aligned:
+                score += 1
+
+            # +1 for strong momentum (ratio > 1.8)
+            strong_momentum = momentum_ratio > STRONG_MOMENTUM_MULTIPLIER
+            if strong_momentum:
+                score += 1
+
+            # +1 for RSI in sweet spot (not overbought)
+            rsi_ok = rsi is not None and CALL_RSI_MIN <= rsi <= CALL_RSI_MAX
+            if rsi_ok:
+                score += 1
+
+            # +1 for volume confirmation
+            vol_confirmed = avg_vol > 0 and mom_volume > VOLUME_CONFIRM_MULTIPLIER * avg_vol
+            if vol_confirmed:
+                score += 1
+
+            if score < 3:
                 return None
 
             return StrategySignal(
@@ -209,31 +259,52 @@ class MomentumOptionBuyingStrategy(BaseStrategy):
                 details={
                     "avg_range": round(avg_range, 2),
                     "momentum_range": round(momentum_range, 2),
-                    "momentum_ratio": round(momentum_range / avg_range, 2),
+                    "momentum_ratio": round(momentum_ratio, 2),
                     "vwap": round(float(vwap), 2),
                     "recent_high": round(recent_high, 2),
                     "breakout_level": round(recent_high, 2),
                     "mob_score": score,
-                    "quantity_pct": 100 if score == 3 else 50,
+                    "quantity_pct": 100 if score >= 4 else 50,
+                    "ema_aligned": ema_aligned,
+                    "rsi": round(rsi, 1) if rsi is not None else None,
+                    "strong_momentum": strong_momentum,
+                    "vol_confirmed": vol_confirmed,
                 },
             )
 
         # ── PUT setup ──
         if (
             direction == "DOWN"
-            and momentum_close < recent_low             # breakdown
-            and momentum_close < momentum_open           # bearish momentum candle
-            and pb_close >= pb_open                      # pullback candle is bullish or doji
-            and conf_close < conf_open                   # confirmation candle is bearish
+            and momentum_close < recent_low
+            and momentum_close < momentum_open
+            and pb_close >= pb_open
+            and conf_close < conf_open
         ):
-            score = 0
-            if has_momentum:
-                score += 1
-            if direction == "DOWN":
-                score += 1
-            score += 1  # ATM option
+            # ── EMA trend alignment filter (hard gate) ──
+            if ema9 is not None and ema20 is not None and ema9 > ema20:
+                return None  # Short-term trend not aligned with put
 
-            if score < 2:
+            # ── Enhanced Scoring (0-6) ──
+            score = 1  # Base: has_momentum
+            score += 1  # VWAP direction confirmed
+
+            ema_aligned = ema9 is not None and ema20 is not None and ema9 < ema20
+            if ema_aligned:
+                score += 1
+
+            strong_momentum = momentum_ratio > STRONG_MOMENTUM_MULTIPLIER
+            if strong_momentum:
+                score += 1
+
+            rsi_ok = rsi is not None and PUT_RSI_MIN <= rsi <= PUT_RSI_MAX
+            if rsi_ok:
+                score += 1
+
+            vol_confirmed = avg_vol > 0 and mom_volume > VOLUME_CONFIRM_MULTIPLIER * avg_vol
+            if vol_confirmed:
+                score += 1
+
+            if score < 3:
                 return None
 
             return StrategySignal(
@@ -243,12 +314,16 @@ class MomentumOptionBuyingStrategy(BaseStrategy):
                 details={
                     "avg_range": round(avg_range, 2),
                     "momentum_range": round(momentum_range, 2),
-                    "momentum_ratio": round(momentum_range / avg_range, 2),
+                    "momentum_ratio": round(momentum_ratio, 2),
                     "vwap": round(float(vwap), 2),
                     "recent_low": round(recent_low, 2),
                     "breakout_level": round(recent_low, 2),
                     "mob_score": score,
-                    "quantity_pct": 100 if score == 3 else 50,
+                    "quantity_pct": 100 if score >= 4 else 50,
+                    "ema_aligned": ema_aligned,
+                    "rsi": round(rsi, 1) if rsi is not None else None,
+                    "strong_momentum": strong_momentum,
+                    "vol_confirmed": vol_confirmed,
                 },
             )
 
