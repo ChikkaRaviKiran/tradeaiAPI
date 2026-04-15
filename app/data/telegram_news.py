@@ -17,12 +17,13 @@ import pytz
 from openai import AsyncOpenAI
 
 from app.core.config import settings
-from app.db.models import AsyncSessionLocal
 
 
 def _get_session_factory():
-    """Return the shared async session factory."""
-    return AsyncSessionLocal
+    """Return the shared async session factory (always fetches the current one
+    to avoid stale references after init_db() rebinds the engine)."""
+    from app.db import models
+    return models.AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")

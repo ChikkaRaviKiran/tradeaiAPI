@@ -8,7 +8,7 @@ from datetime import datetime
 from sqlalchemy import select
 
 from app.core.models import AlertItem, MarketSnapshot
-from app.db.models import AlertRecord, MarketSnapshotRecord, AsyncSessionLocal
+from app.db.models import AlertRecord, MarketSnapshotRecord
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,10 @@ _tables_ensured = False
 
 
 def _get_session_factory():
-    """Return the shared async session factory."""
-    return AsyncSessionLocal
+    """Return the shared async session factory (always fetches the current one
+    to avoid stale references after init_db() rebinds the engine)."""
+    from app.db import models
+    return models.AsyncSessionLocal
 
 
 async def _ensure_tables():
@@ -95,6 +97,7 @@ class HistoryLogger:
 
     async def save_alert(self, alert: AlertItem) -> None:
         """Save an alert to the database."""
+        global _db_error_count
         try:
             await _ensure_tables()
             # Strip timezone to store as naive IST (consistent with _now_ist convention)
