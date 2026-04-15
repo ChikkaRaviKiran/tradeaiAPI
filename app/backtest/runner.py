@@ -36,10 +36,12 @@ from app.analysis.day_types import EnhancedDayClassifier
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
 
-# Only MOB strategy is active — all others disabled
+# Strategies available for backtesting
 ALL_STRATEGIES = {
-    "MOMENTUM_OPTION_BUYING": MomentumOptionBuyingStrategy,
-    "RANGE_BREAKOUT": None,  # Handled separately via _run_rb_backtest_task
+    "RANGE_BREAKOUT": None,     # Handled via _run_analysis_backtest_task
+    "EMA_BREAKOUT": None,       # Handled via _run_analysis_backtest_task
+    "MOMENTUM_BREAKOUT": None,  # Handled via _run_analysis_backtest_task
+    "ALL_THREE": None,          # Combined: runs all 3 strategies as portfolio
 }
 
 # ── MOB parameters (from settings, overridable via env vars) ──────────
@@ -770,9 +772,26 @@ def _simulate_orb_day(dt, data, option_cache, instruments_cfg,
 
 # ── RANGE_BREAKOUT helpers ────────────────────────────────────────────
 
-# Time windows where RANGE_BREAKOUT has a proven edge
+# Per-strategy, per-instrument allowed time windows (backtest-proven edges)
+_STRATEGY_WINDOWS = {
+    "RANGE_BREAKOUT": {
+        "NIFTY":  {"09:45-10:15"},
+        "SENSEX": {"09:45-10:15"},
+    },
+    "EMA_BREAKOUT": {
+        "NIFTY":  {"11:00-12:00"},
+        # SENSEX excluded (PF 0.70)
+    },
+    "MOMENTUM_BREAKOUT": {
+        "SENSEX": {"09:45-10:15"},
+        # NIFTY excluded (PF 0.77)
+    },
+}
+
+# Legacy alias
 RB_ALLOWED_WINDOWS = {"09:45-10:15", "11:00-12:00"}
 RB_STARTING_CAPITAL = 100_000
+ANALYSIS_STARTING_CAPITAL = 100_000
 
 
 def _build_synthetic_index(option_cache, instrument, dates):
@@ -835,16 +854,20 @@ async def run_backtest(
     progress = BacktestProgress(job_id=job_id)
     _active_jobs[job_id] = progress
 
-    # Determine which strategy to run (default: ORB_VWAP)
-    strategy_name = "ORB_VWAP"
+    # Determine which strategy to run (default: RANGE_BREAKOUT)
+    strategy_name = "RANGE_BREAKOUT"
     if strategies and len(strategies) > 0:
         s = strategies[0].upper().strip()
-        if s in ("MOB", "MOMENTUM_OPTION_BUYING"):
-            strategy_name = "MOB"
-        elif s in ("RB", "RANGE_BREAKOUT"):
+        if s in ("RB", "RANGE_BREAKOUT"):
             strategy_name = "RANGE_BREAKOUT"
+        elif s in ("EMA", "EMA_BREAKOUT"):
+            strategy_name = "EMA_BREAKOUT"
+        elif s in ("MB", "MOMENTUM_BREAKOUT"):
+            strategy_name = "MOMENTUM_BREAKOUT"
+        elif s in ("ALL", "ALL_THREE", "COMBINED"):
+            strategy_name = "ALL_THREE"
         else:
-            strategy_name = "ORB_VWAP"
+            strategy_name = "RANGE_BREAKOUT"
 
     asyncio.create_task(_run_backtest_task(job_id, start_date, end_date, strategy_name))
     return job_id
@@ -859,8 +882,8 @@ async def _run_backtest_task(
     """Run backtest with progress tracking. Supports MOB, ORB_VWAP, and RANGE_BREAKOUT."""
     progress = _active_jobs[job_id]
 
-    if strategy_name == "RANGE_BREAKOUT":
-        await _run_rb_backtest_task(job_id, start_date, end_date)
+    if strategy_name in ("RANGE_BREAKOUT", "EMA_BREAKOUT", "MOMENTUM_BREAKOUT", "ALL_THREE"):
+        await _run_analysis_backtest_task(job_id, start_date, end_date, strategy_name)
         return
 
     is_orb = strategy_name == "ORB_VWAP"
@@ -1007,21 +1030,48 @@ async def _load_option_dates(engine, symbol, start_date, end_date):
         return [str(row[0]) for row in result.fetchall()]
 
 
-async def _run_rb_backtest_task(job_id: str, start_date: str, end_date: str) -> None:
-    """Run RANGE_BREAKOUT backtest using analysis engine's StrategyTester."""
+async def _run_analysis_backtest_task(
+    job_id: str, start_date: str, end_date: str, strategy_name: str,
+) -> None:
+    """Run any analysis-engine strategy backtest with per-instrument window filtering.
+
+    Uses _STRATEGY_WINDOWS to determine which instruments and time windows
+    are allowed for the given strategy.  strategy_name="ALL_THREE" runs
+    RANGE_BREAKOUT + EMA_BREAKOUT + MOMENTUM_BREAKOUT as a combined portfolio.
+    """
     progress = _active_jobs[job_id]
     try:
         progress.status = "loading"
-        progress.message = "Initializing RANGE_BREAKOUT backtest..."
+        display_name = "ALL 3 STRATEGIES" if strategy_name == "ALL_THREE" else strategy_name
+        progress.message = f"Initializing {display_name} backtest..."
 
         db_url = str(settings.database_url)
         engine = create_async_engine(db_url, echo=False)
         fe = FeatureEngine()
         classifier = EnhancedDayClassifier()
-        tester = StrategyTester(fe, strategy_filter=["RANGE_BREAKOUT"])
 
-        instruments = [get_instrument("NIFTY"), get_instrument("SENSEX")]
-        starting_capital = RB_STARTING_CAPITAL
+        # For ALL_THREE: run each strategy with its own tester and window config
+        if strategy_name == "ALL_THREE":
+            strategy_configs = [
+                ("RANGE_BREAKOUT", _STRATEGY_WINDOWS["RANGE_BREAKOUT"]),
+                ("EMA_BREAKOUT", _STRATEGY_WINDOWS["EMA_BREAKOUT"]),
+                ("MOMENTUM_BREAKOUT", _STRATEGY_WINDOWS["MOMENTUM_BREAKOUT"]),
+            ]
+        else:
+            strat_windows = _STRATEGY_WINDOWS.get(strategy_name, {})
+            strategy_configs = [(strategy_name, strat_windows)]
+
+        # Build testers per strategy
+        testers = {}
+        for sname, _ in strategy_configs:
+            testers[sname] = StrategyTester(fe, strategy_filter=[sname])
+
+        # Collect all instruments needed across all strategies
+        all_instrument_syms = set()
+        for _, sw in strategy_configs:
+            all_instrument_syms.update(sw.keys())
+        instruments = [get_instrument(sym) for sym in sorted(all_instrument_syms)]
+        starting_capital = ANALYSIS_STARTING_CAPITAL
 
         index_data = {}
         option_cache = {}
@@ -1037,7 +1087,6 @@ async def _run_rb_backtest_task(job_id: str, start_date: str, end_date: str) -> 
             oc = await _load_option_candles_batch(engine, sym, all_dates)
             option_cache.update(oc)
 
-            # Build synthetic index for dates missing real index data
             missing = [d for d in option_dates if d not in idx]
             if missing:
                 synthetic = _build_synthetic_index(option_cache, sym, missing)
@@ -1048,7 +1097,6 @@ async def _run_rb_backtest_task(job_id: str, start_date: str, end_date: str) -> 
         prev_closes = _build_prev_closes(index_data)
         await engine.dispose()
 
-        # Trading dates within requested range
         trading_dates = sorted(set(
             d for inst in instruments
             for d in index_data.get(inst.symbol, {}).keys()
@@ -1057,11 +1105,13 @@ async def _run_rb_backtest_task(job_id: str, start_date: str, end_date: str) -> 
 
         progress.total_days = len(trading_dates)
         progress.status = "running"
-        progress.message = f"Simulating {len(trading_dates)} days (RANGE_BREAKOUT)..."
+        progress.message = f"Simulating {len(trading_dates)} days ({display_name})..."
 
         all_trades = []
         equity_curve = []
         capital = starting_capital
+        DAILY_LOSS_CAP = -1500  # Stop adding trades once day PnL crosses this
+        GAP_SKIP_PCT = 1.0     # Skip day if any instrument's opening gap > this %
 
         for day_idx, dt in enumerate(trading_dates):
             progress.processed_days = day_idx + 1
@@ -1070,8 +1120,32 @@ async def _run_rb_backtest_task(job_id: str, start_date: str, end_date: str) -> 
 
             day_pnl = 0.0
             day_trade_count = 0
+            day_capped = False
+
+            # Pre-trade gap filter: skip entire day if opening gap is too large
+            gap_too_large = False
+            for inst in instruments:
+                sym = inst.symbol
+                if dt not in index_data.get(sym, {}):
+                    continue
+                df = index_data[sym][dt]
+                prev = prev_closes.get(sym, {}).get(dt)
+                if prev and len(df) > 0:
+                    open_price = float(df.iloc[0]["open"] if "open" in df.columns else df.iloc[0]["close"])
+                    gap_pct = abs(open_price - prev) / prev * 100
+                    if gap_pct > GAP_SKIP_PCT:
+                        gap_too_large = True
+                        break
+
+            if gap_too_large:
+                equity_curve.append({
+                    "Date": dt, "PnL": 0, "Capital": round(capital, 2), "Trades": 0,
+                })
+                continue
 
             for inst in instruments:
+                if day_capped:
+                    break
                 sym = inst.symbol
                 if dt not in index_data.get(sym, {}):
                     continue
@@ -1080,55 +1154,68 @@ async def _run_rb_backtest_task(job_id: str, start_date: str, end_date: str) -> 
                 prev = prev_closes.get(sym, {}).get(dt)
                 hs = classifier.classify_hindsight(df, prev)
 
-                trades = tester.test_day(
-                    df=df,
-                    instrument_symbol=sym,
-                    strike_interval=inst.strike_interval,
-                    lot_size=inst.lot_size,
-                    option_cache=option_cache,
-                    oi_snapshots=[],
-                    day_type=hs.value,
-                    day_type_hindsight=hs.value,
-                    date_str=dt,
-                )
-
-                for t in trades:
-                    if t.time_window not in RB_ALLOWED_WINDOWS:
+                # Run each strategy that is allowed on this instrument
+                for sname, strat_windows in strategy_configs:
+                    allowed_windows = strat_windows.get(sym, set())
+                    if not allowed_windows:
                         continue
 
-                    result_str = "WIN" if t.pnl > 0 else "LOSS"
-                    trade = {
-                        "Date": t.date,
-                        "Instrument": t.instrument,
-                        "Symbol": f"{t.instrument}{int(t.strike)}{t.direction}",
-                        "Strategy": "RANGE_BREAKOUT",
-                        "Direction": t.direction,
-                        "Score": 0,
-                        "Entry Time": t.entry_time,
-                        "Exit Time": t.exit_time,
-                        "Strike": t.strike,
-                        "Entry Price": round(t.entry_price, 2),
-                        "Exit Price": round(t.exit_price, 2),
-                        "Stop Loss": round(t.entry_price * 0.80, 2),
-                        "Target 1": round(t.entry_price * 1.20, 2),
-                        "Target 2": round(t.entry_price * 1.40, 2),
-                        "Lots": 1,
-                        "Lot Size": t.lot_size,
-                        "PnL": round(t.pnl, 2),
-                        "PnL %": round(t.pnl_pct, 2),
-                        "Exit Reason": t.exit_reason,
-                        "Result": result_str,
-                        "Risk %": 20.0,
-                        "Data Source": "real",
-                        "R Multiple": round(t.r_multiple, 2),
-                        "Time Window": t.time_window,
-                        "Day Type": t.day_type_hindsight,
-                        "Hold Minutes": t.hold_minutes,
-                    }
-                    all_trades.append(trade)
-                    capital += t.pnl
-                    day_pnl += t.pnl
-                    day_trade_count += 1
+                    trades = testers[sname].test_day(
+                        df=df,
+                        instrument_symbol=sym,
+                        strike_interval=inst.strike_interval,
+                        lot_size=inst.lot_size,
+                        option_cache=option_cache,
+                        oi_snapshots=[],
+                        day_type=hs.value,
+                        day_type_hindsight=hs.value,
+                        date_str=dt,
+                    )
+
+                    for t in trades:
+                        if t.time_window not in allowed_windows:
+                            continue
+
+                        result_str = "WIN" if t.pnl > 0 else "LOSS"
+                        trade = {
+                            "Date": t.date,
+                            "Instrument": t.instrument,
+                            "Symbol": f"{t.instrument}{int(t.strike)}{t.direction}",
+                            "Strategy": sname,
+                            "Direction": t.direction,
+                            "Score": 0,
+                            "Entry Time": t.entry_time,
+                            "Exit Time": t.exit_time,
+                            "Strike": t.strike,
+                            "Entry Price": round(t.entry_price, 2),
+                            "Exit Price": round(t.exit_price, 2),
+                            "Stop Loss": round(t.entry_price * 0.80, 2),
+                            "Target 1": round(t.entry_price * 1.20, 2),
+                            "Target 2": round(t.entry_price * 1.40, 2),
+                            "Lots": 1,
+                            "Lot Size": t.lot_size,
+                            "PnL": round(t.pnl, 2),
+                            "PnL %": round(t.pnl_pct, 2),
+                            "Exit Reason": t.exit_reason,
+                            "Result": result_str,
+                            "Risk %": 20.0,
+                            "Data Source": "real",
+                            "R Multiple": round(t.r_multiple, 2),
+                            "Time Window": t.time_window,
+                            "Day Type": t.day_type_hindsight,
+                            "Hold Minutes": t.hold_minutes,
+                        }
+                        all_trades.append(trade)
+                        capital += t.pnl
+                        day_pnl += t.pnl
+                        day_trade_count += 1
+
+                        # Daily loss cap: stop trading for the day once breached
+                        if day_pnl <= DAILY_LOSS_CAP:
+                            day_capped = True
+                            break
+                    if day_capped:
+                        break
 
             equity_curve.append({
                 "Date": dt,
@@ -1142,12 +1229,17 @@ async def _run_rb_backtest_task(job_id: str, start_date: str, end_date: str) -> 
 
         _build_result(job_id, all_trades, equity_curve, start_date, end_date,
                       [i.symbol for i in instruments], capital, progress,
-                      "RANGE_BREAKOUT", starting_capital)
+                      strategy_name, starting_capital)
 
     except Exception as e:
-        logger.exception("Backtest %s failed (RANGE_BREAKOUT)", job_id)
+        logger.exception("Backtest %s failed (%s)", job_id, strategy_name)
         progress.status = "failed"
         progress.error = str(e)
+
+
+# Legacy alias for backward compat
+async def _run_rb_backtest_task(job_id: str, start_date: str, end_date: str) -> None:
+    await _run_analysis_backtest_task(job_id, start_date, end_date, "RANGE_BREAKOUT")
 
 
 def _build_result(job_id, all_trades, equity_curve, start_date, end_date,
@@ -1182,14 +1274,31 @@ def _build_result(job_id, all_trades, equity_curve, start_date, end_date,
         sharpe = 0.0
 
     is_orb = strategy_name == "ORB_VWAP"
-    is_rb = strategy_name == "RANGE_BREAKOUT"
-    if is_rb:
+    is_analysis = strategy_name in ("RANGE_BREAKOUT", "EMA_BREAKOUT", "MOMENTUM_BREAKOUT", "ALL_THREE")
+    if is_analysis:
+        if strategy_name == "ALL_THREE":
+            window_strs = []
+            for sn in ("RANGE_BREAKOUT", "EMA_BREAKOUT", "MOMENTUM_BREAKOUT"):
+                sw = _STRATEGY_WINDOWS.get(sn, {})
+                for sym, wins in sw.items():
+                    window_strs.append(f"{sn} → {sym}: {', '.join(sorted(wins))}")
+            entry_cond = "RB: ADX<20 range breakout | EMA: EMA50 cross | MB: Donchian breakout"
+        else:
+            sw = _STRATEGY_WINDOWS.get(strategy_name, {})
+            window_strs = [f"{sym}: {', '.join(sorted(wins))}" for sym, wins in sw.items()]
+            entry_cond = {
+                "RANGE_BREAKOUT": "ADX<20, range<0.80%, breakout + RSI/volume/body",
+                "EMA_BREAKOUT": "Price crosses EMA50, EMA9>EMA20, RSI 50-70, body≥40%",
+                "MOMENTUM_BREAKOUT": "Donchian 20-candle breakout, ADX>25, RSI>60, volume≥1.5×",
+            }.get(strategy_name, "")
         config_used = {
-            "strategy": "RANGE_BREAKOUT",
+            "strategy": strategy_name,
             "initial_capital": starting_capital,
             "sl_pct": "20%",
-            "entry_conditions": "ADX<20, range<0.80%, breakout + RSI/volume/body",
-            "time_windows": ", ".join(sorted(RB_ALLOWED_WINDOWS)),
+            "daily_loss_cap": "₹1,500",
+            "gap_skip": ">1.0% opening gap → skip day",
+            "entry_conditions": entry_cond,
+            "time_windows": " | ".join(window_strs),
             "exit_engine": "20% SL (1R) | T1 +1R → SL→BE | T2 +2R → lock 1R | EOD 15:10",
             "instruments": instruments,
         }
@@ -1262,7 +1371,7 @@ def generate_excel(job_id: str) -> Optional[bytes]:
     edf = pd.DataFrame(result.equity_curve)
 
     strategy = result.config_used.get("strategy", "MOMENTUM_OPTION_BUYING")
-    if strategy == "RANGE_BREAKOUT":
+    if strategy in ("RANGE_BREAKOUT", "EMA_BREAKOUT", "MOMENTUM_BREAKOUT"):
         display_cols = [
             "Date", "Instrument", "Symbol", "Strategy", "Direction",
             "Entry Time", "Exit Time", "Strike", "Entry Price", "Exit Price",
