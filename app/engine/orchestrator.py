@@ -57,6 +57,7 @@ from app.strategies.liquidity_sweep import LiquiditySweepStrategy
 from app.strategies.orb import ORBStrategy
 from app.strategies.range_breakout import RangeBreakoutStrategy
 from app.strategies.momentum_breakout import MomentumBreakoutStrategy
+from app.strategies.ema_breakout import EMABreakoutStrategy
 from app.strategies.trend_pullback import TrendPullbackStrategy
 from app.strategies.vwap_reclaim import VWAPReclaimStrategy
 from app.trading.history_logger import HistoryLogger
@@ -82,20 +83,37 @@ PRE_CLOSE = dtime(15, 20)
 REPORT_TIME = dtime(15, 30)
 GLOBAL_FETCH_TIME = dtime(9, 0)
 LOAD_TIME = dtime(8, 45)
-NO_NEW_ENTRY_AFTER = dtime(12, 0)  # RB trades in 09:45-10:15 and 11:00-12:00 windows
+NO_NEW_ENTRY_AFTER = dtime(12, 0)  # Latest entry window ends at 12:00
 
-# RANGE_BREAKOUT time windows — only enter during these periods (backtest-proven edge)
-_RB_ALLOWED_WINDOWS = [
-    (dtime(9, 45), dtime(10, 15)),
-    (dtime(11, 0), dtime(12, 0)),
-]
+# ── Production filters (synced with backtest runner) ─────────────────
+DAILY_LOSS_CAP = -1500        # Absolute daily PnL cap (₹) — stop trading once hit
+GAP_SKIP_PCT = 1.0            # Skip entire day if any instrument opens with gap > this %
+
+# ── Per-strategy time windows  (backtest-proven edge) ────────────────
+# Maps strategy class name → instrument → allowed (start, end) windows
+_STRATEGY_WINDOWS: dict[str, dict[str, list[tuple]]] = {
+    "RangeBreakoutStrategy": {
+        "NIFTY":  [(dtime(9, 45), dtime(10, 15))],
+        "SENSEX": [(dtime(9, 45), dtime(10, 15))],
+    },
+    "EMABreakoutStrategy": {
+        "NIFTY":  [(dtime(11, 0), dtime(12, 0))],
+        # SENSEX excluded — PF 0.70 in backtest
+    },
+    "MomentumBreakoutStrategy": {
+        "SENSEX": [(dtime(9, 45), dtime(10, 15))],
+        # NIFTY excluded — PF 0.77 in backtest
+    },
+}
 
 LOOP_INTERVAL_SECONDS = 60  # 1-minute analysis cycle
 
-# RB-only mode: regime compat disabled — RB self-selects via ADX/range conditions
+# Regime compatibility — allow all proven strategies in all regimes
+# (they have internal condition checks: ADX, RSI, Donchian, EMA crossovers)
 _REGIME_STRATEGY_COMPAT: dict[str, set[MarketRegime]] = {
-    # Allow RangeBreakoutStrategy in ALL regimes
     "RangeBreakoutStrategy": {MarketRegime.TRENDING, MarketRegime.RANGE_BOUND, MarketRegime.HIGH_VOLATILITY},
+    "EMABreakoutStrategy": {MarketRegime.TRENDING, MarketRegime.RANGE_BOUND, MarketRegime.HIGH_VOLATILITY},
+    "MomentumBreakoutStrategy": {MarketRegime.TRENDING, MarketRegime.RANGE_BOUND, MarketRegime.HIGH_VOLATILITY},
 }
 
 
@@ -235,10 +253,13 @@ class Orchestrator:
         from app.engine.strategy_selector import StrategySelector
         self.strategy_selector = StrategySelector()
 
-        # RB-ONLY MODE: Only RangeBreakout strategy active
+        # ALL 3 STRATEGIES: RB + EMA + MB (backtest-proven profitable)
         self.strategies: list[BaseStrategy] = [
             RangeBreakoutStrategy(),
+            EMABreakoutStrategy(),
+            MomentumBreakoutStrategy(),
         ]
+        self._gap_skip_today = False  # Set True if opening gap > GAP_SKIP_PCT
 
         # Unified engine components
         self.day_classifier = DayClassifier()
@@ -414,12 +435,12 @@ class Orchestrator:
         # Unified engine reset
         self.day_type = DayType.PENDING
         self.day_classified = False
-        # Reset strategies to defaults — top 3 proven performers
-        # Selector will override pre-market if DB has enough condition data
+        self._gap_skip_today = False  # Reset gap skip flag for new day
+        # Reset strategies — all 3 backtest-proven strategies
         self.strategies = [
-            TrendPullbackStrategy(),
+            RangeBreakoutStrategy(),
+            EMABreakoutStrategy(),
             MomentumBreakoutStrategy(),
-            ORBStrategy(),
         ]
         self.running = False
         logger.info("Daily state reset complete")
@@ -1343,16 +1364,37 @@ class Orchestrator:
                 self._log_event("gate", f"Past {NO_NEW_ENTRY_AFTER} — no new entries", cycle=cycle, instrument=symbol)
                 return
 
-            # 8a. RB time window filter — only enter during proven windows
-            current_time = now.time()
-            in_allowed_window = any(
-                start <= current_time <= end for start, end in _RB_ALLOWED_WINDOWS
-            )
-            if not in_allowed_window:
-                logger.debug("[%s][Cycle %d] Outside RB allowed windows — no new entries", symbol, cycle)
+            # 8a. Gap skip filter — skip entire day if opening gap > threshold
+            if self._gap_skip_today:
+                self._log_event("gate", "Gap skip day — no trades", cycle=cycle, instrument=symbol)
                 return
 
-            # 8b. Global risk check + per-instrument concurrent limit
+            # Check opening gap on first few cycles
+            if cycle <= 3 and not self._gap_skip_today and prev_day_close and day_open:
+                gap_pct = abs(day_open - prev_day_close) / prev_day_close * 100
+                if gap_pct > GAP_SKIP_PCT:
+                    self._gap_skip_today = True
+                    logger.warning("GAP SKIP: %.2f%% gap detected (threshold: %.1f%%) — skipping all trades today", gap_pct, GAP_SKIP_PCT)
+                    self._log_event("gate", f"Gap {gap_pct:.2f}% > {GAP_SKIP_PCT}% — SKIP DAY", cycle=cycle, instrument=symbol)
+                    await self.alert_manager.send_info(
+                        "GAP FILTER — SKIP DAY",
+                        f"Opening gap: {gap_pct:.2f}% (threshold: {GAP_SKIP_PCT}%)\n"
+                        f"Open: {day_open:.2f}, Prev close: {prev_day_close:.2f}\n"
+                        "All strategies disabled for today.",
+                    )
+                    return
+
+            # 8b. Daily loss cap — absolute PnL check (synced with backtest ₹1,500)
+            day_pnl = sum(
+                t.pnl or 0 for t in self.paper_trader.all_today_trades
+                if t.status == TradeStatus.CLOSED
+            )
+            if day_pnl <= DAILY_LOSS_CAP:
+                logger.info("[%s][Cycle %d] Daily loss cap hit: ₹%.0f (cap: ₹%d)", symbol, cycle, day_pnl, DAILY_LOSS_CAP)
+                self._log_event("gate", f"Daily loss cap ₹{abs(DAILY_LOSS_CAP)} hit (PnL: ₹{day_pnl:.0f}) — stopping", cycle=cycle, instrument=symbol)
+                return
+
+            # 8c. Global risk check + per-instrument concurrent limit
             if not self.risk_manager.can_trade(
                 self.paper_trader.all_today_trades,
                 open_count=len(self.paper_trader.open_trades),
@@ -1363,14 +1405,14 @@ class Orchestrator:
                 self._log_event("gate", "Risk limits reached — skipping", cycle=cycle, instrument=symbol)
                 return
 
-            # 8c. Daily SL circuit breaker — after 2 consecutive SL hits, stop trading
+            # 8d. Daily SL circuit breaker — after 2 consecutive SL hits, stop trading
             daily_sl_count = self._daily_sl_hit.get(symbol, 0)
             if daily_sl_count >= 2:
                 logger.info("[%s][Cycle %d] Daily SL circuit breaker active (%d SL hits) — no more trades", symbol, cycle, daily_sl_count)
                 self._log_event("gate", f"SL circuit breaker — {daily_sl_count} SL hits today, stopping", cycle=cycle, instrument=symbol)
                 return
 
-            # 8d. No Trade Day guard — if no signal scored > 55 by 11:30, skip rest of day
+            # 8e. No Trade Day guard — if no signal scored > 55 by 11:30, skip rest of day
             if self._no_trade_day.get(symbol, False):
                 logger.debug("[%s][Cycle %d] No Trade Day — skipping", symbol, cycle)
                 return
@@ -1408,7 +1450,15 @@ class Orchestrator:
             daily_levels = self._daily_levels.get(symbol)
             signals: list[StrategySignal] = []
             active_strategies = self._instrument_strategies.get(symbol, self.strategies)
+            current_time = now.time()
             for strategy in active_strategies:
+                strat_name = type(strategy).__name__
+                # Per-strategy + per-instrument time window filter
+                strat_windows = _STRATEGY_WINDOWS.get(strat_name, {}).get(symbol, [])
+                if strat_windows:
+                    in_window = any(start <= current_time <= end for start, end in strat_windows)
+                    if not in_window:
+                        continue  # Outside this strategy's window for this instrument
                 # Regime-strategy filtering: skip strategies that don't fit current regime
                 if not _strategy_compatible_with_regime(strategy, regime):
                     continue
@@ -2978,30 +3028,47 @@ class Orchestrator:
             logger.exception("Error in pre-market evaluation — will use existing data or config fallback")
 
     async def _run_strategy_selection(self, day_type_str: str = "") -> None:
-        """RB-only mode: always use RangeBreakoutStrategy for all instruments.
+        """Assign per-instrument strategies based on backtest-proven windows.
 
-        Ignores DB-based strategy selection — always returns RANGE_BREAKOUT.
+        RB → NIFTY + SENSEX (09:45-10:15)
+        EMA → NIFTY only (11:00-12:00)
+        MB → SENSEX only (09:45-10:15)
         """
         try:
-            rb_strategy = [RangeBreakoutStrategy()]
+            all_strategies = [
+                RangeBreakoutStrategy(),
+                EMABreakoutStrategy(),
+                MomentumBreakoutStrategy(),
+            ]
 
             for instrument in self._active_instruments:
                 symbol = instrument.symbol
-                self._instrument_strategies[symbol] = list(rb_strategy)
+                # Filter strategies to only those with a window for this instrument
+                inst_strategies = [
+                    s for s in all_strategies
+                    if symbol in _STRATEGY_WINDOWS.get(type(s).__name__, {})
+                ]
+                if not inst_strategies:
+                    inst_strategies = [RangeBreakoutStrategy()]  # Fallback
+
+                self._instrument_strategies[symbol] = inst_strategies
                 self._instrument_capital[symbol] = settings.initial_capital / max(len(self._active_instruments), 1)
+
+                strat_names = [type(s).__name__.replace("Strategy", "") for s in inst_strategies]
                 self._log_event(
                     "selection",
-                    f"[{symbol}] RB-only mode: RANGE_BREAKOUT",
+                    f"[{symbol}] Strategies: {', '.join(strat_names)}",
                     instrument=symbol,
                 )
-                logger.info("[%s] Strategy: RANGE_BREAKOUT (RB-only mode)", symbol)
+                logger.info("[%s] Strategies: %s", symbol, ", ".join(strat_names))
 
-            self.strategies = list(rb_strategy)
+            self.strategies = list(all_strategies)
 
             await self.alert_manager.send_info(
-                "STRATEGY SELECTION — RB ONLY" + (" (10AM re-select)" if day_type_str else ""),
+                "STRATEGY SELECTION — 3-STRATEGY MODE" + (" (10AM re-select)" if day_type_str else ""),
                 "\n".join(
-                    f"{inst.symbol}: RANGE_BREAKOUT | ₹{self._instrument_capital.get(inst.symbol, 0):,.0f}"
+                    f"{inst.symbol}: {', '.join(type(s).__name__ for s in self._instrument_strategies.get(inst.symbol, []))} "
+                    f"| ₹{self._instrument_capital.get(inst.symbol, 0):,.0f}"
                     for inst in self._active_instruments
                 ),
             )

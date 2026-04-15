@@ -48,6 +48,7 @@ services:
     environment:
       TZ: Asia/Kolkata
       REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tradeai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tradeai}
     ports:
       - "8001:8000"
     volumes:
