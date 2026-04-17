@@ -289,6 +289,30 @@ async def get_system_status():
         if tick_time:
             ws_last_tick = tick_time.strftime("%H:%M:%S")
 
+    # Scanner status
+    scanner_info = {}
+    if orch:
+        config_p = getattr(orch, "config_p_scanner", None)
+        move_det = getattr(orch, "move_detection_scanner", None)
+        if config_p:
+            cp_trade = config_p._active_trade
+            scanner_info["config_p"] = {
+                "active": True,
+                "day_tradeable": config_p._day_tradeable,
+                "signal_found": config_p._signal_found_today,
+                "in_trade": cp_trade is not None and not cp_trade.exited if cp_trade else False,
+                "last_trade_week": config_p._last_trade_week,
+            }
+        if move_det:
+            md_trade = move_det._active_trade
+            scanner_info["move_det"] = {
+                "active": True,
+                "day_tradeable": move_det._day_tradeable,
+                "signal_found": move_det._signal_found_today,
+                "in_trade": md_trade is not None and not md_trade.exited if md_trade else False,
+                "last_trade_week": move_det._last_trade_week,
+            }
+
     return {
         "status": "running" if orch and getattr(orch, "running", False) else "stopped",
         "paper_trading": settings.paper_trading,
@@ -305,6 +329,7 @@ async def get_system_status():
         "last_snapshot_time": snapshot.timestamp.isoformat() if snapshot else None,
         "open_trades_count": len(_state.get("open_trades", [])),
         "db_connected": db_ok,
+        "scanners": scanner_info,
         "websocket": {
             "status": ws_status,
             "last_tick": ws_last_tick,

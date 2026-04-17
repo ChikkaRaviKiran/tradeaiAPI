@@ -70,6 +70,7 @@ from app.ai.pre_market_analyst import PreMarketAnalyst
 from app.ai.insight_manager import InsightManager
 from app.engine.ai_decision import set_ai_insight_manager
 from app.engine.config_p_scanner import ConfigPScanner
+from app.engine.move_detection_scanner import MoveDetectionScanner
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
 from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
@@ -250,8 +251,15 @@ class Orchestrator:
         # Wire insight manager into AI decision engine
         set_ai_insight_manager(self.insight_manager)
 
-        # ── Config P Scanner (ONLY active engine — all V1 strategies disabled) ──
+        # ── Config P Scanner (bearish momentum, detect_move based) ──
         self.config_p_scanner = ConfigPScanner(
+            client=self.client,
+            feature_engine=self.feature_engine,
+            alert_manager=self.alert_manager,
+        )
+
+        # ── Move Detection Scanner (Production v2 AGGRESSIVE, scan_all_moves based) ──
+        self.move_detection_scanner = MoveDetectionScanner(
             client=self.client,
             feature_engine=self.feature_engine,
             alert_manager=self.alert_manager,
@@ -377,10 +385,10 @@ class Orchestrator:
         inst_names = [i.symbol for i in self._active_instruments]
 
         logger.info("=" * 60)
-        logger.info("TradeAI Orchestrator started — CONFIG P MODE")
+        logger.info("TradeAI Orchestrator started — CONFIG P + MOVE DETECTION MODE")
         logger.info("Mode: %s", "AUTO-SELECT" if settings.auto_select_instruments else "MANUAL")
         logger.info("Active instruments: %s", ", ".join(inst_names))
-        logger.info("Engine: CONFIG P ONLY (all V1/V2 strategies disabled)")
+        logger.info("Engine: CONFIG P + MOVE DETECTION (all V1/V2 strategies disabled)")
         logger.info("Paper trading: %s", settings.paper_trading)
         logger.info("Capital: ₹%s", f"{settings.initial_capital:,.0f}")
         logger.info("=" * 60)
@@ -441,10 +449,12 @@ class Orchestrator:
         self.day_type = DayType.PENDING
         self.day_classified = False
         self._gap_skip_today = False  # Reset gap skip flag for new day
-        # V1 strategies disabled — Config P scanner is the only engine
+        # V1 strategies disabled — Config P + Move Detection scanners are the active engines
         self.strategies = []
         # Reset Config P scanner daily state
         self.config_p_scanner.reset_daily()
+        # Reset Move Detection scanner daily state
+        self.move_detection_scanner.reset_daily()
         self.running = False
         logger.info("Daily state reset complete")
 
@@ -586,7 +596,8 @@ class Orchestrator:
             nifty_expiry_date = self._expiry_dates.get("NIFTY")
             if nifty_expiry:
                 self.config_p_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                logger.info("[ConfigP] Expiry set: %s", nifty_expiry)
+                self.move_detection_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
+                logger.info("[ConfigP+MoveDet] Expiry set: %s", nifty_expiry)
         except Exception:
             logger.exception("Failed to determine expiries — options data may be unavailable")
             self._log_event("setup", "Expiry discovery FAILED — continuing without options")
@@ -613,16 +624,18 @@ class Orchestrator:
             "SYSTEM STARTED — CONFIG P MODE",
             f"Mode: {'AUTO-SELECT' if settings.auto_select_instruments else 'MANUAL'}\n"
             f"Instruments: {', '.join(inst_names)}\n"
-            f"Engine: CONFIG P ONLY (bearish momentum)\n"
+            f"Engines: CONFIG P + MOVE-DET (bearish momentum)\n"
             f"All V1/V2 strategies: DISABLED\n"
             f"Paper trading: {settings.paper_trading}\nCapital: ₹{settings.initial_capital:,.0f}",
         )
         # Also push to Telegram (send_info is UI-only)
         await self.alert_manager.telegram.send(
-            f"🟢 SYSTEM STARTED — CONFIG P MODE\n"
+            f"🟢 SYSTEM STARTED — DUAL SCANNER MODE\n"
             f"Instruments: {', '.join(inst_names)}\n"
-            f"Engine: CONFIG P ONLY (bearish momentum)\n"
-            f"All V1/V2 strategies: DISABLED\n"
+            f"Engines:\n"
+            f"  1. CONFIG P — detect_move (bear, conf≥70, EMA aligned)\n"
+            f"  2. MOVE-DET — scan_all_moves (bear, conf≥80, AGGRESSIVE)\n"
+            f"Each scanner runs independently with own weekly filter.\n"
             f"Observe mode: ON"
         )
         self._log_event("setup", f"System started: instruments={', '.join(inst_names)}")
@@ -1375,11 +1388,12 @@ class Orchestrator:
                 except Exception:
                     logger.exception("10AM strategy re-selection failed")
 
-            # ── CONFIG P SCANNER (replaces all V1 strategy logic) ────────
-            # Run Config P bearish momentum scanner on NIFTY — this is the only active engine.
-            # All V1 strategies, scoring, gates, AI decisions are bypassed.
+            # ── SIGNAL SCANNERS (Config P + Move Detection) ───────────
+            # Both scanners run independently on NIFTY. Each has its own
+            # weekly filter, day assessment, and trade tracking.
             if symbol == "NIFTY":
                 await self.config_p_scanner.run_cycle(df_today, instrument, cycle)
+                await self.move_detection_scanner.run_cycle(df_today, instrument, cycle)
             return
 
             # 8. Time-of-day circuit breaker — no new entries after cutoff
@@ -2966,6 +2980,8 @@ class Orchestrator:
         from app.core.instruments import NIFTY as _NIFTY_INST
         nifty_df = self._df_today_cache.get("NIFTY")
         await self.config_p_scanner.force_close(nifty_df, _NIFTY_INST)
+        # Close Move Detection scanner trade
+        await self.move_detection_scanner.force_close(nifty_df, _NIFTY_INST)
 
         all_traders = [("v1", self.paper_trader), ("v2", self.v2_paper_trader)]
         for engine_label, trader in all_traders:
