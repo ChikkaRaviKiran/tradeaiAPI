@@ -51,6 +51,7 @@ TRAIL_LOOKBACK = 5
 TRAIL_BUFFER_PCT = 0.02       # 0.02% buffer on trailing stop
 OPTION_LEVERAGE = 55          # Approximate ATM PUT leverage
 MAX_HOLD_CANDLES = 120        # ~2 hours max
+DAY_ASSESSMENT_TIME = dtime(10, 0)
 
 
 class ActiveTrade:
@@ -160,8 +161,16 @@ class ConfigPScanner:
         if df_today is None or df_today.empty:
             return
 
+        if isinstance(df_today.index, pd.DatetimeIndex):
+            # Count only regular session candles; ignore any pre-open/non-session rows.
+            df_today = df_today.between_time("09:15", "15:30")
+            if df_today.empty:
+                return
+
         now = datetime.now(IST)
         candle_count = len(df_today)
+        if not self._today_str:
+            self._today_str = now.strftime("%Y-%m-%d")
 
         # ── If we have an active trade, check exits first ────────────
         if self._active_trade and not self._active_trade.exited:
@@ -177,8 +186,12 @@ class ConfigPScanner:
         if self._last_trade_week == current_week:
             return  # Already traded this week
 
-        # ── Day quality assessment (once, at ~candle 45 / 10:00 AM) ──
-        if not self._day_assessed and candle_count >= EARLIEST_CANDLE:
+        # ── Day quality assessment (once, after 10:00 and >=45 candles) ──
+        if (
+            not self._day_assessed
+            and now.time() >= DAY_ASSESSMENT_TIME
+            and candle_count >= EARLIEST_CANDLE
+        ):
             self._day_quality = assess_day_quality(df_today, check_candles=EARLIEST_CANDLE)
             self._day_assessed = True
 
@@ -190,13 +203,18 @@ class ConfigPScanner:
                 self._day_tradeable = False
                 reason = "choppy" if not tradeable else "mild_chop"
                 logger.info(
-                    "[ConfigP] Day %s SKIPPED: %s (VWAP crosses=%d, trend=%s)",
-                    self._today_str, reason,
-                    self._day_quality.get("vwap_crosses", 0), vwap_trend,
+                    "[ConfigP] Day %s SKIPPED: %s at %s (candles=%d, VWAP crosses=%d, trend=%s)",
+                    self._today_str,
+                    reason,
+                    now.strftime("%H:%M"),
+                    candle_count,
+                    self._day_quality.get("vwap_crosses", 0),
+                    vwap_trend,
                 )
                 await self.alert_manager.telegram.send(
                     f"📊 CONFIG P — Day Skip\n"
                     f"Date: {self._today_str}\n"
+                    f"Assessed at: {now.strftime('%H:%M')} (candles={candle_count})\n"
                     f"Reason: {reason}\n"
                     f"VWAP crosses: {self._day_quality.get('vwap_crosses', 0)}\n"
                     f"Trend: {vwap_trend}\n"
@@ -206,14 +224,18 @@ class ConfigPScanner:
             else:
                 self._day_tradeable = True
                 logger.info(
-                    "[ConfigP] Day %s TRADEABLE: trend=%s, VWAP crosses=%d, direction=%.2f%%",
-                    self._today_str, vwap_trend,
+                    "[ConfigP] Day %s TRADEABLE at %s: trend=%s, candles=%d, VWAP crosses=%d, direction=%.2f%%",
+                    self._today_str,
+                    now.strftime("%H:%M"),
+                    vwap_trend,
+                    candle_count,
                     self._day_quality.get("vwap_crosses", 0),
                     self._day_quality.get("net_move_pct", 0),
                 )
                 await self.alert_manager.telegram.send(
                     f"📊 CONFIG P — Day Assessment\n"
                     f"Date: {self._today_str}\n"
+                    f"Assessed at: {now.strftime('%H:%M')} (candles={candle_count})\n"
                     f"Status: TRADEABLE ✅\n"
                     f"VWAP trend: {vwap_trend}\n"
                     f"VWAP crosses: {self._day_quality.get('vwap_crosses', 0)}\n"
