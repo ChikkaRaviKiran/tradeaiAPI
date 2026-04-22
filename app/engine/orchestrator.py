@@ -71,6 +71,8 @@ from app.ai.insight_manager import InsightManager
 from app.engine.ai_decision import set_ai_insight_manager
 from app.engine.config_p_scanner import ConfigPScanner
 from app.engine.move_detection_scanner import MoveDetectionScanner
+from app.engine.ai_gpt_scanner import AIGPTScanner
+from app.ai.ai_gpt_pipeline import AIGPTPipeline
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
 from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
@@ -265,6 +267,32 @@ class Orchestrator:
             alert_manager=self.alert_manager,
         )
 
+        # ── AI-GPT Scanner (3-stage GPT pipeline, 5-min cadence) ──
+        ai_pipeline: Optional[AIGPTPipeline] = None
+        if settings.ai_gpt_scanner_enabled and settings.openai_api_key:
+            try:
+                ai_pipeline = AIGPTPipeline(
+                    api_key=settings.openai_api_key,
+                    model=settings.ai_gpt_scanner_model,
+                )
+                logger.info(
+                    "[AI-GPT] Pipeline initialised (model=%s)",
+                    settings.ai_gpt_scanner_model,
+                )
+            except Exception:
+                logger.exception("[AI-GPT] Pipeline init failed — scanner disabled")
+                ai_pipeline = None
+        else:
+            logger.info("[AI-GPT] Scanner disabled (enabled=%s, key_set=%s)",
+                        settings.ai_gpt_scanner_enabled,
+                        bool(settings.openai_api_key))
+        self.ai_gpt_scanner = AIGPTScanner(
+            client=self.client,
+            feature_engine=self.feature_engine,
+            alert_manager=self.alert_manager,
+            pipeline=ai_pipeline,
+        )
+
         # Strategy selector — picks best strategies based on condition-performance data
         from app.engine.strategy_selector import StrategySelector
         self.strategy_selector = StrategySelector()
@@ -455,6 +483,8 @@ class Orchestrator:
         self.config_p_scanner.reset_daily()
         # Reset Move Detection scanner daily state
         self.move_detection_scanner.reset_daily()
+        # Reset AI-GPT scanner daily state
+        self.ai_gpt_scanner.reset_daily()
         self.running = False
         logger.info("Daily state reset complete")
 
@@ -533,6 +563,7 @@ class Orchestrator:
         # Reset scanner daily state (ensures _today_str is correct after weekends/holidays)
         self.config_p_scanner.reset_daily()
         self.move_detection_scanner.reset_daily()
+        self.ai_gpt_scanner.reset_daily()
 
         self.running = True
 
@@ -601,7 +632,8 @@ class Orchestrator:
             if nifty_expiry:
                 self.config_p_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.move_detection_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                logger.info("[ConfigP+MoveDet] Expiry set: %s", nifty_expiry)
+                self.ai_gpt_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
+                logger.info("[ConfigP+MoveDet+AIGPT] Expiry set: %s", nifty_expiry)
         except Exception:
             logger.exception("Failed to determine expiries — options data may be unavailable")
             self._log_event("setup", "Expiry discovery FAILED — continuing without options")
@@ -1397,6 +1429,7 @@ class Orchestrator:
             if symbol == "NIFTY":
                 await self.config_p_scanner.run_cycle(df_today, instrument, cycle)
                 await self.move_detection_scanner.run_cycle(df_today, instrument, cycle)
+                await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
             return
 
             # 8. Time-of-day circuit breaker — no new entries after cutoff
@@ -2985,6 +3018,8 @@ class Orchestrator:
         await self.config_p_scanner.force_close(nifty_df, _NIFTY_INST)
         # Close Move Detection scanner trade
         await self.move_detection_scanner.force_close(nifty_df, _NIFTY_INST)
+        # Close AI-GPT scanner trade
+        await self.ai_gpt_scanner.force_close(nifty_df, _NIFTY_INST)
 
         all_traders = [("v1", self.paper_trader)]
         for engine_label, trader in all_traders:

@@ -129,6 +129,19 @@ class AlertManager:
             self._history_logger = HistoryLogger()
         return self._history_logger
 
+    async def record(self, alert: AlertItem) -> None:
+        """Persist an externally-built alert (e.g. from a Scanner) to UI store + DB.
+
+        Used by ConfigPScanner / MoveDetectionScanner / AIGPTScanner which build
+        their own rich Telegram-style messages and need them visible in the
+        Alerts panel and in DB history.
+        """
+        self.store.add(alert)
+        try:
+            await self._get_history_logger().save_alert(alert)
+        except Exception:
+            logger.debug("save_alert failed for scanner alert", exc_info=True)
+
     async def send_signal_alert(self, signal: StrategySignal, decision: AIDecision, engine: str = "v1") -> None:
         msg = _format_signal_message(signal, decision)
         inst = getattr(signal, 'instrument', 'NIFTY')

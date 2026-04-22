@@ -436,7 +436,7 @@ class ConfigPScanner:
             message=msg,
             timestamp=now,
         )
-        self.alert_manager.store.add(alert)
+        await self.alert_manager.record(alert)
 
     async def _check_exit(
         self,
@@ -574,7 +574,7 @@ class ConfigPScanner:
             message=msg,
             timestamp=now,
         )
-        self.alert_manager.store.add(alert)
+        await self.alert_manager.record(alert)
 
     async def force_close(self, df_today: pd.DataFrame, instrument: InstrumentConfig) -> None:
         """Force close any active trade (called at EOD 15:20)."""

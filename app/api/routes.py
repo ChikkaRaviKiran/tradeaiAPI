@@ -294,6 +294,7 @@ async def get_system_status():
     if orch:
         config_p = getattr(orch, "config_p_scanner", None)
         move_det = getattr(orch, "move_detection_scanner", None)
+        ai_gpt = getattr(orch, "ai_gpt_scanner", None)
         if config_p:
             cp_trade = config_p._active_trade
             scanner_info["config_p"] = {
@@ -311,6 +312,14 @@ async def get_system_status():
                 "signal_found": move_det._signal_found_today,
                 "in_trade": md_trade is not None and not md_trade.exited if md_trade else False,
                 "last_trade_week": move_det._last_trade_week,
+            }
+        if ai_gpt:
+            ag_trade = ai_gpt._active_trade
+            scanner_info["ai_gpt"] = {
+                "active": ai_gpt.pipeline is not None,
+                "in_trade": ag_trade is not None and not ag_trade.exited if ag_trade else False,
+                "ai_failures_today": ai_gpt._ai_failure_count_today,
+                "model": settings.ai_gpt_scanner_model if ai_gpt.pipeline is not None else None,
             }
 
     return {

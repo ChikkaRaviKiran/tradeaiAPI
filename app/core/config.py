@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4", alias="OPENAI_MODEL")
 
+    # AI-GPT Scanner (3rd independent scanner — 5-min AI decision pipeline)
+    ai_gpt_scanner_enabled: bool = Field(default=True, alias="AI_GPT_SCANNER_ENABLED")
+    ai_gpt_scanner_model: str = Field(default="gpt-5", alias="AI_GPT_SCANNER_MODEL")
+
     # DhanHQ (expired options data only)
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
 
