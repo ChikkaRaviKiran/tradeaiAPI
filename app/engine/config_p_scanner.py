@@ -169,8 +169,17 @@ class ConfigPScanner:
 
         now = datetime.now(IST)
         candle_count = len(df_today)
-        if not self._today_str:
-            self._today_str = now.strftime("%Y-%m-%d")
+        today_str = now.strftime("%Y-%m-%d")
+        if self._today_str != today_str:
+            # Day rollover detected mid-loop (or first run) — force a fresh reset
+            # so daily flags / Telegram messages reflect today's date, not yesterday's.
+            if self._today_str:
+                logger.info(
+                    "[ConfigP] Day rollover detected: %s → %s. Resetting daily state.",
+                    self._today_str, today_str,
+                )
+            self.reset_daily()
+            self._today_str = today_str
 
         # ── If we have an active trade, check exits first ────────────
         if self._active_trade and not self._active_trade.exited:
