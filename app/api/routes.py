@@ -319,6 +319,10 @@ async def get_system_status():
                 "active": ai_gpt.pipeline is not None,
                 "in_trade": ag_trade is not None and not ag_trade.exited if ag_trade else False,
                 "ai_failures_today": ai_gpt._ai_failure_count_today,
+                "ai_runs_today": getattr(ai_gpt, "_ai_runs_today", 0),
+                "last_run_at": getattr(ai_gpt, "_last_run_at", None),
+                "last_decision": getattr(ai_gpt, "_last_decision", None),
+                "last_decision_detail": getattr(ai_gpt, "_last_decision_detail", None),
                 "model": settings.ai_gpt_scanner_model if ai_gpt.pipeline is not None else None,
             }
 

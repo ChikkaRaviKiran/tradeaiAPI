@@ -127,6 +127,11 @@ class AIGPTScanner:
         self._last_ai_run_minute: Optional[int] = None  # to enforce 5-min cadence
         self._last_ai_run_date: Optional[str] = None
         self._ai_failure_count_today: int = 0
+        # Visibility into AI activity (surfaced via /api/system/status)
+        self._last_run_at: Optional[str] = None        # "HH:MM" of most recent AI cycle
+        self._last_decision: Optional[str] = None      # short label (e.g. "no_trade", "low_conf:60", "rejected", "failed", "signal CE", "hold")
+        self._last_decision_detail: Optional[str] = None
+        self._ai_runs_today: int = 0
 
     def reset_daily(self) -> None:
         """Reset daily state for a fresh trading day."""
@@ -135,6 +140,41 @@ class AIGPTScanner:
         self._last_ai_run_minute = None
         self._last_ai_run_date = None
         self._ai_failure_count_today = 0
+        self._last_run_at = None
+        self._last_decision = None
+        self._last_decision_detail = None
+        self._ai_runs_today = 0
+
+    async def _record_cycle(
+        self,
+        now: datetime,
+        decision: str,
+        detail: str,
+        *,
+        emit_alert: bool = True,
+    ) -> None:
+        """Track AI activity for status/UI visibility and (optionally) push a
+        compact info alert so users can see the scanner is alive each cycle.
+        Telegram is NOT spammed — record() only writes to UI store + DB.
+        """
+        self._last_run_at = now.strftime("%H:%M")
+        self._last_decision = decision
+        self._last_decision_detail = detail
+        self._ai_runs_today += 1
+        logger.info("[%s] cycle %s — %s | %s", SCANNER_TAG, self._last_run_at, decision, detail)
+        if not emit_alert:
+            return
+        try:
+            alert = AlertItem(
+                id=str(uuid.uuid4())[:8],
+                alert_type="info",
+                title=f"{SCANNER_TAG} cycle {self._last_run_at} — {decision}",
+                message=detail,
+                timestamp=now,
+            )
+            await self.alert_manager.record(alert)
+        except Exception:
+            logger.debug("[%s] failed to record cycle alert", SCANNER_TAG, exc_info=True)
 
     def set_expiry(self, expiry: str, expiry_date: Optional[date] = None) -> None:
         self._expiry = expiry
@@ -268,22 +308,38 @@ class AIGPTScanner:
     ) -> None:
         payload = self._build_payload(df_today, now)
         if payload is None:
+            await self._record_cycle(now, "skipped", "insufficient candles to build payload", emit_alert=False)
             return
 
         interpretation = await self.pipeline.interpret(payload)
         if interpretation is None:
             self._ai_failure_count_today += 1
+            await self._record_cycle(
+                now, "AI FAILED",
+                f"interpret stage failed (fail {self._ai_failure_count_today}/5)",
+            )
             return
 
         reasoning = await self.pipeline.reason(payload, interpretation)
         if reasoning is None:
             self._ai_failure_count_today += 1
+            await self._record_cycle(
+                now, "AI FAILED",
+                f"reasoning stage failed (fail {self._ai_failure_count_today}/5)",
+            )
             return
 
         # Hard filters
         trade_side = str(reasoning.get("trade", "NONE")).upper()
+        bias = str(reasoning.get("bias", "?"))
+        phase = str(interpretation.get("market_phase", "?"))
+        momentum = str(interpretation.get("momentum", "?"))
         if trade_side not in ("CE", "PE"):
-            return  # AI says no trade
+            await self._record_cycle(
+                now, "no trade",
+                f"bias={bias} | phase={phase} | momentum={momentum}",
+            )
+            return
 
         try:
             confidence = int(reasoning.get("confidence", 0))
@@ -291,20 +347,37 @@ class AIGPTScanner:
             confidence = 0
         if confidence < MIN_CONFIDENCE:
             logger.info("[%s] Reasoning conf=%d < %d — skip", SCANNER_TAG, confidence, MIN_CONFIDENCE)
+            await self._record_cycle(
+                now, f"low confidence ({confidence}<{MIN_CONFIDENCE})",
+                f"trade={trade_side} | bias={bias} | phase={phase}",
+            )
             return
 
         validation = await self.pipeline.validate(payload, interpretation, reasoning)
         if validation is None:
             self._ai_failure_count_today += 1
+            await self._record_cycle(
+                now, "AI FAILED",
+                f"validator stage failed (fail {self._ai_failure_count_today}/5)",
+            )
             return
         if str(validation.get("decision", "")).upper() != "APPROVED":
             logger.info(
                 "[%s] Validator rejected: %s",
                 SCANNER_TAG, validation.get("reason", "no reason"),
             )
+            await self._record_cycle(
+                now, "validator REJECTED",
+                f"trade={trade_side} conf={confidence} | reason={validation.get('reason', '?')}",
+            )
             return
 
         # ── Place (paper) trade ─────────────────────────────────────
+        await self._record_cycle(
+            now, f"SIGNAL {trade_side}",
+            f"conf={confidence} | bias={bias} | risk={validation.get('risk', '?')}",
+            emit_alert=False,  # entry path emits its own rich alert
+        )
         await self._enter_trade(
             df_today, instrument, now,
             interpretation, reasoning, validation,
@@ -454,13 +527,27 @@ class AIGPTScanner:
         decision = await self.pipeline.monitor(payload, trade_context)
         if decision is None:
             self._ai_failure_count_today += 1
+            await self._record_cycle(
+                now, "AI FAILED",
+                f"monitor stage failed (fail {self._ai_failure_count_today}/5)",
+            )
             return
 
         action = str(decision.get("action", "HOLD")).upper()
+        mon_reason = str(decision.get("reason", ""))
         if action == "EXIT" or action == "PARTIAL_EXIT":
-            reason = f"ai_{action.lower()}: {decision.get('reason', '')}"
+            await self._record_cycle(
+                now, action,
+                f"{trade.option_type} | spot_move={trade_context['spot_move_pts']}pts | {mon_reason}",
+                emit_alert=False,  # exit path emits its own rich alert
+            )
+            reason = f"ai_{action.lower()}: {mon_reason}"
             await self._exit_trade(df_today, instrument, now, reason)
-        # HOLD → do nothing
+        else:
+            await self._record_cycle(
+                now, "HOLD",
+                f"{trade.option_type} | spot_move={trade_context['spot_move_pts']}pts | {mon_reason}",
+            )
 
     # ── Exit trade ──────────────────────────────────────────────────
     async def _exit_trade(
