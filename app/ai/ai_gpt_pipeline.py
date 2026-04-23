@@ -128,17 +128,21 @@ class AIGPTPipeline:
 
     # ── Internal: single JSON-mode call with timeout/error guards ──
     async def _call(self, system: str, user: str, stage: str) -> Optional[dict]:
+        kwargs: dict = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        # gpt-5 / o-series reasoning models only support the default
+        # temperature (1). Setting any other value triggers a 400.
+        if not self.model.startswith(("gpt-5", "o1", "o3", "o4")):
+            kwargs["temperature"] = 0.2
         try:
             resp = await asyncio.wait_for(
-                self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.2,
-                ),
+                self._client.chat.completions.create(**kwargs),
                 timeout=_CALL_TIMEOUT,
             )
         except asyncio.TimeoutError:
