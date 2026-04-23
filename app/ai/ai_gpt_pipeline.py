@@ -27,14 +27,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Optional
 
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-# Per-call timeout. AI calls must complete fast (spec: < 2s ideal, hard cap 30s).
-_CALL_TIMEOUT = 30.0
+# Per-call timeout. Reasoning models (gpt-5, o-series) routinely take
+# 30-90s to produce JSON; keep the cap generous.
+_CALL_TIMEOUT = 90.0
+# Truncate long payloads in logs so we don't blow up disk/Loki.
+_LOG_PAYLOAD_CHARS = 4000
 
 
 class AIGPTPipeline:
@@ -140,25 +144,49 @@ class AIGPTPipeline:
         # temperature (1). Setting any other value triggers a 400.
         if not self.model.startswith(("gpt-5", "o1", "o3", "o4")):
             kwargs["temperature"] = 0.2
+
+        # Step-by-step request log (truncated)
+        user_log = user if len(user) <= _LOG_PAYLOAD_CHARS else user[:_LOG_PAYLOAD_CHARS] + f"…[+{len(user) - _LOG_PAYLOAD_CHARS} chars]"
+        logger.info(
+            "[AI-GPT] → %s REQUEST model=%s timeout=%ds payload_chars=%d\n%s",
+            stage, self.model, int(_CALL_TIMEOUT), len(user), user_log,
+        )
+        t0 = time.monotonic()
         try:
             resp = await asyncio.wait_for(
                 self._client.chat.completions.create(**kwargs),
                 timeout=_CALL_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            logger.warning("[AI-GPT] %s stage timed out after %ds", stage, _CALL_TIMEOUT)
+            logger.warning(
+                "[AI-GPT] ← %s TIMEOUT after %.1fs (cap=%ds)",
+                stage, time.monotonic() - t0, int(_CALL_TIMEOUT),
+            )
             return None
-        except Exception:
-            logger.exception("[AI-GPT] %s stage failed", stage)
+        except Exception as e:
+            logger.exception(
+                "[AI-GPT] ← %s ERROR after %.1fs: %s",
+                stage, time.monotonic() - t0, e,
+            )
             return None
 
+        elapsed = time.monotonic() - t0
         try:
             content = resp.choices[0].message.content or "{}"
             data: Any = json.loads(content)
             if not isinstance(data, dict):
-                logger.warning("[AI-GPT] %s returned non-object JSON: %r", stage, content)
+                logger.warning(
+                    "[AI-GPT] ← %s NON-OBJECT JSON in %.1fs: %r",
+                    stage, elapsed, content,
+                )
                 return None
+            logger.info(
+                "[AI-GPT] ← %s RESPONSE in %.1fs\n%s",
+                stage, elapsed, json.dumps(data, indent=2, default=str),
+            )
             return data
         except (json.JSONDecodeError, IndexError, AttributeError):
-            logger.exception("[AI-GPT] %s returned malformed JSON", stage)
+            logger.exception(
+                "[AI-GPT] ← %s MALFORMED JSON in %.1fs", stage, elapsed,
+            )
             return None
