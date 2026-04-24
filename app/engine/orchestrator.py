@@ -73,6 +73,7 @@ from app.engine.config_p_scanner import ConfigPScanner
 from app.engine.move_detection_scanner import MoveDetectionScanner
 from app.engine.ai_gpt_scanner import AIGPTScanner
 from app.engine.nr5_breakout_scanner import NR5BreakoutScanner
+from app.engine.pdh_pdl_scanner import PDHPDLBreakoutScanner
 from app.ai.ai_gpt_pipeline import AIGPTPipeline
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
@@ -302,6 +303,14 @@ class Orchestrator:
         if not settings.nr5_scanner_enabled:
             logger.info("[NR5] Scanner disabled via config (NR5_SCANNER_ENABLED=false)")
 
+        # ── PDH/PDL Breakout Scanner (prev-day H/L breakout, PAPER-ONLY) ──
+        self.pdh_pdl_scanner = PDHPDLBreakoutScanner(
+            client=self.client,
+            alert_manager=self.alert_manager,
+        )
+        if not settings.pdh_pdl_scanner_enabled:
+            logger.info("[PDHPDL] Scanner disabled via config (PDH_PDL_SCANNER_ENABLED=false)")
+
         # Strategy selector — picks best strategies based on condition-performance data
         from app.engine.strategy_selector import StrategySelector
         self.strategy_selector = StrategySelector()
@@ -496,6 +505,8 @@ class Orchestrator:
         self.ai_gpt_scanner.reset_daily()
         # Reset NR5 scanner daily state
         self.nr5_scanner.reset_daily()
+        # Reset PDH/PDL scanner daily state
+        self.pdh_pdl_scanner.reset_daily()
         self.running = False
         logger.info("Daily state reset complete")
 
@@ -576,6 +587,7 @@ class Orchestrator:
         self.move_detection_scanner.reset_daily()
         self.ai_gpt_scanner.reset_daily()
         self.nr5_scanner.reset_daily()
+        self.pdh_pdl_scanner.reset_daily()
 
         self.running = True
 
@@ -646,7 +658,8 @@ class Orchestrator:
                 self.move_detection_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.ai_gpt_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.nr5_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                logger.info("[ConfigP+MoveDet+AIGPT+NR5] Expiry set: %s", nifty_expiry)
+                self.pdh_pdl_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
+                logger.info("[ConfigP+MoveDet+AIGPT+NR5+PDHPDL] Expiry set: %s", nifty_expiry)
         except Exception:
             logger.exception("Failed to determine expiries — options data may be unavailable")
             self._log_event("setup", "Expiry discovery FAILED — continuing without options")
@@ -1446,18 +1459,24 @@ class Orchestrator:
                 cp_in_trade = self.config_p_scanner.is_in_trade()
                 md_in_trade = self.move_detection_scanner.is_in_trade()
                 nr5_in_trade = self.nr5_scanner.is_in_trade()
+                pdh_in_trade = self.pdh_pdl_scanner.is_in_trade()
                 await self.config_p_scanner.run_cycle(
                     df_today, instrument, cycle,
-                    peer_in_trade=(md_in_trade or nr5_in_trade),
+                    peer_in_trade=(md_in_trade or nr5_in_trade or pdh_in_trade),
                 )
                 await self.move_detection_scanner.run_cycle(
                     df_today, instrument, cycle,
-                    peer_in_trade=(cp_in_trade or nr5_in_trade),
+                    peer_in_trade=(cp_in_trade or nr5_in_trade or pdh_in_trade),
                 )
                 if settings.nr5_scanner_enabled:
                     await self.nr5_scanner.run_cycle(
                         df_today, instrument, cycle,
-                        peer_in_trade=(cp_in_trade or md_in_trade),
+                        peer_in_trade=(cp_in_trade or md_in_trade or pdh_in_trade),
+                    )
+                if settings.pdh_pdl_scanner_enabled:
+                    await self.pdh_pdl_scanner.run_cycle(
+                        df_today, instrument, cycle,
+                        peer_in_trade=(cp_in_trade or md_in_trade or nr5_in_trade),
                     )
                 await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
             return
@@ -3052,6 +3071,8 @@ class Orchestrator:
         await self.ai_gpt_scanner.force_close(nifty_df, _NIFTY_INST)
         # Close NR5 Breakout scanner trade
         await self.nr5_scanner.force_close(nifty_df, _NIFTY_INST)
+        # Close PDH/PDL Breakout scanner trade
+        await self.pdh_pdl_scanner.force_close(nifty_df, _NIFTY_INST)
 
         all_traders = [("v1", self.paper_trader)]
         for engine_label, trader in all_traders:

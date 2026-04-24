@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # Honoured 3-way mutex with Config-P / Move-Det.
     nr5_scanner_enabled: bool = Field(default=True, alias="NR5_SCANNER_ENABLED")
 
+    # PDH/PDL Breakout Scanner (previous day high/low breakout, paper-only)
+    # Backtest: N=121 trades, Spot WR ~64% PF 1.45, Opt WR 72.7% Opt PF 4.86
+    # over 131 days. Stop=15 pts, Target=60 pts (R:R 1:4). Mutex w/ peers.
+    pdh_pdl_scanner_enabled: bool = Field(default=True, alias="PDH_PDL_SCANNER_ENABLED")
+
     # DhanHQ (expired options data only)
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
 

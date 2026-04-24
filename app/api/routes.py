@@ -296,6 +296,7 @@ async def get_system_status():
         move_det = getattr(orch, "move_detection_scanner", None)
         ai_gpt = getattr(orch, "ai_gpt_scanner", None)
         nr5 = getattr(orch, "nr5_scanner", None)
+        pdh_pdl = getattr(orch, "pdh_pdl_scanner", None)
         if config_p:
             cp_trade = config_p._active_trade
             scanner_info["config_p"] = {
@@ -355,6 +356,34 @@ async def get_system_status():
                         "option_exit_price": n_trade.option_exit_price,
                     }
                     if n_trade else None
+                ),
+            }
+        if pdh_pdl:
+            p_trade = pdh_pdl._active_trade
+            scanner_info["pdh_pdl"] = {
+                "active": settings.pdh_pdl_scanner_enabled,
+                "setup_checked": pdh_pdl._setup_checked,
+                "is_tradeable_day": pdh_pdl._is_tradeable_day,
+                "signal_found": pdh_pdl._signal_found_today,
+                "in_trade": p_trade is not None and not p_trade.exited if p_trade else False,
+                "prev_high": pdh_pdl._prev_high,
+                "prev_low": pdh_pdl._prev_low,
+                "trade": (
+                    {
+                        "side": p_trade.side,
+                        "entry_time": p_trade.entry_time,
+                        "entry_spot": p_trade.entry_spot,
+                        "stop_level": p_trade.stop_level,
+                        "target_level": p_trade.target_level,
+                        "option_symbol": p_trade.option_symbol,
+                        "option_entry_price": p_trade.option_entry_price,
+                        "exited": p_trade.exited,
+                        "exit_time": p_trade.exit_time,
+                        "exit_spot": p_trade.exit_spot,
+                        "exit_reason": p_trade.exit_reason,
+                        "option_exit_price": p_trade.option_exit_price,
+                    }
+                    if p_trade else None
                 ),
             }
 
