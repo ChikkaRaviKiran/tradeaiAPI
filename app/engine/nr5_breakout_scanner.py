@@ -1,15 +1,17 @@
 """NR5 Breakout Scanner — Volatility Contraction → Expansion (PAPER-ONLY).
 
 Strategy summary (backtested on 131 NIFTY days, 2025-10-13 → 2026-04-24):
-  - Setup:  yesterday's daily range = NARROWEST of last 5 trading days (NR5)
-  - Filter: skip if abs(today_open vs prev_close) gap > 1.5 %
-  - Entry:  break of prev-day high + 2 (CE) or prev-day low − 2 (PE)
-  - Stop:   12 pts adverse (spot)
-  - Target: 50 pts favorable (spot)  → R:R = 1:4.2
-  - EOD:    force exit at 15:20
+  - Setup:    yesterday's daily range = NARROWEST of last 5 trading days (NR5)
+  - Filter:   skip if abs(today_open vs prev_close) gap > 1.5 %
+  - Bars:     5-min OHLC (resampled from 1-min) — removes intrabar wick noise
+  - Entry:    break of prev-day high + 2 (CE) or prev-day low − 2 (PE)
+  - Stop:     20 pts adverse (spot)
+  - Target:   70 pts favorable (spot)  → R:R = 1:3.5
+  - EOD:      force exit at 15:20
 
-Backtest result: N=23 trades, WR=43.5 %, PF=3.21, expectancy +14.96 pts,
-total +344 pts, MDD -72 pts.
+Backtest result (5-min bars, stop=20, target=70):
+  N=23 trades, WR=58.3 % (aligned subset), Option PF 2.54 (all) / 2.87 (color-aligned),
+  Option expectancy +7.9 pts/trade, total +94.8 option pts.
 
 This scanner is OBSERVE-ONLY: it sends Telegram alerts but does NOT
 record trades to the paper-trader DB. It also respects a 3-way mutex
@@ -41,11 +43,27 @@ IST = pytz.timezone("Asia/Kolkata")
 # ── NR5 Parameters (LOCKED — matches backtest) ────────────────────────
 NR_LEN = 5                 # narrow-range lookback (yesterday is the narrowest of last NR_LEN days)
 BREAKOUT_BUFFER = 2.0      # spot points beyond prev high/low to trigger entry
-STOP_PTS = 12.0            # adverse spot move that stops the trade out
-TARGET_PTS = 50.0          # favorable spot move that books target
+STOP_PTS = 20.0            # adverse spot move that stops the trade out
+TARGET_PTS = 70.0          # favorable spot move that books target
 GAP_MAX_PCT = 1.5          # skip the day if abs(gap %) exceeds this
+BAR_MINUTES = 5            # resample 1-min input candles to this timeframe (noise filter)
 ENTRY_CUTOFF = dtime(14, 0)
 EOD_FORCE_CLOSE = dtime(15, 20)
+
+
+def _resample_to_bar_minutes(df: pd.DataFrame, minutes: int = BAR_MINUTES) -> pd.DataFrame:
+    """Aggregate 1-min OHLC bars into ``minutes``-min bars (left-labeled).
+
+    Requires a DatetimeIndex. Volume is summed if present.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return df
+    rule = f"{int(minutes)}min"
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if "volume" in df.columns:
+        agg["volume"] = "sum"
+    out = df.resample(rule, label="left", closed="left").agg(agg).dropna(how="any")
+    return out
 
 
 class NR5Trade:
@@ -160,6 +178,10 @@ class NR5BreakoutScanner:
             return
         if isinstance(df_today.index, pd.DatetimeIndex):
             df_today = df_today.between_time("09:15", "15:30")
+            if df_today.empty:
+                return
+            # Resample to BAR_MINUTES (matches backtest: 5-min OHLC removes 1-min wick noise)
+            df_today = _resample_to_bar_minutes(df_today, BAR_MINUTES)
             if df_today.empty:
                 return
 
