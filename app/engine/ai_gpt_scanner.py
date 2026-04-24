@@ -315,18 +315,20 @@ class AIGPTScanner:
         interpretation = await self.pipeline.interpret(payload)
         if interpretation is None:
             self._ai_failure_count_today += 1
+            err = self.pipeline.last_error or "unknown"
             await self._record_cycle(
                 now, "AI FAILED",
-                f"interpret stage failed (fail {self._ai_failure_count_today}/5)",
+                f"interpret stage failed (fail {self._ai_failure_count_today}/5) | {err}",
             )
             return
 
         reasoning = await self.pipeline.reason(payload, interpretation)
         if reasoning is None:
             self._ai_failure_count_today += 1
+            err = self.pipeline.last_error or "unknown"
             await self._record_cycle(
                 now, "AI FAILED",
-                f"reasoning stage failed (fail {self._ai_failure_count_today}/5)",
+                f"reasoning stage failed (fail {self._ai_failure_count_today}/5) | {err}",
             )
             return
 
@@ -357,9 +359,10 @@ class AIGPTScanner:
         validation = await self.pipeline.validate(payload, interpretation, reasoning)
         if validation is None:
             self._ai_failure_count_today += 1
+            err = self.pipeline.last_error or "unknown"
             await self._record_cycle(
                 now, "AI FAILED",
-                f"validator stage failed (fail {self._ai_failure_count_today}/5)",
+                f"validator stage failed (fail {self._ai_failure_count_today}/5) | {err}",
             )
             return
         if str(validation.get("decision", "")).upper() != "APPROVED":
@@ -528,9 +531,10 @@ class AIGPTScanner:
         decision = await self.pipeline.monitor(payload, trade_context)
         if decision is None:
             self._ai_failure_count_today += 1
+            err = self.pipeline.last_error or "unknown"
             await self._record_cycle(
                 now, "AI FAILED",
-                f"monitor stage failed (fail {self._ai_failure_count_today}/5)",
+                f"monitor stage failed (fail {self._ai_failure_count_today}/5) | {err}",
             )
             return
 

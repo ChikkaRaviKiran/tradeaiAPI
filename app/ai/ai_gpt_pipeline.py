@@ -35,8 +35,9 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 # Per-call timeout. Reasoning models (gpt-5, o-series) routinely take
-# 30-90s to produce JSON; keep the cap generous.
-_CALL_TIMEOUT = 90.0
+# 60-150s to produce JSON; keep the cap generous.
+_CALL_TIMEOUT = 180.0
+_RETRY_ATTEMPTS = 2          # initial try + 1 retry on timeout/error
 # Truncate long payloads in logs so we don't blow up disk/Loki.
 _LOG_PAYLOAD_CHARS = 4000
 
@@ -49,6 +50,10 @@ class AIGPTPipeline:
             raise ValueError("AIGPTPipeline requires an OpenAI API key")
         self.model = model
         self._client = AsyncOpenAI(api_key=api_key)
+        # Last failure reason for the most recent _call — surfaced by the
+        # scanner in user-visible alerts so prod issues are diagnosable
+        # without log access. Cleared on every successful call.
+        self.last_error: Optional[str] = None
 
     # ── Stage 1: INTERPRETER ────────────────────────────────────────
     async def interpret(self, payload: dict) -> Optional[dict]:
@@ -161,42 +166,55 @@ class AIGPTPipeline:
             "[AI-GPT] → %s REQUEST model=%s timeout=%ds payload_chars=%d\n%s",
             stage, self.model, int(_CALL_TIMEOUT), len(user), user_log,
         )
-        t0 = time.monotonic()
-        try:
-            resp = await asyncio.wait_for(
-                self._client.chat.completions.create(**kwargs),
-                timeout=_CALL_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "[AI-GPT] ← %s TIMEOUT after %.1fs (cap=%ds)",
-                stage, time.monotonic() - t0, int(_CALL_TIMEOUT),
-            )
-            return None
-        except Exception as e:
-            logger.exception(
-                "[AI-GPT] ← %s ERROR after %.1fs: %s",
-                stage, time.monotonic() - t0, e,
-            )
-            return None
 
-        elapsed = time.monotonic() - t0
-        try:
-            content = resp.choices[0].message.content or "{}"
-            data: Any = json.loads(content)
-            if not isinstance(data, dict):
+        last_err: str = ""
+        for attempt in range(1, _RETRY_ATTEMPTS + 1):
+            t0 = time.monotonic()
+            try:
+                resp = await asyncio.wait_for(
+                    self._client.chat.completions.create(**kwargs),
+                    timeout=_CALL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                last_err = f"TIMEOUT >{int(_CALL_TIMEOUT)}s (attempt {attempt}/{_RETRY_ATTEMPTS})"
                 logger.warning(
-                    "[AI-GPT] ← %s NON-OBJECT JSON in %.1fs: %r",
-                    stage, elapsed, content,
+                    "[AI-GPT] ← %s %s after %.1fs",
+                    stage, last_err, time.monotonic() - t0,
+                )
+                continue
+            except Exception as e:
+                # Compact one-line error (class:msg, truncated) for the alert
+                err_msg = f"{type(e).__name__}: {str(e)[:160]}"
+                last_err = f"{err_msg} (attempt {attempt}/{_RETRY_ATTEMPTS})"
+                logger.exception(
+                    "[AI-GPT] ← %s ERROR after %.1fs: %s",
+                    stage, time.monotonic() - t0, e,
+                )
+                continue
+
+            elapsed = time.monotonic() - t0
+            try:
+                content = resp.choices[0].message.content or "{}"
+                data: Any = json.loads(content)
+                if not isinstance(data, dict):
+                    last_err = f"NON-OBJECT JSON: {str(content)[:120]}"
+                    logger.warning(
+                        "[AI-GPT] ← %s NON-OBJECT JSON in %.1fs: %r",
+                        stage, elapsed, content,
+                    )
+                    return None
+                logger.info(
+                    "[AI-GPT] ← %s RESPONSE in %.1fs\n%s",
+                    stage, elapsed, json.dumps(data, indent=2, default=str),
+                )
+                self.last_error = None
+                return data
+            except (json.JSONDecodeError, IndexError, AttributeError) as e:
+                last_err = f"MALFORMED JSON: {type(e).__name__}"
+                logger.exception(
+                    "[AI-GPT] ← %s MALFORMED JSON in %.1fs", stage, elapsed,
                 )
                 return None
-            logger.info(
-                "[AI-GPT] ← %s RESPONSE in %.1fs\n%s",
-                stage, elapsed, json.dumps(data, indent=2, default=str),
-            )
-            return data
-        except (json.JSONDecodeError, IndexError, AttributeError):
-            logger.exception(
-                "[AI-GPT] ← %s MALFORMED JSON in %.1fs", stage, elapsed,
-            )
-            return None
+
+        self.last_error = last_err
+        return None
