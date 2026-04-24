@@ -1426,9 +1426,18 @@ class Orchestrator:
             # ── SIGNAL SCANNERS (Config P + Move Detection) ───────────
             # Both scanners run independently on NIFTY. Each has its own
             # weekly filter, day assessment, and trade tracking.
+            # Mutex: only ONE of Config-P / Move-Det may hold a live trade
+            # at any given time. Each is told whether the peer is currently
+            # in a trade so it can skip new entries.
             if symbol == "NIFTY":
-                await self.config_p_scanner.run_cycle(df_today, instrument, cycle)
-                await self.move_detection_scanner.run_cycle(df_today, instrument, cycle)
+                cp_in_trade = self.config_p_scanner.is_in_trade()
+                md_in_trade = self.move_detection_scanner.is_in_trade()
+                await self.config_p_scanner.run_cycle(
+                    df_today, instrument, cycle, peer_in_trade=md_in_trade,
+                )
+                await self.move_detection_scanner.run_cycle(
+                    df_today, instrument, cycle, peer_in_trade=cp_in_trade,
+                )
                 await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
             return
 

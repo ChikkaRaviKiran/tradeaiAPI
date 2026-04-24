@@ -60,6 +60,7 @@ TRAIL_BUFFER_PCT = 0.02         # 0.02% buffer on trailing stop
 OPTION_LEVERAGE = 55            # Approximate ATM PUT leverage
 MAX_HOLD_CANDLES = 120          # ~2 hours max
 DAY_ASSESSMENT_TIME = dtime(10, 0)
+PREMIUM_TARGET_PTS = 20.0       # Exit when option premium gains ≥ ₹20 over entry
 
 SCANNER_TAG = "MOVE-DET"        # Telegram message prefix
 
@@ -162,11 +163,16 @@ class MoveDetectionScanner:
         self._expiry = expiry
         self._expiry_date = expiry_date
 
+    def is_in_trade(self) -> bool:
+        """True if this scanner currently holds an open (un-exited) trade."""
+        return self._active_trade is not None and not self._active_trade.exited
+
     async def run_cycle(
         self,
         df_today: pd.DataFrame,
         instrument: InstrumentConfig,
         cycle: int,
+        peer_in_trade: bool = False,
     ) -> None:
         """Run one Move Detection scan cycle. Called every 60s by orchestrator."""
         if df_today is None or df_today.empty:
@@ -196,7 +202,10 @@ class MoveDetectionScanner:
         if self._active_trade and not self._active_trade.exited:
             await self._check_exit(df_today, instrument, now)
             return  # Don't look for new signals while in a trade
-
+        # ── Mutex with peer scanner (only one of Config-P / Move-Det
+        #    can hold a live signal at a time) ──────────────────────
+        if peer_in_trade:
+            return
         # ── Already found a signal today — skip ──────────────────────
         if self._signal_found_today:
             return
@@ -488,9 +497,24 @@ class MoveDetectionScanner:
 
         exit_reason = ""
         exit_price = current_close
+        live_option_ltp = 0.0
+
+        # ── Exit 0: Premium target — option LTP up ≥ ₹20 from entry ─
+        # Highest priority: book profit fast on premium expansion.
+        if trade.option_entry_price > 0 and trade.option_symbol and self._expiry:
+            quote = await self._fetch_option_quote(instrument, trade.strike_price, "PE")
+            if quote:
+                live_option_ltp = float(quote.get("ltp", 0.0) or 0.0)
+                if (
+                    live_option_ltp > 0
+                    and (live_option_ltp - trade.option_entry_price) >= PREMIUM_TARGET_PTS
+                ):
+                    exit_reason = "premium_target_20pts"
+                    exit_price = current_close
+                    trade.option_exit_price = live_option_ltp
 
         # ── Exit 1: Structure break — close above body midpoint ──────
-        if current_close > trade.body_mid:
+        if not exit_reason and current_close > trade.body_mid:
             exit_reason = "structure_break"
             exit_price = current_close
 
@@ -538,9 +562,9 @@ class MoveDetectionScanner:
         option_pnl_pct = index_pnl_pct * OPTION_LEVERAGE
         is_win = index_pnl_pct > 0
 
-        # Fetch current option price
-        option_exit_ltp = 0.0
-        if trade.option_symbol and self._expiry:
+        # Fetch current option price (skip if premium-target path already did it)
+        option_exit_ltp = trade.option_exit_price or 0.0
+        if option_exit_ltp <= 0 and trade.option_symbol and self._expiry:
             quote = await self._fetch_option_quote(instrument, trade.strike_price, "PE")
             if quote:
                 option_exit_ltp = quote.get("ltp", 0.0)

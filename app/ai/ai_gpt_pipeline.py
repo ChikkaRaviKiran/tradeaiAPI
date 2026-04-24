@@ -96,14 +96,24 @@ class AIGPTPipeline:
         self, payload: dict, interpretation: dict, reasoning: dict
     ) -> Optional[dict]:
         sys_prompt = (
-            "You are a risk validator for an intraday options trade about "
-            "to be placed. Reject any setup that is misaligned, low-"
-            "conviction, or carries excessive risk (e.g. fighting the "
-            "trend, choppy structure, weak volume, contradictory OI). "
-            "Respond ONLY with a JSON object using EXACTLY these keys: "
-            "decision, risk, reason. Allowed values: decision ∈ {APPROVED, "
-            "REJECTED}; risk ∈ {low, moderate, high}; reason is a short "
-            "string."
+            "You are a risk validator for an intraday NIFTY options trade. "
+            "Your job is to APPROVE setups that are coherent and REJECT "
+            "only those that are clearly broken. Respond ONLY with a JSON "
+            "object using EXACTLY these keys: decision, risk, reason. "
+            "Allowed values: decision ∈ {APPROVED, REJECTED}; risk ∈ "
+            "{low, moderate, high}; reason is a short string.\n\n"
+            "APPROVE when the trade direction agrees with the interpreted "
+            "trend AND with price action vs VWAP/EMA20 (e.g. PE with "
+            "bearish bias and price below VWAP/EMA20 = APPROVED). Mark "
+            "risk as 'low' for textbook setups, 'moderate' for normal "
+            "trends, 'high' for late entries or mid-range chop.\n\n"
+            "REJECT only when there is a clear structural problem: trade "
+            "direction fights the dominant trend, choppy/sideways structure "
+            "with no expansion, or contradictory signals (e.g. bearish "
+            "trade but price closing above VWAP and EMAs). Do NOT reject "
+            "just because data is incomplete or volume is low — that is "
+            "normal for Indian index spot data. Default to APPROVED when in "
+            "doubt and the direction is correct."
         )
         user_prompt = (
             "Market data:\n" + json.dumps(payload, default=str)

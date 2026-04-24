@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 # ── Parameters ──────────────────────────────────────────────────────
-MIN_CONFIDENCE = 75              # Spec: confidence >= 75 required
+MIN_CONFIDENCE = 70              # Approve trades ≥ 70 (was 75 — too restrictive;
+                                 # AI clustered at 60-72 on real trends)
 EARLIEST_TIME = dtime(9, 35)     # First AI run after 9:35 (need ≥4 5-min candles)
 NO_NEW_ENTRY_TIME = dtime(15, 0)
 EOD_FORCE_CLOSE_TIME = dtime(15, 20)
