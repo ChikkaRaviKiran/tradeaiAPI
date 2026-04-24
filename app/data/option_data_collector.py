@@ -34,8 +34,24 @@ from app.db.models import Base, OptionCandle
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
 
-# Extra strikes beyond the day's high/low ATM to capture (covers OTM offset)
+# Extra strikes beyond the day's high/low ATM to capture (covers OTM offset).
+# Can be overridden per call (e.g. backfill for non-directional strategies wants 7+).
 STRIKE_BUFFER = 3
+# Default: collect only the current weekly expiry.  Backfill jobs can request 2-3
+# upcoming weeklies to enable multi-day-hold strategies (strangles, calendars).
+DEFAULT_NUM_EXPIRIES = 1
+
+
+def _next_n_weekly_expiries(dt: date, expiry_weekday: int, n: int) -> list[date]:
+    """Return the next ``n`` weekly expiry dates on/after ``dt`` (holiday-adjusted)."""
+    out: list[date] = []
+    base = dt
+    for _ in range(n):
+        ex = compute_weekly_expiry(base, expiry_weekday)
+        if ex not in out:
+            out.append(ex)
+        base = ex + timedelta(days=1)
+    return out
 
 
 class OptionDataCollector:
@@ -91,17 +107,23 @@ class OptionDataCollector:
             logger.warning("Failed to get day range for %s on %s: %s", instrument.symbol, dt, e)
             return None
 
-    def _get_strikes_for_range(self, instrument: InstrumentConfig, day_low: float, day_high: float) -> list[float]:
+    def _get_strikes_for_range(
+        self,
+        instrument: InstrumentConfig,
+        day_low: float,
+        day_high: float,
+        strike_buffer: int = STRIKE_BUFFER,
+    ) -> list[float]:
         """Generate strikes covering the full day range + buffer.
 
-        Computes ATM for day_low and day_high, then adds STRIKE_BUFFER
+        Computes ATM for day_low and day_high, then adds ``strike_buffer``
         extra strikes on each side to cover OTM entries at any intraday level.
         """
         interval = instrument.strike_interval
         atm_low = round(day_low / interval) * interval
         atm_high = round(day_high / interval) * interval
-        lowest = atm_low - STRIKE_BUFFER * interval
-        highest = atm_high + STRIKE_BUFFER * interval
+        lowest = atm_low - strike_buffer * interval
+        highest = atm_high + strike_buffer * interval
         strikes = []
         s = lowest
         while s <= highest:
@@ -197,11 +219,14 @@ class OptionDataCollector:
         instrument: InstrumentConfig,
         dt: date,
         expiry_str: Optional[str] = None,
+        num_expiries: int = DEFAULT_NUM_EXPIRIES,
+        strike_buffer: int = STRIKE_BUFFER,
     ) -> dict:
         """Collect option candles for one instrument on one date.
 
         Uses AngelOne spot candles to get day high/low, then fetches option
-        candles for all strikes covering that range + buffer.
+        candles for all strikes covering that range + buffer for the next
+        ``num_expiries`` weekly expiries (1 by default).
 
         Returns: {"date": str, "contracts": int, "candles": int, "skipped": int}
         """
@@ -215,50 +240,53 @@ class OptionDataCollector:
             return stats
         day_low, day_high = day_range
 
-        # Get expiry — compute per instrument weekday
-        if expiry_str is None:
-            expiry_date = self._compute_weekly_expiry(dt, instrument.expiry_weekday)
-            expiry_str = instrument.format_expiry(expiry_date)
+        # Determine expiries to collect
+        if expiry_str is not None:
+            expiry_strs = [expiry_str]
+        else:
+            expiry_dates = _next_n_weekly_expiries(dt, instrument.expiry_weekday, num_expiries)
+            expiry_strs = [instrument.format_expiry(ed) for ed in expiry_dates]
 
-        strikes = self._get_strikes_for_range(instrument, day_low, day_high)
+        strikes = self._get_strikes_for_range(instrument, day_low, day_high, strike_buffer)
         logger.info(
-            "[%s] %s | Low=%.0f High=%.0f | Expiry=%s | Strikes: %s to %s (%d)",
-            instrument.symbol, date_str, day_low, day_high, expiry_str,
+            "[%s] %s | Low=%.0f High=%.0f | Expiries=%s | Strikes: %s to %s (%d)",
+            instrument.symbol, date_str, day_low, day_high, expiry_strs,
             int(min(strikes)), int(max(strikes)), len(strikes),
         )
 
-        for strike in strikes:
-            for opt_type in ("CE", "PE"):
-                symbol = instrument.build_option_symbol(expiry_str, strike, opt_type)
+        for current_expiry in expiry_strs:
+            for strike in strikes:
+                for opt_type in ("CE", "PE"):
+                    symbol = instrument.build_option_symbol(current_expiry, strike, opt_type)
 
-                async with self._session_factory() as session:
-                    if await self._already_cached(session, symbol, date_str):
-                        stats["skipped"] += 1
+                    async with self._session_factory() as session:
+                        if await self._already_cached(session, symbol, date_str):
+                            stats["skipped"] += 1
+                            continue
+
+                    # Fetch from AngelOne
+                    token_info = self.angel._search_symbol(symbol)
+                    if not token_info:
                         continue
 
-                # Fetch from AngelOne
-                token_info = self.angel._search_symbol(symbol)
-                if not token_info:
-                    continue
-
-                candles = self.angel.get_candle_data(
-                    token_info["symboltoken"], instrument.option_exchange.value, "ONE_MINUTE",
-                    f"{date_str} 09:15", f"{date_str} 15:30",
-                )
-                time_mod.sleep(0.4)  # Rate limit
-
-                if not candles:
-                    continue
-
-                df = self.angel.candles_to_dataframe(candles)
-
-                async with self._session_factory() as session:
-                    saved = await self._save_candles(
-                        session, instrument.symbol, expiry_str,
-                        strike, opt_type, symbol, date_str, df,
+                    candles = self.angel.get_candle_data(
+                        token_info["symboltoken"], instrument.option_exchange.value, "ONE_MINUTE",
+                        f"{date_str} 09:15", f"{date_str} 15:30",
                     )
-                    stats["contracts"] += 1
-                    stats["candles"] += saved
+                    time_mod.sleep(0.4)  # Rate limit
+
+                    if not candles:
+                        continue
+
+                    df = self.angel.candles_to_dataframe(candles)
+
+                    async with self._session_factory() as session:
+                        saved = await self._save_candles(
+                            session, instrument.symbol, current_expiry,
+                            strike, opt_type, symbol, date_str, df,
+                        )
+                        stats["contracts"] += 1
+                        stats["candles"] += saved
 
         logger.info(
             "[%s] %s — Done: %d contracts, %d candles saved, %d skipped (cached)",
@@ -266,7 +294,7 @@ class OptionDataCollector:
         )
         return stats
 
-    async def collect_today(self) -> list[dict]:
+    async def collect_today(self, num_expiries: int = DEFAULT_NUM_EXPIRIES, strike_buffer: int = STRIKE_BUFFER) -> list[dict]:
         """Collect today's option candles for all enabled instruments."""
         self._authenticate()
         await self.init()
@@ -277,30 +305,39 @@ class OptionDataCollector:
 
         results = []
         for instrument in get_enabled_instruments():
-            stats = await self.collect_date(instrument, today)
+            stats = await self.collect_date(
+                instrument, today,
+                num_expiries=num_expiries, strike_buffer=strike_buffer,
+            )
             results.append(stats)
         return results
 
-    async def collect_bulk(self, days: int = 60) -> list[dict]:
+    async def collect_bulk(self, days: int = 60, num_expiries: int = DEFAULT_NUM_EXPIRIES, strike_buffer: int = STRIKE_BUFFER) -> list[dict]:
         """Bulk download historical option candles for the last N days."""
         self._authenticate()
         await self.init()
         end = datetime.now(_IST).date()
         start = end - timedelta(days=days)
-        return await self.collect_range(start, end)
+        return await self.collect_range(start, end, num_expiries=num_expiries, strike_buffer=strike_buffer)
 
-    async def collect_range(self, start: date, end: date) -> list[dict]:
+    async def collect_range(self, start: date, end: date, num_expiries: int = DEFAULT_NUM_EXPIRIES, strike_buffer: int = STRIKE_BUFFER) -> list[dict]:
         """Collect option candles for a date range."""
         self._authenticate()
         await self.init()
         trading_dates = self._get_trading_dates(start, end)
-        logger.info("Collecting option data for %d trading days: %s to %s", len(trading_dates), start, end)
+        logger.info(
+            "Collecting option data for %d trading days: %s to %s | num_expiries=%d strike_buffer=%d",
+            len(trading_dates), start, end, num_expiries, strike_buffer,
+        )
 
         results = []
         for instrument in get_enabled_instruments():
             for dt in trading_dates:
                 try:
-                    stats = await self.collect_date(instrument, dt)
+                    stats = await self.collect_date(
+                        instrument, dt,
+                        num_expiries=num_expiries, strike_buffer=strike_buffer,
+                    )
                     results.append(stats)
                 except Exception as e:
                     logger.error("[%s] %s — Error: %s", instrument.symbol, dt, e)
@@ -372,6 +409,10 @@ async def main():
     parser.add_argument("--from", dest="from_date", type=str, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--to", dest="to_date", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--stats", action="store_true", help="Show stats of cached data")
+    parser.add_argument("--num-expiries", dest="num_expiries", type=int, default=DEFAULT_NUM_EXPIRIES,
+                        help=f"How many upcoming weekly expiries to collect per day (default: {DEFAULT_NUM_EXPIRIES})")
+    parser.add_argument("--strike-buffer", dest="strike_buffer", type=int, default=STRIKE_BUFFER,
+                        help=f"Extra strikes beyond day high/low ATM on each side (default: {STRIKE_BUFFER})")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -397,19 +438,19 @@ async def main():
                     )
 
         elif args.today:
-            results = await collector.collect_today()
+            results = await collector.collect_today(num_expiries=args.num_expiries, strike_buffer=args.strike_buffer)
             total_candles = sum(r.get("candles", 0) for r in results)
             print(f"\nToday: {total_candles:,} candles saved")
 
         elif args.from_date and args.to_date:
             start = datetime.strptime(args.from_date, "%Y-%m-%d").date()
             end = datetime.strptime(args.to_date, "%Y-%m-%d").date()
-            results = await collector.collect_range(start, end)
+            results = await collector.collect_range(start, end, num_expiries=args.num_expiries, strike_buffer=args.strike_buffer)
             total_candles = sum(r.get("candles", 0) for r in results)
             print(f"\n{args.from_date} to {args.to_date}: {total_candles:,} candles saved")
 
         elif args.bulk:
-            results = await collector.collect_bulk(days=args.days)
+            results = await collector.collect_bulk(days=args.days, num_expiries=args.num_expiries, strike_buffer=args.strike_buffer)
             total_candles = sum(r.get("candles", 0) for r in results)
             print(f"\nBulk ({args.days} days): {total_candles:,} candles saved")
 
