@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     ai_gpt_scanner_enabled: bool = Field(default=False, alias="AI_GPT_SCANNER_ENABLED")
     ai_gpt_scanner_model: str = Field(default="gpt-5", alias="AI_GPT_SCANNER_MODEL")
 
+    # NR5 Breakout Scanner (volatility contraction → expansion, paper-only)
+    # Backtest: N=23 trades, WR=43.5%, PF=3.21 over 131 days. Bidirectional.
+    # Honoured 3-way mutex with Config-P / Move-Det.
+    nr5_scanner_enabled: bool = Field(default=True, alias="NR5_SCANNER_ENABLED")
+
     # DhanHQ (expired options data only)
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
 
