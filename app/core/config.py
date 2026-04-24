@@ -24,7 +24,9 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-4", alias="OPENAI_MODEL")
 
     # AI-GPT Scanner (3rd independent scanner — 5-min AI decision pipeline)
-    ai_gpt_scanner_enabled: bool = Field(default=True, alias="AI_GPT_SCANNER_ENABLED")
+    # Disabled by default (OpenAI billing/quota burn). Set
+    # AI_GPT_SCANNER_ENABLED=true in the env to re-enable.
+    ai_gpt_scanner_enabled: bool = Field(default=False, alias="AI_GPT_SCANNER_ENABLED")
     ai_gpt_scanner_model: str = Field(default="gpt-5", alias="AI_GPT_SCANNER_MODEL")
 
     # DhanHQ (expired options data only)
