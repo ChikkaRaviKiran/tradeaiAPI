@@ -295,6 +295,7 @@ async def get_system_status():
         config_p = getattr(orch, "config_p_scanner", None)
         move_det = getattr(orch, "move_detection_scanner", None)
         ai_gpt = getattr(orch, "ai_gpt_scanner", None)
+        nr5 = getattr(orch, "nr5_scanner", None)
         if config_p:
             cp_trade = config_p._active_trade
             scanner_info["config_p"] = {
@@ -324,6 +325,37 @@ async def get_system_status():
                 "last_decision": getattr(ai_gpt, "_last_decision", None),
                 "last_decision_detail": getattr(ai_gpt, "_last_decision_detail", None),
                 "model": settings.ai_gpt_scanner_model if ai_gpt.pipeline is not None else None,
+            }
+        if nr5:
+            n_trade = nr5._active_trade
+            scanner_info["nr5"] = {
+                "active": settings.nr5_scanner_enabled,
+                "setup_checked": nr5._setup_checked,
+                "is_nr5_day": nr5._is_nr5_day,
+                "gap_skip": nr5._gap_skip,
+                "signal_found": nr5._signal_found_today,
+                "in_trade": n_trade is not None and not n_trade.exited if n_trade else False,
+                "prev_high": nr5._prev_high,
+                "prev_low": nr5._prev_low,
+                "prev_range": nr5._prev_range,
+                "gap_pct": nr5._gap_pct,
+                "trade": (
+                    {
+                        "side": n_trade.side,
+                        "entry_time": n_trade.entry_time,
+                        "entry_spot": n_trade.entry_spot,
+                        "stop_level": n_trade.stop_level,
+                        "target_level": n_trade.target_level,
+                        "option_symbol": n_trade.option_symbol,
+                        "option_entry_price": n_trade.option_entry_price,
+                        "exited": n_trade.exited,
+                        "exit_time": n_trade.exit_time,
+                        "exit_spot": n_trade.exit_spot,
+                        "exit_reason": n_trade.exit_reason,
+                        "option_exit_price": n_trade.option_exit_price,
+                    }
+                    if n_trade else None
+                ),
             }
 
     return {
