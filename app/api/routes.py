@@ -297,6 +297,7 @@ async def get_system_status():
         ai_gpt = getattr(orch, "ai_gpt_scanner", None)
         nr5 = getattr(orch, "nr5_scanner", None)
         pdh_pdl = getattr(orch, "pdh_pdl_scanner", None)
+        vacuum = getattr(orch, "vacuum_scanner", None)
         if config_p:
             cp_trade = config_p._active_trade
             scanner_info["config_p"] = {
@@ -384,6 +385,38 @@ async def get_system_status():
                         "option_exit_price": p_trade.option_exit_price,
                     }
                     if p_trade else None
+                ),
+            }
+        if vacuum:
+            v_trade = vacuum._active_trade
+            scanner_info["vacuum"] = {
+                "active": settings.vacuum_scanner_enabled,
+                "setup_checked": vacuum._setup_checked,
+                "is_tradeable_day": vacuum._is_tradeable_day,
+                "signal_found": vacuum._signal_found_today,
+                "in_trade": v_trade is not None and not v_trade.exited if v_trade else False,
+                "coil_high": vacuum._coil_high,
+                "coil_low": vacuum._coil_low,
+                "coil_range": vacuum._coil_range,
+                "avg_range": vacuum._avg_range,
+                "trade": (
+                    {
+                        "side": v_trade.side,
+                        "entry_time": v_trade.entry_time,
+                        "entry_spot": v_trade.entry_spot,
+                        "coil_high": v_trade.coil_high,
+                        "coil_low": v_trade.coil_low,
+                        "option_symbol": v_trade.option_symbol,
+                        "option_entry_price": v_trade.option_entry_price,
+                        "option_sl_price": v_trade.option_sl_price,
+                        "option_target_price": v_trade.option_target_price,
+                        "exited": v_trade.exited,
+                        "exit_time": v_trade.exit_time,
+                        "exit_spot": v_trade.exit_spot,
+                        "exit_reason": v_trade.exit_reason,
+                        "option_exit_price": v_trade.option_exit_price,
+                    }
+                    if v_trade else None
                 ),
             }
 

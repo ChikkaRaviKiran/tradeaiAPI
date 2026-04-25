@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # over 131 days. Stop=15 pts, Target=60 pts (R:R 1:4). Mutex w/ peers.
     pdh_pdl_scanner_enabled: bool = Field(default=True, alias="PDH_PDL_SCANNER_ENABLED")
 
+    # 14:30 Liquidity-Vacuum Scanner (afternoon coil break, paper-only)
+    # Backtest: N=18 trades, Opt WR 66.7%, Opt PF 5.80, +178 pts/lot over
+    # 131 days. Coil < 60% avg | Premium SL -25% TGT +40% | Time exit 14:55.
+    vacuum_scanner_enabled: bool = Field(default=True, alias="VACUUM_SCANNER_ENABLED")
+
     # DhanHQ (expired options data only)
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
 

@@ -74,6 +74,7 @@ from app.engine.move_detection_scanner import MoveDetectionScanner
 from app.engine.ai_gpt_scanner import AIGPTScanner
 from app.engine.nr5_breakout_scanner import NR5BreakoutScanner
 from app.engine.pdh_pdl_scanner import PDHPDLBreakoutScanner
+from app.engine.vacuum_1430_scanner import VacuumBreakoutScanner
 from app.ai.ai_gpt_pipeline import AIGPTPipeline
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
@@ -311,6 +312,14 @@ class Orchestrator:
         if not settings.pdh_pdl_scanner_enabled:
             logger.info("[PDHPDL] Scanner disabled via config (PDH_PDL_SCANNER_ENABLED=false)")
 
+        # ── 14:30 Liquidity-Vacuum Scanner (afternoon coil break, PAPER-ONLY) ──
+        self.vacuum_scanner = VacuumBreakoutScanner(
+            client=self.client,
+            alert_manager=self.alert_manager,
+        )
+        if not settings.vacuum_scanner_enabled:
+            logger.info("[VACUUM] Scanner disabled via config (VACUUM_SCANNER_ENABLED=false)")
+
         # Strategy selector — picks best strategies based on condition-performance data
         from app.engine.strategy_selector import StrategySelector
         self.strategy_selector = StrategySelector()
@@ -507,6 +516,8 @@ class Orchestrator:
         self.nr5_scanner.reset_daily()
         # Reset PDH/PDL scanner daily state
         self.pdh_pdl_scanner.reset_daily()
+        # Reset 14:30 Vacuum scanner daily state
+        self.vacuum_scanner.reset_daily()
         self.running = False
         logger.info("Daily state reset complete")
 
@@ -588,6 +599,7 @@ class Orchestrator:
         self.ai_gpt_scanner.reset_daily()
         self.nr5_scanner.reset_daily()
         self.pdh_pdl_scanner.reset_daily()
+        self.vacuum_scanner.reset_daily()
 
         self.running = True
 
@@ -659,7 +671,8 @@ class Orchestrator:
                 self.ai_gpt_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.nr5_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.pdh_pdl_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                logger.info("[ConfigP+MoveDet+AIGPT+NR5+PDHPDL] Expiry set: %s", nifty_expiry)
+                self.vacuum_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
+                logger.info("[ConfigP+MoveDet+AIGPT+NR5+PDHPDL+VACUUM] Expiry set: %s", nifty_expiry)
         except Exception:
             logger.exception("Failed to determine expiries — options data may be unavailable")
             self._log_event("setup", "Expiry discovery FAILED — continuing without options")
@@ -1460,23 +1473,29 @@ class Orchestrator:
                 md_in_trade = self.move_detection_scanner.is_in_trade()
                 nr5_in_trade = self.nr5_scanner.is_in_trade()
                 pdh_in_trade = self.pdh_pdl_scanner.is_in_trade()
+                vac_in_trade = self.vacuum_scanner.is_in_trade()
                 await self.config_p_scanner.run_cycle(
                     df_today, instrument, cycle,
-                    peer_in_trade=(md_in_trade or nr5_in_trade or pdh_in_trade),
+                    peer_in_trade=(md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade),
                 )
                 await self.move_detection_scanner.run_cycle(
                     df_today, instrument, cycle,
-                    peer_in_trade=(cp_in_trade or nr5_in_trade or pdh_in_trade),
+                    peer_in_trade=(cp_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade),
                 )
                 if settings.nr5_scanner_enabled:
                     await self.nr5_scanner.run_cycle(
                         df_today, instrument, cycle,
-                        peer_in_trade=(cp_in_trade or md_in_trade or pdh_in_trade),
+                        peer_in_trade=(cp_in_trade or md_in_trade or pdh_in_trade or vac_in_trade),
                     )
                 if settings.pdh_pdl_scanner_enabled:
                     await self.pdh_pdl_scanner.run_cycle(
                         df_today, instrument, cycle,
-                        peer_in_trade=(cp_in_trade or md_in_trade or nr5_in_trade),
+                        peer_in_trade=(cp_in_trade or md_in_trade or nr5_in_trade or vac_in_trade),
+                    )
+                if settings.vacuum_scanner_enabled:
+                    await self.vacuum_scanner.run_cycle(
+                        df_today, instrument, cycle,
+                        peer_in_trade=(cp_in_trade or md_in_trade or nr5_in_trade or pdh_in_trade),
                     )
                 await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
             return
