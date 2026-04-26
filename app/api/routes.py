@@ -244,6 +244,94 @@ async def get_alerts(limit: int = 50, target_date: str | None = None):
     return filtered
 
 
+@app.get("/api/signals")
+async def get_signals(limit: int = 200, target_date: str | None = None):
+    """Get signal history for a date from DB.
+
+    Combines:
+    - `signals` table (strategy/AI decision records)
+    - `alert_records` rows where alert_type='signal' (scanner + live alert signals)
+    """
+    from sqlalchemy import select, desc
+    from app.db.models import AsyncSessionLocal, SignalRecord, AlertRecord
+
+    if limit < 1 or limit > 1000:
+        limit = 200
+
+    filter_date = target_date or datetime.now(_IST).strftime("%Y-%m-%d")
+
+    items: list[dict] = []
+    async with AsyncSessionLocal() as session:
+        # Strategy signal audit rows
+        stmt_signals = (
+            select(SignalRecord)
+            .where(SignalRecord.date == filter_date)
+            .order_by(desc(SignalRecord.time), desc(SignalRecord.id))
+            .limit(limit)
+        )
+        rows_signals = (await session.execute(stmt_signals)).scalars().all()
+        for s in rows_signals:
+            ts = f"{s.date}T{s.time}" if s.date and s.time else None
+            items.append({
+                "source": "signals_table",
+                "id": f"sig-{s.id}",
+                "date": s.date,
+                "time": s.time,
+                "timestamp": ts,
+                "instrument": s.instrument,
+                "strategy": s.strategy,
+                "option_type": s.option_type,
+                "score": s.score,
+                "confidence": s.confidence,
+                "strike_price": s.strike_price,
+                "entry_price": s.entry_price,
+                "ai_decision": s.ai_decision,
+                "ai_confidence": s.ai_confidence,
+                "reason": s.reason,
+                "title": None,
+                "message": None,
+            })
+
+        # Scanner/live signal alerts (includes scanner-only signals not written to SignalRecord)
+        stmt_alert_signals = (
+            select(AlertRecord)
+            .where(AlertRecord.date == filter_date)
+            .where(AlertRecord.alert_type == "signal")
+            .order_by(desc(AlertRecord.created_at), desc(AlertRecord.id))
+            .limit(limit)
+        )
+        rows_alert_signals = (await session.execute(stmt_alert_signals)).scalars().all()
+        for a in rows_alert_signals:
+            ts = a.created_at.isoformat() if a.created_at else None
+            t = a.created_at.strftime("%H:%M:%S") if a.created_at else ""
+            items.append({
+                "source": "alert_records",
+                "id": f"alr-{a.id}",
+                "date": a.date,
+                "time": t,
+                "timestamp": ts,
+                "instrument": None,
+                "strategy": a.strategy,
+                "option_type": None,
+                "score": None,
+                "confidence": None,
+                "strike_price": None,
+                "entry_price": None,
+                "ai_decision": None,
+                "ai_confidence": None,
+                "reason": None,
+                "title": a.title,
+                "message": a.message,
+            })
+
+    # Sort merged set by timestamp descending and cap to limit
+    def _sort_key(x: dict):
+        return x.get("timestamp") or f"{x.get('date', '')}T{x.get('time', '')}"
+
+    items.sort(key=_sort_key, reverse=True)
+    return items[:limit]
+
+
 # ── System Control ───────────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -711,12 +799,15 @@ async def get_full_day_data(target_date: str):
                 for a in mem_alerts
             ]
 
+    signals = await get_signals(limit=500, target_date=target_date)
+
     return {
         "date": target_date,
         "summary": summary,
         "snapshots": snapshots,
         "trades": [t.model_dump() for t in trades],
         "alerts": alerts,
+        "signals": signals,
         "performance": perf.model_dump(),
     }
 
