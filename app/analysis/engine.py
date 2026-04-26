@@ -41,6 +41,7 @@ from app.strategies.trend_pullback import TrendPullbackStrategy
 from app.strategies.liquidity_sweep import LiquiditySweepStrategy
 from app.strategies.momentum_breakout import MomentumBreakoutStrategy
 from app.strategies.range_breakout import RangeBreakoutStrategy
+from app.strategies.range_breakout import SL_PCT as RB_SL_PCT, MIN_ENTRY_PREMIUM as RB_MIN_ENTRY_PREMIUM
 from app.strategies.ema_breakout import EMABreakoutStrategy
 from app.strategies.rsi_extreme import RSIExtremeStrategy
 from app.strategies.momentum_option_buying import MomentumOptionBuyingStrategy
@@ -249,8 +250,14 @@ class StrategyTester:
         if entry_price <= 0:
             return None
 
-        # Uniform exit: 20% SL (1R), T1 at +1R, T2 at +2R
-        one_r = entry_price * 0.20
+        # Strategy-specific entry filter: skip if option premium below minimum
+        if strat_name == "RANGE_BREAKOUT" and RB_MIN_ENTRY_PREMIUM > 0 and entry_price < RB_MIN_ENTRY_PREMIUM:
+            return None
+
+        # Uniform exit: SL (1R), T1 at +1R, T2 at +2R
+        # RANGE_BREAKOUT uses RB_SL_PCT (env-driven); all others use 20%
+        sl_pct = RB_SL_PCT if strat_name == "RANGE_BREAKOUT" else 0.20
+        one_r = entry_price * sl_pct
         sl = max(entry_price - one_r, 1.0)
         t1 = entry_price + one_r
         t2 = entry_price + 2.0 * one_r

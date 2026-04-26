@@ -28,6 +28,7 @@ PUT:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import time as dtime
 from typing import Optional
 
@@ -38,9 +39,28 @@ from app.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-WINDOW_START = dtime(9, 45)
-WINDOW_END = dtime(15, 0)
-LOOKBACK = 20
+
+def _env_time(name: str, default: dtime) -> dtime:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        h, m = raw.split(":", 1)
+        return dtime(int(h), int(m))
+    except Exception:
+        return default
+
+
+WINDOW_START = _env_time("MB_WINDOW_START", dtime(9, 45))
+WINDOW_END = _env_time("MB_WINDOW_END", dtime(15, 0))
+LOOKBACK = int(os.getenv("MB_LOOKBACK", "20"))
+MIN_BODY_RATIO = float(os.getenv("MB_MIN_BODY_RATIO", "0.5"))
+MIN_VOL_RATIO = float(os.getenv("MB_MIN_VOL_RATIO", "1.5"))
+MIN_RSI_CALL = float(os.getenv("MB_MIN_RSI_CALL", "60"))
+MAX_RSI_PUT = float(os.getenv("MB_MAX_RSI_PUT", "40"))
+MIN_ADX = float(os.getenv("MB_MIN_ADX", "25"))
+MIN_BREAKOUT_PCT = float(os.getenv("MB_MIN_BREAKOUT_PCT", "0"))
+ALLOW_ADX_RISING = os.getenv("MB_ALLOW_ADX_RISING", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 class MomentumBreakoutStrategy(BaseStrategy):
@@ -89,7 +109,7 @@ class MomentumBreakoutStrategy(BaseStrategy):
         # Candle body strength check
         candle_range = high - low
         body = abs(close - open_)
-        if candle_range <= 0 or (body / candle_range) < 0.5:
+        if candle_range <= 0 or (body / candle_range) < MIN_BODY_RATIO:
             return None
 
         # Lookback window for high/low (excluding current candle)
@@ -109,12 +129,12 @@ class MomentumBreakoutStrategy(BaseStrategy):
         # CALL: breakout above 20-candle high with momentum
         # O'Neil: volume ≥ 50% above avg; Wilder: ADX > 25 = trending
         if (
-            close > lookback_high
+            close > lookback_high * (1 + MIN_BREAKOUT_PCT / 100)
             and close > open_  # bullish candle (Nison)
-            and (is_index or volume >= 1.5 * avg_vol)  # O'Neil minimum
-            and rsi > 60  # Wilder: above centerline + momentum
+            and (is_index or volume >= MIN_VOL_RATIO * avg_vol)  # O'Neil minimum
+            and rsi > MIN_RSI_CALL  # Wilder: above centerline + momentum
             and ema9 > ema20  # Elder: short-term trend aligned
-            and (adx > 25 or adx_rising)  # Wilder: ADX > 25 = trending
+            and (adx > MIN_ADX or (ALLOW_ADX_RISING and adx_rising))  # Wilder: ADX > 25 = trending
         ):
             return StrategySignal(
                 strategy=StrategyName.MOMENTUM_BREAKOUT,
@@ -130,12 +150,12 @@ class MomentumBreakoutStrategy(BaseStrategy):
 
         # PUT: breakdown below 20-candle low with momentum
         if (
-            close < lookback_low
+            close < lookback_low * (1 - MIN_BREAKOUT_PCT / 100)
             and close < open_  # bearish candle (Nison)
-            and (is_index or volume >= 1.5 * avg_vol)  # O'Neil minimum
-            and rsi < 40  # Wilder: below centerline − momentum
+            and (is_index or volume >= MIN_VOL_RATIO * avg_vol)  # O'Neil minimum
+            and rsi < MAX_RSI_PUT  # Wilder: below centerline − momentum
             and ema9 < ema20  # Elder: short-term trend aligned
-            and (adx > 25 or adx_rising)  # Wilder: ADX > 25 = trending
+            and (adx > MIN_ADX or (ALLOW_ADX_RISING and adx_rising))  # Wilder: ADX > 25 = trending
         ):
             return StrategySignal(
                 strategy=StrategyName.MOMENTUM_BREAKOUT,

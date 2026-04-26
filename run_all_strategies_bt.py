@@ -21,6 +21,18 @@ from app.engine.feature_engine import FeatureEngine
 
 DB_DSN = None  # Use explicit params below (password has @)
 
+PG_HOST = os.getenv("PGHOST", "localhost")
+PG_PORT = int(os.getenv("PGPORT", "5432"))
+PG_USER = os.getenv("PGUSER", "tradeai")
+PG_PASSWORD = os.getenv("PGPASSWORD", "TradeAI@6724")
+PG_DATABASE = os.getenv("PGDATABASE", "tradeai")
+
+# Optional runtime filters
+# INSTRUMENTS: comma list, e.g. "NIFTY" or "NIFTY,SENSEX"
+# STRATEGIES: comma list, e.g. "MOMENTUM_BREAKOUT,ORB"
+INSTRUMENTS_FILTER = [s.strip().upper() for s in os.getenv("INSTRUMENTS", "").split(",") if s.strip()]
+STRATEGIES_FILTER = [s.strip().upper() for s in os.getenv("STRATEGIES", "").split(",") if s.strip()]
+
 # 6-month window (Oct 2025 - Mar 2026)
 START_DATE = date(2025, 10, 1)
 END_DATE = date(2026, 3, 31)
@@ -95,14 +107,22 @@ async def load_option_candles(conn, instrument, start, end):
 async def run():
     print(f"Connecting to DB...")
     conn = await asyncpg.connect(
-        user="tradeai", password="TradeAI@6724",
-        host="localhost", port=5432, database="tradeai",
+        user=PG_USER,
+        password=PG_PASSWORD,
+        host=PG_HOST,
+        port=PG_PORT,
+        database=PG_DATABASE,
     )
 
-    for instrument, strike_int, lot_size in [
+    configured_instruments = [
         ("NIFTY", NIFTY_STRIKE_INTERVAL, NIFTY_LOT_SIZE),
         ("SENSEX", SENSEX_STRIKE_INTERVAL, SENSEX_LOT_SIZE),
-    ]:
+    ]
+
+    if INSTRUMENTS_FILTER:
+        configured_instruments = [cfg for cfg in configured_instruments if cfg[0] in INSTRUMENTS_FILTER]
+
+    for instrument, strike_int, lot_size in configured_instruments:
         print(f"\n{'='*80}")
         print(f"  INSTRUMENT: {instrument} | {START_DATE} to {END_DATE}")
         print(f"{'='*80}")
@@ -122,6 +142,8 @@ async def run():
         # Test each strategy individually
         fe = FeatureEngine()
         strategy_names = list(STRATEGIES.keys())
+        if STRATEGIES_FILTER:
+            strategy_names = [s for s in strategy_names if s in STRATEGIES_FILTER]
 
         # Collect all trades across strategies
         all_trades = []

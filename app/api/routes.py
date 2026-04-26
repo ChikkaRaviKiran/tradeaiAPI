@@ -298,6 +298,7 @@ async def get_system_status():
         nr5 = getattr(orch, "nr5_scanner", None)
         pdh_pdl = getattr(orch, "pdh_pdl_scanner", None)
         vacuum = getattr(orch, "vacuum_scanner", None)
+        rb = getattr(orch, "range_breakout_scanner", None)
         if config_p:
             cp_trade = config_p._active_trade
             scanner_info["config_p"] = {
@@ -419,11 +420,42 @@ async def get_system_status():
                     if v_trade else None
                 ),
             }
+        if rb:
+            rb_trade = rb._active_trade
+            scanner_info["range_breakout"] = {
+                "active": settings.range_breakout_scanner_enabled,
+                "signal_found": rb._signal_found_today,
+                "in_trade": rb_trade is not None and not rb_trade.exited if rb_trade else False,
+                "trade": (
+                    {
+                        "side": rb_trade.side,
+                        "entry_time": rb_trade.entry_time,
+                        "entry_spot": rb_trade.entry_spot,
+                        "range_high": rb_trade.range_high,
+                        "range_low": rb_trade.range_low,
+                        "adx": rb_trade.adx,
+                        "rsi": rb_trade.rsi,
+                        "option_symbol": rb_trade.option_symbol,
+                        "option_entry_price": rb_trade.option_entry_price,
+                        "option_sl_price": rb_trade.option_sl_price,
+                        "option_t1_price": rb_trade.option_t1_price,
+                        "option_t2_price": rb_trade.option_t2_price,
+                        "t1_hit": rb_trade.t1_hit,
+                        "exited": rb_trade.exited,
+                        "exit_time": rb_trade.exit_time,
+                        "exit_spot": rb_trade.exit_spot,
+                        "exit_reason": rb_trade.exit_reason,
+                        "option_exit_price": rb_trade.option_exit_price,
+                    }
+                    if rb_trade else None
+                ),
+            }
 
     return {
         "status": "running" if orch and getattr(orch, "running", False) else "stopped",
         "paper_trading": settings.paper_trading,
         "capital": settings.initial_capital,
+        "scanners_allow_concurrent": settings.scanners_allow_concurrent,
         "max_trades_per_day": settings.max_trades_per_day,
         "auto_select": settings.auto_select_instruments,
         "active_instruments": (

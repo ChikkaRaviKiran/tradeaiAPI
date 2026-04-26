@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     # 131 days. Coil < 60% avg | Premium SL -25% TGT +40% | Time exit 14:55.
     vacuum_scanner_enabled: bool = Field(default=True, alias="VACUUM_SCANNER_ENABLED")
 
+    # Range Breakout Scanner (09:45-10:30 consolidation → breakout, paper-only)
+    # Backtest (Option C): N=41 trades, WR=68.3%, PF=3.52, Max DD ₹9,823/lot
+    # ADX<20 | RSI 58/42 | Body≥0.45 | MinPremium≥80 | SL=15% | T1=+15% | T2=+30%
+    range_breakout_scanner_enabled: bool = Field(default=True, alias="RANGE_BREAKOUT_SCANNER_ENABLED")
+
+    # Scanner concurrency control
+    # True: all scanners can open/manage trades independently (no peer mutex)
+    # False: legacy mutex mode (only one scanner trade at a time)
+    scanners_allow_concurrent: bool = Field(default=True, alias="SCANNERS_ALLOW_CONCURRENT")
+
     # DhanHQ (expired options data only)
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
 
