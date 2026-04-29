@@ -210,6 +210,10 @@ class MoveDetectionScanner:
         if self._signal_found_today:
             return
 
+        # ── Skip expiry day — avoid trading on weekly options expiry ─────
+        if self._expiry_date and now.date() == self._expiry_date:
+            return
+
         # ── Weekly filter: only 1 trade per ISO week ─────────────────
         current_week = now.isocalendar()[1]
         if self._last_trade_week == current_week:
