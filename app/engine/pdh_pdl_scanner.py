@@ -34,10 +34,13 @@ import pytz
 from sqlalchemy import select
 
 from app.alerts.alert_manager import AlertManager
+from app.core.config import settings
 from app.core.instruments import InstrumentConfig
 from app.core.models import AlertItem
 from app.data.angelone_client import AngelOneClient
 from app.db.models import AsyncSessionLocal, IndexCandle
+from app.engine import scanner_exec_settings as exec_settings
+from app.engine.lot_sizer import compute_buy_option_lots
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -89,6 +92,14 @@ class PDHPDLTrade:
         self.option_symbol = option_symbol
         self.option_entry_price = option_entry_price
         self.strike_price = strike_price
+        # Execution metadata
+        self.lots: int = 0
+        self.lot_size: int = 0
+        self.symboltoken: str = ""
+        self.exchange: str = "NFO"
+        self.live_executed: bool = False
+        self.entry_order_id: str = ""
+        self.exit_order_id: str = ""
         # Exit tracking
         self.exited = False
         self.exit_time: str = ""
@@ -116,9 +127,11 @@ class PDHPDLBreakoutScanner:
         self,
         client: AngelOneClient,
         alert_manager: AlertManager,
+        broker: Optional[object] = None,
     ):
         self.client = client
         self.alert_manager = alert_manager
+        self.broker = broker
 
         # Daily state
         self._today_str: str = ""
@@ -272,6 +285,68 @@ class PDHPDLBreakoutScanner:
         )
         self._signal_found_today = True
 
+        # ── DYNAMIC LOT SIZING + LIVE ORDER ──────────────────────────
+        token_info = self.client._search_symbol(option_symbol) if option_symbol else None
+        symboltoken = (token_info or {}).get("token", "")
+        exchange = (token_info or {}).get("exch_seg", "NFO")
+        self._active_trade.symboltoken = symboltoken
+        self._active_trade.exchange = exchange
+        self._active_trade.lot_size = int(instrument.lot_size)
+
+        exec_summary = ""
+        order_status = "OBSERVE ONLY — paper trade, no execution"
+        if self.broker is not None and option_ltp > 0:
+            cfg = exec_settings.load("pdh_pdl")
+            if cfg.get("lots_mode") == "manual":
+                lots = max(0, min(int(cfg.get("manual_lots", 1)), int(cfg.get("max_lots", 20))))
+                cost_per_lot = option_ltp * int(instrument.lot_size)
+                sizing = {
+                    "available": 0.0,
+                    "max_funds_cap": cfg.get("max_funds", 0),
+                    "cost_per_lot": round(cost_per_lot, 2),
+                    "deployed_capital": round(lots * cost_per_lot, 2),
+                    "mode": "manual",
+                }
+            else:
+                lots, sizing = compute_buy_option_lots(
+                    self.broker,
+                    premium=option_ltp,
+                    lot_size=int(instrument.lot_size),
+                    max_funds_cap=cfg.get("max_funds", 0),
+                    buffer_pct=cfg.get("buffer_pct", 5.0),
+                    max_lots_cap=cfg.get("max_lots", 20),
+                    min_lots=1,
+                )
+                sizing["mode"] = "auto"
+            self._active_trade.lots = lots
+            exec_summary = (
+                f"\n💰 SIZING ({sizing.get('mode', 'auto')})\n"
+                f"  Available: ₹{sizing.get('available', 0):,.0f}"
+                f" | Cap: ₹{sizing.get('max_funds_cap', 0):,.0f}\n"
+                f"  Cost/lot: ₹{sizing.get('cost_per_lot', 0):,.0f}"
+                f" | Lots: {lots}"
+                f" | Capital: ₹{sizing.get('deployed_capital', 0):,.0f}"
+            )
+            if lots == 0:
+                exec_summary += f"\n  ⚠️ {sizing.get('reason', 'no_lots')}"
+
+            live_exec = (
+                bool(cfg.get("live_execution"))
+                and not settings.paper_trading
+                and option_ltp > 0
+                and bool(symboltoken)
+                and lots > 0
+            )
+            if live_exec:
+                ok, oid = await self._place_entry_order(self._active_trade)
+                self._active_trade.entry_order_id = oid
+                self._active_trade.live_executed = bool(ok)
+                order_status = (
+                    f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
+                )
+            elif bool(cfg.get("live_execution")) and not settings.paper_trading and lots == 0:
+                order_status = "LIVE skipped — insufficient funds for 1 lot"
+
         expiry_display = self._expiry or "N/A"
         days_to_expiry = (
             (self._expiry_date - now.date()).days if self._expiry_date else "?"
@@ -306,8 +381,9 @@ class PDHPDLBreakoutScanner:
             f"  1. Spot stop: {stop_level:.2f}\n"
             f"  2. Spot target: {target_level:.2f}\n"
             f"  3. EOD: 15:20 force close\n"
+            f"{exec_summary}\n"
             f"\n"
-            f"⚠️ OBSERVE ONLY — paper trade, no execution"
+            f"⚠️ {order_status}"
         )
         await self.alert_manager.telegram.send(msg)
         logger.info(
@@ -424,6 +500,13 @@ class PDHPDLBreakoutScanner:
         trade.exit_spot = exit_spot
         trade.exit_reason = exit_reason
 
+        # ── LIVE EXIT ORDER ──────────────────────────────────────────
+        if trade.live_executed and trade.lots > 0 and trade.symboltoken:
+            ok, oid = await self._place_exit_order(trade, reason=exit_reason)
+            trade.exit_order_id = oid
+            if not ok:
+                logger.error("[PDHPDL] Exit order failed for %s reason=%s", trade.option_symbol, exit_reason)
+
         spot_pnl = (exit_spot - trade.entry_spot) if trade.side == "CE" else (trade.entry_spot - exit_spot)
         is_win = spot_pnl > 0
 
@@ -491,6 +574,9 @@ class PDHPDLBreakoutScanner:
             now = datetime.now(IST)
             await self._check_exit(df_today, instrument, now)
             if self._active_trade and not self._active_trade.exited:
+                if self._active_trade.live_executed and self._active_trade.lots > 0 and self._active_trade.symboltoken:
+                    ok, oid = await self._place_exit_order(self._active_trade, reason="eod_force")
+                    self._active_trade.exit_order_id = oid
                 self._active_trade.exited = True
                 self._active_trade.exit_reason = "eod_force"
                 if df_today is not None and not df_today.empty:
@@ -501,6 +587,75 @@ class PDHPDLBreakoutScanner:
                     f"Exit spot: {self._active_trade.exit_spot:.2f}\n"
                     f"Reason: End of day"
                 )
+
+    # ── Live order helpers ──────────────────────────────────────────
+    async def _place_entry_order(self, trade: PDHPDLTrade) -> tuple[bool, str]:
+        qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
+        return await self._place_order(
+            side="BUY",
+            symbol=trade.option_symbol,
+            symboltoken=trade.symboltoken,
+            exchange=trade.exchange,
+            quantity=qty,
+            tag="pdhpdl_entry",
+        )
+
+    async def _place_exit_order(self, trade: PDHPDLTrade, reason: str) -> tuple[bool, str]:
+        qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
+        return await self._place_order(
+            side="SELL",
+            symbol=trade.option_symbol,
+            symboltoken=trade.symboltoken,
+            exchange=trade.exchange,
+            quantity=qty,
+            tag=f"pdhpdl_exit_{reason}",
+        )
+
+    async def _place_order(
+        self,
+        *,
+        side: str,
+        symbol: str,
+        symboltoken: str,
+        exchange: str,
+        quantity: int,
+        tag: str,
+    ) -> tuple[bool, str]:
+        if not symbol or not symboltoken or quantity <= 0:
+            return False, ""
+        try:
+            self.client.ensure_authenticated()
+            params = {
+                "variety": "NORMAL",
+                "tradingsymbol": symbol,
+                "symboltoken": symboltoken,
+                "transactiontype": side,
+                "exchange": exchange or "NFO",
+                "ordertype": "MARKET",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "quantity": str(quantity),
+                "price": "0",
+                "triggerprice": "0",
+            }
+            resp = await asyncio.to_thread(self.client._smart_api.placeOrder, params)
+            order_id = ""
+            if isinstance(resp, str):
+                order_id = resp.strip()
+            elif isinstance(resp, dict):
+                data = resp.get("data") or {}
+                if isinstance(data, dict):
+                    order_id = str(data.get("orderid") or data.get("orderId") or "").strip()
+                if not order_id:
+                    order_id = str(resp.get("orderid") or resp.get("orderId") or "").strip()
+            if not order_id:
+                logger.error("[PDHPDL] Order placement returned no id (%s %s tag=%s) resp=%s", side, symbol, tag, resp)
+                return False, ""
+            logger.info("[PDHPDL] %s order placed %s qty=%d id=%s tag=%s", side, symbol, quantity, order_id, tag)
+            return True, order_id
+        except Exception:
+            logger.exception("[PDHPDL] Order exception side=%s symbol=%s tag=%s", side, symbol, tag)
+            return False, ""
 
     # ── Helpers ─────────────────────────────────────────────────────
 

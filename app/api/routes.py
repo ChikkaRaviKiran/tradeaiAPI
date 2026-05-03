@@ -24,6 +24,7 @@ from app.db.models import init_db
 from app.trading.history_logger import HistoryLogger
 from app.trading.trade_logger import TradeLogger
 from app.engine.atl_settings import load_atl_settings, save_atl_settings
+from app.engine import scanner_exec_settings as scanner_exec_settings_mod
 
 logger = logging.getLogger(__name__)
 
@@ -765,6 +766,32 @@ async def get_atl_straddle_settings():
 async def update_atl_straddle_settings(body: dict):
     """Update and persist ATL Straddle settings from the settings page."""
     saved = save_atl_settings(body or {})
+    return {"success": True, "settings": saved}
+
+
+@app.get("/api/strategy-settings/move-det")
+async def get_move_det_exec_settings():
+    """Fetch MoveDet execution settings (lots mode, funds, max lots)."""
+    return scanner_exec_settings_mod.load("move_det")
+
+
+@app.put("/api/strategy-settings/move-det")
+async def update_move_det_exec_settings(body: dict):
+    """Update MoveDet execution settings."""
+    saved = scanner_exec_settings_mod.save("move_det", body or {})
+    return {"success": True, "settings": saved}
+
+
+@app.get("/api/strategy-settings/pdh-pdl")
+async def get_pdh_pdl_exec_settings():
+    """Fetch PDH/PDL execution settings (lots mode, funds, max lots)."""
+    return scanner_exec_settings_mod.load("pdh_pdl")
+
+
+@app.put("/api/strategy-settings/pdh-pdl")
+async def update_pdh_pdl_exec_settings(body: dict):
+    """Update PDH/PDL execution settings."""
+    saved = scanner_exec_settings_mod.save("pdh_pdl", body or {})
     return {"success": True, "settings": saved}
 
 

@@ -103,6 +103,13 @@ class Settings(BaseSettings):
     paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
     min_margin_required: float = Field(default=5000, alias="MIN_MARGIN_REQUIRED")
 
+    # Move Detection live execution + dynamic sizing
+    move_det_live_execution: bool = Field(default=False, alias="MOVE_DET_LIVE_EXECUTION")
+    move_det_max_funds: float = Field(default=150000.0, alias="MOVE_DET_MAX_FUNDS")  # ₹ allocation cap; 0 = use full available
+    move_det_funds_buffer_pct: float = Field(default=5.0, alias="MOVE_DET_FUNDS_BUFFER_PCT")  # safety margin %
+    move_det_max_lots: int = Field(default=20, alias="MOVE_DET_MAX_LOTS")  # hard cap
+    move_det_priority_over_atl: bool = Field(default=True, alias="MOVE_DET_PRIORITY_OVER_ATL")
+
     # Dual-Engine Control
     v1_enabled: bool = Field(default=True, alias="V1_ENABLED")
     v2_enabled: bool = Field(default=False, alias="V2_ENABLED")

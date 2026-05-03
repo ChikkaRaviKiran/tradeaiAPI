@@ -37,6 +37,7 @@ import pandas as pd
 import pytz
 
 from app.alerts.alert_manager import AlertManager
+from app.core.config import settings
 from app.core.instruments import InstrumentConfig
 from app.core.models import AlertItem
 from app.data.angelone_client import AngelOneClient
@@ -46,6 +47,11 @@ from app.engine.feature_engine import (
     scan_all_moves,
     select_production_trade,
 )
+from app.engine.lot_sizer import compute_buy_option_lots
+from app.engine import scanner_exec_settings as exec_settings
+
+ORDER_POLL_RETRIES = 8
+ORDER_POLL_DELAY_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -104,6 +110,15 @@ class ActiveTrade:
         self.strike_price = strike_price
         self.spot_at_entry = spot_at_entry
 
+        # Execution metadata (only populated when live order placed)
+        self.lots: int = 0
+        self.lot_size: int = 0
+        self.symboltoken: str = ""
+        self.exchange: str = "NFO"
+        self.live_executed: bool = False
+        self.entry_order_id: str = ""
+        self.exit_order_id: str = ""
+
         # Exit tracking
         self.best_price = entry_price
         self.candles_in_trade = 0
@@ -132,10 +147,12 @@ class MoveDetectionScanner:
         client: AngelOneClient,
         feature_engine: FeatureEngine,
         alert_manager: AlertManager,
+        broker: Optional[object] = None,
     ):
         self.client = client
         self.fe = feature_engine
         self.alert_manager = alert_manager
+        self.broker = broker
 
         # Daily state
         self._day_assessed = False
@@ -414,6 +431,82 @@ class MoveDetectionScanner:
         # Update weekly filter
         self._last_trade_week = now.isocalendar()[1]
 
+        # ── DYNAMIC LOT SIZING + LIVE ORDER ──────────────────────────
+        # Compute affordable lots based on broker margin (rmsLimit) and
+        # the configured fund cap. Place a real BUY order only when
+        # live execution is enabled.
+        exec_summary = ""
+        token_info = self.client._search_symbol(option_symbol) if option_symbol else None
+        symboltoken = (token_info or {}).get("token", "")
+        exchange = (token_info or {}).get("exch_seg", "NFO")
+        self._active_trade.symboltoken = symboltoken
+        self._active_trade.exchange = exchange
+        self._active_trade.lot_size = int(instrument.lot_size)
+
+        live_exec = (
+            settings.move_det_live_execution
+            and not settings.paper_trading
+            and self.broker is not None
+            and option_ltp > 0
+            and symboltoken
+        )
+
+        if self.broker is not None and option_ltp > 0:
+            cfg = exec_settings.load("move_det")
+            if cfg.get("lots_mode") == "manual":
+                lots = max(0, min(int(cfg.get("manual_lots", 1)), int(cfg.get("max_lots", 20))))
+                cost_per_lot = option_ltp * int(instrument.lot_size)
+                sizing = {
+                    "available": 0.0,
+                    "max_funds_cap": cfg.get("max_funds", 0),
+                    "cost_per_lot": round(cost_per_lot, 2),
+                    "deployed_capital": round(lots * cost_per_lot, 2),
+                    "mode": "manual",
+                }
+            else:
+                lots, sizing = compute_buy_option_lots(
+                    self.broker,
+                    premium=option_ltp,
+                    lot_size=int(instrument.lot_size),
+                    max_funds_cap=cfg.get("max_funds", settings.move_det_max_funds),
+                    buffer_pct=cfg.get("buffer_pct", settings.move_det_funds_buffer_pct),
+                    max_lots_cap=cfg.get("max_lots", settings.move_det_max_lots),
+                    min_lots=1,
+                )
+                sizing["mode"] = "auto"
+            self._active_trade.lots = lots
+            exec_summary = (
+                f"\n💰 SIZING ({sizing.get('mode', 'auto')})\n"
+                f"  Available: ₹{sizing.get('available', 0):,.0f}"
+                f" | Cap: ₹{sizing.get('max_funds_cap', 0):,.0f}\n"
+                f"  Cost/lot: ₹{sizing.get('cost_per_lot', 0):,.0f}"
+                f" | Lots: {lots}"
+                f" | Capital: ₹{sizing.get('deployed_capital', 0):,.0f}"
+            )
+            if lots == 0:
+                exec_summary += f"\n  ⚠️ {sizing.get('reason', 'no_lots')}"
+
+            # Settings override the global config flag
+            live_exec = (
+                bool(cfg.get("live_execution"))
+                and not settings.paper_trading
+                and option_ltp > 0
+                and bool(symboltoken)
+                and lots > 0
+            )
+
+        order_status = "OBSERVE ONLY — No auto-execution"
+        if live_exec and self._active_trade.lots > 0:
+            ok, oid = await self._place_entry_order(self._active_trade)
+            self._active_trade.entry_order_id = oid
+            self._active_trade.live_executed = bool(ok)
+            order_status = (
+                f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
+            )
+        elif settings.move_det_live_execution and not settings.paper_trading:
+            if self._active_trade.lots == 0:
+                order_status = "LIVE skipped — insufficient funds for 1 lot"
+
         # Calculate expected levels
         sl_points = round(body_mid - entry_price, 2)
         sl_pct_option = round(abs(sl_points) / entry_price * 100 * OPTION_LEVERAGE, 1)
@@ -459,8 +552,9 @@ class MoveDetectionScanner:
             f"  2. VWAP break: close > VWAP\n"
             f"  3. Trailing stop: after 10 candles in profit\n"
             f"  4. EOD: 15:20 force close\n"
+            f"{exec_summary}\n"
             f"\n"
-            f"⚠️ OBSERVE ONLY — No auto-execution"
+            f"⚠️ {order_status}"
         )
 
         await self.alert_manager.telegram.send(msg)
@@ -560,6 +654,13 @@ class MoveDetectionScanner:
         trade.exit_time = now.strftime("%H:%M")
         trade.exit_reason = exit_reason
 
+        # ── LIVE EXIT ORDER (sell back the long PE) ──────────────────
+        if trade.live_executed and trade.lots > 0 and trade.symboltoken:
+            ok, oid = await self._place_exit_order(trade, reason=exit_reason)
+            trade.exit_order_id = oid
+            if not ok:
+                logger.error("[MoveDet] Exit order failed for %s reason=%s", trade.option_symbol, exit_reason)
+
         # Calculate PnL (bearish: profit when price drops)
         index_pnl_pct = (trade.entry_price - exit_price) / trade.entry_price * 100
         index_pnl_pts = trade.entry_price - exit_price
@@ -627,12 +728,16 @@ class MoveDetectionScanner:
         await self.alert_manager.record(alert)
 
     async def force_close(self, df_today: pd.DataFrame, instrument: InstrumentConfig) -> None:
-        """Force close any active trade (called at EOD 15:20)."""
+        """Force close any active trade (called at EOD 15:20 or by priority handover)."""
         if self._active_trade and not self._active_trade.exited:
             now = datetime.now(IST)
             await self._check_exit(df_today, instrument, now)
             # If still not exited (shouldn't happen — EOD triggers), force it
             if not self._active_trade.exited:
+                # Live exit if needed
+                if self._active_trade.live_executed and self._active_trade.lots > 0 and self._active_trade.symboltoken:
+                    ok, oid = await self._place_exit_order(self._active_trade, reason="eod_force")
+                    self._active_trade.exit_order_id = oid
                 self._active_trade.exited = True
                 self._active_trade.exit_reason = "eod_force"
                 if df_today is not None and not df_today.empty:
@@ -643,6 +748,77 @@ class MoveDetectionScanner:
                     f"Exit price: {self._active_trade.exit_price:.2f}\n"
                     f"Reason: End of day"
                 )
+
+    # ── Live order helpers ───────────────────────────────────────────
+    async def _place_entry_order(self, trade: ActiveTrade) -> tuple[bool, str]:
+        """Place a BUY market order for the long PE leg."""
+        qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
+        return await self._place_order(
+            side="BUY",
+            symbol=trade.option_symbol,
+            symboltoken=trade.symboltoken,
+            exchange=trade.exchange,
+            quantity=qty,
+            tag="md_entry",
+        )
+
+    async def _place_exit_order(self, trade: ActiveTrade, reason: str) -> tuple[bool, str]:
+        """Place a SELL market order to close the long PE leg."""
+        qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
+        return await self._place_order(
+            side="SELL",
+            symbol=trade.option_symbol,
+            symboltoken=trade.symboltoken,
+            exchange=trade.exchange,
+            quantity=qty,
+            tag=f"md_exit_{reason}",
+        )
+
+    async def _place_order(
+        self,
+        *,
+        side: str,
+        symbol: str,
+        symboltoken: str,
+        exchange: str,
+        quantity: int,
+        tag: str,
+    ) -> tuple[bool, str]:
+        if not symbol or not symboltoken or quantity <= 0:
+            return False, ""
+        try:
+            self.client.ensure_authenticated()
+            params = {
+                "variety": "NORMAL",
+                "tradingsymbol": symbol,
+                "symboltoken": symboltoken,
+                "transactiontype": side,
+                "exchange": exchange or "NFO",
+                "ordertype": "MARKET",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "quantity": str(quantity),
+                "price": "0",
+                "triggerprice": "0",
+            }
+            resp = await asyncio.to_thread(self.client._smart_api.placeOrder, params)
+            order_id = ""
+            if isinstance(resp, str):
+                order_id = resp.strip()
+            elif isinstance(resp, dict):
+                data = resp.get("data") or {}
+                if isinstance(data, dict):
+                    order_id = str(data.get("orderid") or data.get("orderId") or "").strip()
+                if not order_id:
+                    order_id = str(resp.get("orderid") or resp.get("orderId") or "").strip()
+            if not order_id:
+                logger.error("[MoveDet] Order placement returned no id (%s %s tag=%s) resp=%s", side, symbol, tag, resp)
+                return False, ""
+            logger.info("[MoveDet] %s order placed %s qty=%d id=%s tag=%s", side, symbol, quantity, order_id, tag)
+            return True, order_id
+        except Exception:
+            logger.exception("[MoveDet] Order exception side=%s symbol=%s tag=%s", side, symbol, tag)
+            return False, ""
 
     async def _fetch_option_quote(
         self,

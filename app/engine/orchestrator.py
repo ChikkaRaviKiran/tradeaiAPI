@@ -272,6 +272,7 @@ class Orchestrator:
             client=self.client,
             feature_engine=self.feature_engine,
             alert_manager=self.alert_manager,
+            broker=self.broker,
         )
 
         # ── AI-GPT Scanner (3-stage GPT pipeline, 5-min cadence) ──
@@ -308,10 +309,11 @@ class Orchestrator:
         if not settings.nr5_scanner_enabled:
             logger.info("[NR5] Scanner disabled via config (NR5_SCANNER_ENABLED=false)")
 
-        # ── PDH/PDL Breakout Scanner (prev-day H/L breakout, PAPER-ONLY) ──
+        # ── PDH/PDL Breakout Scanner (prev-day H/L breakout) ──
         self.pdh_pdl_scanner = PDHPDLBreakoutScanner(
             client=self.client,
             alert_manager=self.alert_manager,
+            broker=self.broker,
         )
         if not settings.pdh_pdl_scanner_enabled:
             logger.info("[PDHPDL] Scanner disabled via config (PDH_PDL_SCANNER_ENABLED=false)")
@@ -1523,6 +1525,39 @@ class Orchestrator:
                     df_today, instrument, cycle,
                     peer_in_trade=(False if allow_concurrent else (cp_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
                 )
+                # ── Priority handover: MoveDet wins over ATL ──
+                # If MoveDet just entered a trade and ATL was holding
+                # positions, force-close ATL immediately so MoveDet has
+                # full account focus. Skip ATL run for this cycle.
+                md_just_entered = (not md_in_trade) and self.move_detection_scanner.is_in_trade()
+                atl_preempted = False
+                if (
+                    settings.move_det_priority_over_atl
+                    and md_just_entered
+                    and self.atl_straddle_scanner.is_in_trade()
+                ):
+                    logger.warning(
+                        "[Priority] MoveDet signal detected — force-closing ATL to hand over control"
+                    )
+                    self._log_event(
+                        "priority_handover",
+                        "MoveDet entered → force-closing ATL",
+                        cycle=cycle, instrument=symbol,
+                    )
+                    try:
+                        await self.atl_straddle_scanner.force_close(df_today, instrument)
+                    except Exception:
+                        logger.exception("[Priority] ATL force_close failed")
+                    atl_preempted = True
+                    try:
+                        await self.alert_manager.telegram.send(
+                            "⚡ PRIORITY HANDOVER\n"
+                            "MoveDet found a signal — closing ATL straddle and prioritising MoveDet entry."
+                        )
+                    except Exception:
+                        pass
+                # Refresh MoveDet trade flag so downstream scanners respect it
+                md_in_trade = self.move_detection_scanner.is_in_trade()
                 if settings.nr5_scanner_enabled:
                     await self.nr5_scanner.run_cycle(
                         df_today, instrument, cycle,
@@ -1547,7 +1582,7 @@ class Orchestrator:
                     df_today,
                     instrument,
                     cycle,
-                    peer_in_trade=(False if allow_concurrent else (cp_in_trade or md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
+                    peer_in_trade=(False if allow_concurrent else (atl_preempted or cp_in_trade or md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
                 )
                 if settings.ai_gpt_scanner_enabled:
                     await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
