@@ -26,8 +26,10 @@ ATL_SETTINGS_DEFAULTS: dict[str, Any] = {
     "sl_upper": 0,
     "first_straddle_sl_pct": 100,
     "reform_straddle_sl_pct": 60,
+    "hedge_mode": "none",
     "hedge_enabled": False,
     "hedge_premium": 3,
+    "hedge_otm_points": 500,
     "hedge_lots": 0,
     "execution_account": "Primary",
 }
@@ -80,7 +82,7 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
     out["rolling_points"] = max(1, int(out.get("rolling_points", 300)))
 
     sl_type = str(out.get("sl_type", "premium_pct")).strip().lower()
-    if sl_type not in {"premium_pct", "spot"}:
+    if sl_type not in {"none", "premium_pct", "spot"}:
         sl_type = "premium_pct"
     out["sl_type"] = sl_type
     out["sl_lower"] = max(0, int(out.get("sl_lower", 0)))
@@ -88,10 +90,28 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
 
     out["first_straddle_sl_pct"] = max(1, int(out.get("first_straddle_sl_pct", 100)))
     out["reform_straddle_sl_pct"] = max(1, int(out.get("reform_straddle_sl_pct", 60)))
-    out["hedge_enabled"] = bool(out.get("hedge_enabled", False))
+
+    hedge_mode = str(out.get("hedge_mode", "none")).strip().lower()
+    if hedge_mode not in {"none", "premium", "otm_points"}:
+        # Backward compatibility with previous boolean-only flag.
+        hedge_mode = "premium" if bool(out.get("hedge_enabled", False)) else "none"
+    out["hedge_mode"] = hedge_mode
+    out["hedge_enabled"] = hedge_mode != "none"
     out["hedge_premium"] = max(1, int(out.get("hedge_premium", 3)))
+    out["hedge_otm_points"] = max(1, int(out.get("hedge_otm_points", out.get("offset_points", 500))))
     out["hedge_lots"] = max(0, int(out.get("hedge_lots", 0)))
     out["execution_account"] = str(out.get("execution_account", "Primary"))
+
+    if sl_type == "none":
+        out["sl_lower"] = 0
+        out["sl_upper"] = 0
+
+    if sl_type == "spot":
+        out["first_straddle_sl_pct"] = 100
+
+    if hedge_mode == "none":
+        out["hedge_lots"] = 0
+
     return out
 
 

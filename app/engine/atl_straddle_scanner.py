@@ -94,6 +94,8 @@ class ATLStraddleScanner:
             "sl_type": self._settings.get("sl_type", "premium_pct"),
             "sl_lower": self._settings.get("sl_lower", 0),
             "sl_upper": self._settings.get("sl_upper", 0),
+            "hedge_mode": self._settings.get("hedge_mode", "none"),
+            "hedge_otm_points": self._settings.get("hedge_otm_points", 500),
             "ref_spot": st.ref_spot,
             "straddle_strike": st.straddle_strike,
             "straddle_sl_points": st.straddle_sl_points,
@@ -293,7 +295,7 @@ class ATLStraddleScanner:
                 return
 
         # STRADDLE phase logic
-        if self._state.phase == "STRADDLE" and self._state.straddle_sl_points > 0:
+        if sl_type == "premium_pct" and self._state.phase == "STRADDLE" and self._state.straddle_sl_points > 0:
             upper = self._state.straddle_strike + self._state.straddle_sl_points
             lower = self._state.straddle_strike - self._state.straddle_sl_points
             if spot >= upper or spot <= lower:
@@ -323,9 +325,10 @@ class ATLStraddleScanner:
         if self._settings.get("hedge_enabled", False) and (not self._state.hedge_ce or not self._state.hedge_pe):
             await self._ensure_hedges(instrument, strike)
 
+        sl_type = str(self._settings.get("sl_type", "premium_pct")).lower()
         pct = int(self._settings.get("first_straddle_sl_pct", 100)) if self._state.is_first_straddle else int(self._settings.get("reform_straddle_sl_pct", 60))
         prem_sum = self._state.ce.premium + self._state.pe.premium
-        self._state.straddle_sl_points = prem_sum * (pct / 100.0)
+        self._state.straddle_sl_points = prem_sum * (pct / 100.0) if sl_type == "premium_pct" else 0.0
 
         tag = "REFORM" if reform else "AT-STRIKE"
         self._record_event("straddle", f"{tag} strike {int(strike)} spot {spot:.2f} sl {self._state.straddle_sl_points:.2f}")
@@ -343,7 +346,7 @@ class ATLStraddleScanner:
         spot = float(df_today.iloc[-1]["close"]) if df_today is not None and not df_today.empty else 0.0
         # Close active short legs first.
         await self._close_current_shorts(instrument, reason="eod_force_close")
-        if self._settings.get("hedge_enabled", False) and (self._state.hedge_ce or self._state.hedge_pe):
+        if self._settings.get("hedge_mode", "none") != "none" and (self._state.hedge_ce or self._state.hedge_pe):
             await self._close_hedges(instrument, reason="eod_force_close")
             await self.alert_manager.telegram.send(
                 f"🛡️ ATL Hedge Close ({'LIVE' if not settings.paper_trading else 'PAPER'})\n"
@@ -361,12 +364,26 @@ class ATLStraddleScanner:
 
     async def _ensure_hedges(self, instrument: InstrumentConfig, ref_strike: float) -> None:
         """Initialize protective hedges once per day using target premium matching."""
+        hedge_mode = str(self._settings.get("hedge_mode", "none")).lower()
+        if hedge_mode == "none":
+            return
         if self._state.hedge_ce and self._state.hedge_pe:
             return
-        target_premium = max(1.0, float(self._settings.get("hedge_premium", 3) or 3))
+
         interval = max(1, int(self._settings.get("strike_interval", 50)))
-        ce_leg = await self._find_hedge_leg(instrument, ref_strike, "CE", target_premium, interval)
-        pe_leg = await self._find_hedge_leg(instrument, ref_strike, "PE", target_premium, interval)
+        if hedge_mode == "otm_points":
+            otm_points = max(1, int(self._settings.get("hedge_otm_points", 500) or 500))
+            ce_strike = round((ref_strike + otm_points) / interval) * interval
+            pe_strike = round((ref_strike - otm_points) / interval) * interval
+            ce_q = await self._fetch_option_quote(instrument, ce_strike, "CE")
+            pe_q = await self._fetch_option_quote(instrument, pe_strike, "PE")
+            ce_leg = await self._build_leg(instrument, ce_strike, "CE", fallback_quote=ce_q)
+            pe_leg = await self._build_leg(instrument, pe_strike, "PE", fallback_quote=pe_q)
+        else:
+            target_premium = max(1.0, float(self._settings.get("hedge_premium", 3) or 3))
+            ce_leg = await self._find_hedge_leg(instrument, ref_strike, "CE", target_premium, interval)
+            pe_leg = await self._find_hedge_leg(instrument, ref_strike, "PE", target_premium, interval)
+
         if ce_leg:
             self._state.hedge_ce = ce_leg
         if pe_leg:
