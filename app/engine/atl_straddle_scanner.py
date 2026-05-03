@@ -82,13 +82,18 @@ class ATLStraddleScanner:
         return {
             "enabled": bool(self._settings.get("enabled", False)),
             "live_mode": not settings.paper_trading,
+            "strategy_type": self._settings.get("strategy_type", "ATM_STRADDLE"),
             "phase": st.phase,
             "in_trade": self.is_in_trade(),
             "done_for_day": st.done_for_day,
             "index": self._settings.get("index", "NIFTY"),
+            "trading_day": self._settings.get("trading_day", "Daily"),
             "expiry": self._expiry,
             "entry_time": self._settings.get("entry_time", "09:20"),
             "exit_time": self._settings.get("exit_time", "15:15"),
+            "sl_type": self._settings.get("sl_type", "premium_pct"),
+            "sl_lower": self._settings.get("sl_lower", 0),
+            "sl_upper": self._settings.get("sl_upper", 0),
             "ref_spot": st.ref_spot,
             "straddle_strike": st.straddle_strike,
             "straddle_sl_points": st.straddle_sl_points,
@@ -127,6 +132,19 @@ class ATLStraddleScanner:
         if instrument.symbol != self._settings.get("index", "NIFTY"):
             return
 
+        trading_day = str(self._settings.get("trading_day", "Daily")).title()
+        if trading_day != "Daily":
+            weekdays = {
+                "Monday": 0,
+                "Tuesday": 1,
+                "Wednesday": 2,
+                "Thursday": 3,
+                "Friday": 4,
+            }
+            target = weekdays.get(trading_day)
+            if target is not None and now.weekday() != target:
+                return
+
         try:
             entry_h, entry_m = [int(x) for x in str(self._settings.get("entry_time", "09:20")).split(":")]
             exit_h, exit_m = [int(x) for x in str(self._settings.get("exit_time", "15:15")).split(":")]
@@ -148,6 +166,26 @@ class ATLStraddleScanner:
         interval = max(1, int(self._settings.get("strike_interval", 50)))
         offset = max(1, int(self._settings.get("offset_points", 500)))
         rolling = max(1, int(self._settings.get("rolling_points", 300)))
+        sl_type = str(self._settings.get("sl_type", "premium_pct")).lower()
+        sl_lower = float(self._settings.get("sl_lower", 0) or 0)
+        sl_upper = float(self._settings.get("sl_upper", 0) or 0)
+
+        if sl_type == "spot" and self._state.entered:
+            lower_hit = sl_lower > 0 and spot <= sl_lower
+            upper_hit = sl_upper > 0 and spot >= sl_upper
+            if lower_hit or upper_hit:
+                self._record_event(
+                    "stoploss",
+                    f"SPOT SL breach spot={spot:.2f} lower={sl_lower:.2f} upper={sl_upper:.2f}",
+                )
+                await self.alert_manager.telegram.send(
+                    f"🛑 ATL SPOT SL HIT\n"
+                    f"Spot: {spot:.2f}\n"
+                    f"SL Range: {sl_lower:.2f} - {sl_upper:.2f}"
+                )
+                await self.force_close(df_today, instrument)
+                self._state.done_for_day = True
+                return
 
         # Initial entry
         if not self._state.entered:

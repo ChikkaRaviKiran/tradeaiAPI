@@ -798,6 +798,24 @@ async def force_close_atm():
     await atl.force_close(nifty_df, _NIFTY_INST)
     return {"status": "ok", "message": "ATL force close executed"}
 
+
+@app.post("/api/atm/place-now")
+async def place_now_atm():
+    """Enable ATL and trigger immediate eligibility for next cycle entry."""
+    now_hhmm = datetime.now(_IST).strftime("%H:%M")
+    current = load_atl_settings()
+    current["enabled"] = True
+    current["entry_time"] = now_hhmm
+    saved = save_atl_settings(current)
+
+    orch = _state.get("orchestrator")
+    atl = getattr(orch, "atl_straddle_scanner", None) if orch else None
+    if atl:
+        atl._settings = saved
+        if getattr(atl, "_state", None):
+            atl._state.done_for_day = False
+    return {"status": "ok", "message": "ATL armed for immediate entry", "settings": saved}
+
 # ── History (Snapshots / Alerts / Calendar) ──────────────────────────────
 
 @app.get("/api/history/snapshots/{target_date}")
