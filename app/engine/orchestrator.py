@@ -77,6 +77,7 @@ from app.engine.pdh_pdl_scanner import PDHPDLBreakoutScanner
 from app.engine.vacuum_1430_scanner import VacuumBreakoutScanner
 from app.ai.ai_gpt_pipeline import AIGPTPipeline
 from app.engine.range_breakout_scanner import RangeBreakoutScanner
+from app.engine.atl_straddle_scanner import ATLStraddleScanner
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
 from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
@@ -263,6 +264,8 @@ class Orchestrator:
             feature_engine=self.feature_engine,
             alert_manager=self.alert_manager,
         )
+        if not settings.config_p_scanner_enabled:
+            logger.info("[ConfigP] Scanner disabled via config (CONFIG_P_SCANNER_ENABLED=false)")
 
         # ── Move Detection Scanner (Production v2 AGGRESSIVE, scan_all_moves based) ──
         self.move_detection_scanner = MoveDetectionScanner(
@@ -329,6 +332,12 @@ class Orchestrator:
         if not settings.range_breakout_scanner_enabled:
             logger.info("[RB] Scanner disabled via config (RANGE_BREAKOUT_SCANNER_ENABLED=false)")
 
+        # ── ATL Straddle Scanner (OptionSelling-style paper engine) ──
+        self.atl_straddle_scanner = ATLStraddleScanner(
+            client=self.client,
+            alert_manager=self.alert_manager,
+        )
+
         # Strategy selector — picks best strategies based on condition-performance data
         from app.engine.strategy_selector import StrategySelector
         self.strategy_selector = StrategySelector()
@@ -378,6 +387,8 @@ class Orchestrator:
         self._traded_strikes_today: set[tuple[str, float, str]] = {}
         # Daily SL circuit breaker: stop after 2 consecutive SL hits per symbol
         self._daily_sl_hit: dict[str, int] = {}  # {symbol: count of SL hits today}
+        # Broker EOD snapshot capture guard
+        self._eod_broker_snapshot_done: bool = False
         # ORB trade limit: max 1 ORB per day per instrument (avoid doubling down)
         self._orb_trades_today: dict[str, int] = {}  # {symbol: count of ORB trades today}
         # No Trade Day guard: if no signal > 55 by 11:30, skip rest of day
@@ -498,6 +509,7 @@ class Orchestrator:
         self._sl_cooldowns = {}
         self._traded_strikes_today = set()
         self._daily_sl_hit = {}
+        self._eod_broker_snapshot_done = False
         self._orb_trades_today = {}
         self._no_trade_day = {}
         self._best_score_today = {}
@@ -529,6 +541,8 @@ class Orchestrator:
         self.vacuum_scanner.reset_daily()
         # Reset Range Breakout scanner daily state
         self.range_breakout_scanner.reset_daily()
+        # Reset ATL scanner daily state
+        self.atl_straddle_scanner.reset_daily()
         self.running = False
         logger.info("Daily state reset complete")
 
@@ -612,6 +626,8 @@ class Orchestrator:
         self.pdh_pdl_scanner.reset_daily()
         self.vacuum_scanner.reset_daily()
         self.range_breakout_scanner.reset_daily()
+        self.atl_straddle_scanner.reset_daily()
+        self._eod_broker_snapshot_done = False
 
         self.running = True
 
@@ -685,6 +701,7 @@ class Orchestrator:
                 self.pdh_pdl_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.vacuum_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.range_breakout_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
+                self.atl_straddle_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 logger.info("[ConfigP+MoveDet+AIGPT+NR5+PDHPDL+VACUUM+RB] Expiry set: %s", nifty_expiry)
         except Exception:
             logger.exception("Failed to determine expiries — options data may be unavailable")
@@ -867,6 +884,14 @@ class Orchestrator:
             # Pre-close: close open trades
             if PRE_CLOSE <= current_time < MARKET_CLOSE:
                 await self._close_all_trades()
+                if not self._eod_broker_snapshot_done:
+                    try:
+                        from app.api.routes import capture_eod_broker_snapshot
+                        snap_result = await capture_eod_broker_snapshot()
+                        logger.info("EOD broker snapshot: %s", snap_result)
+                    except Exception:
+                        logger.exception("EOD broker snapshot capture failed")
+                    self._eod_broker_snapshot_done = True
                 await asyncio.sleep(60)
                 continue
 
@@ -1482,17 +1507,18 @@ class Orchestrator:
             # trade at any given time. Each is told whether ANY peer is
             # currently in a trade so it can skip new entries.
             if symbol == "NIFTY":
-                cp_in_trade = self.config_p_scanner.is_in_trade()
+                cp_in_trade = self.config_p_scanner.is_in_trade() if settings.config_p_scanner_enabled else False
                 md_in_trade = self.move_detection_scanner.is_in_trade()
                 nr5_in_trade = self.nr5_scanner.is_in_trade()
                 pdh_in_trade = self.pdh_pdl_scanner.is_in_trade()
                 vac_in_trade = self.vacuum_scanner.is_in_trade()
                 rb_in_trade = self.range_breakout_scanner.is_in_trade()
                 allow_concurrent = settings.scanners_allow_concurrent
-                await self.config_p_scanner.run_cycle(
-                    df_today, instrument, cycle,
-                    peer_in_trade=(False if allow_concurrent else (md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
-                )
+                if settings.config_p_scanner_enabled:
+                    await self.config_p_scanner.run_cycle(
+                        df_today, instrument, cycle,
+                        peer_in_trade=(False if allow_concurrent else (md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
+                    )
                 await self.move_detection_scanner.run_cycle(
                     df_today, instrument, cycle,
                     peer_in_trade=(False if allow_concurrent else (cp_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
@@ -1517,7 +1543,14 @@ class Orchestrator:
                         df_today, instrument, cycle,
                         peer_in_trade=(False if allow_concurrent else (cp_in_trade or md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade)),
                     )
-                await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
+                await self.atl_straddle_scanner.run_cycle(
+                    df_today,
+                    instrument,
+                    cycle,
+                    peer_in_trade=(False if allow_concurrent else (cp_in_trade or md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
+                )
+                if settings.ai_gpt_scanner_enabled:
+                    await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
             return
 
             # 8. Time-of-day circuit breaker — no new entries after cutoff
@@ -3112,6 +3145,8 @@ class Orchestrator:
         await self.nr5_scanner.force_close(nifty_df, _NIFTY_INST)
         # Close PDH/PDL Breakout scanner trade
         await self.pdh_pdl_scanner.force_close(nifty_df, _NIFTY_INST)
+        # Close ATL Straddle scanner trade
+        await self.atl_straddle_scanner.force_close(nifty_df, _NIFTY_INST)
 
         all_traders = [("v1", self.paper_trader)]
         for engine_label, trader in all_traders:

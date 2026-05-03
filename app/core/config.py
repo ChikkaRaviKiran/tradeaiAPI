@@ -29,10 +29,13 @@ class Settings(BaseSettings):
     ai_gpt_scanner_enabled: bool = Field(default=False, alias="AI_GPT_SCANNER_ENABLED")
     ai_gpt_scanner_model: str = Field(default="gpt-5", alias="AI_GPT_SCANNER_MODEL")
 
+    # Config-P scanner (legacy scanner; default OFF)
+    config_p_scanner_enabled: bool = Field(default=False, alias="CONFIG_P_SCANNER_ENABLED")
+
     # NR5 Breakout Scanner (volatility contraction → expansion, paper-only)
     # Backtest: N=23 trades, WR=43.5%, PF=3.21 over 131 days. Bidirectional.
     # Honoured 3-way mutex with Config-P / Move-Det.
-    nr5_scanner_enabled: bool = Field(default=True, alias="NR5_SCANNER_ENABLED")
+    nr5_scanner_enabled: bool = Field(default=False, alias="NR5_SCANNER_ENABLED")
 
     # PDH/PDL Breakout Scanner (previous day high/low breakout, paper-only)
     # Backtest: N=121 trades, Spot WR ~64% PF 1.45, Opt WR 72.7% Opt PF 4.86
@@ -42,12 +45,12 @@ class Settings(BaseSettings):
     # 14:30 Liquidity-Vacuum Scanner (afternoon coil break, paper-only)
     # Backtest: N=18 trades, Opt WR 66.7%, Opt PF 5.80, +178 pts/lot over
     # 131 days. Coil < 60% avg | Premium SL -25% TGT +40% | Time exit 14:55.
-    vacuum_scanner_enabled: bool = Field(default=True, alias="VACUUM_SCANNER_ENABLED")
+    vacuum_scanner_enabled: bool = Field(default=False, alias="VACUUM_SCANNER_ENABLED")
 
     # Range Breakout Scanner (09:45-10:30 consolidation → breakout, paper-only)
     # Backtest (Option C): N=41 trades, WR=68.3%, PF=3.52, Max DD ₹9,823/lot
     # ADX<20 | RSI 58/42 | Body≥0.45 | MinPremium≥80 | SL=15% | T1=+15% | T2=+30%
-    range_breakout_scanner_enabled: bool = Field(default=True, alias="RANGE_BREAKOUT_SCANNER_ENABLED")
+    range_breakout_scanner_enabled: bool = Field(default=False, alias="RANGE_BREAKOUT_SCANNER_ENABLED")
 
     # Scanner concurrency control
     # True: all scanners can open/manage trades independently (no peer mutex)

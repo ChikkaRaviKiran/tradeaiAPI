@@ -330,6 +330,22 @@ class StrategyConditionPerformance(Base):
     created_at = Column(DateTime, default=_now_ist)
 
 
+class BrokerEODSnapshot(Base):
+    """End-of-day broker PnL snapshot (OptionSelling-style history support)."""
+
+    __tablename__ = "broker_eod_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(String(10), nullable=False, index=True)
+    account_name = Column(String(100), nullable=True, default="Primary")
+    broker_pnl = Column(Float, nullable=True)
+    realised = Column(Float, nullable=True)
+    unrealised = Column(Float, nullable=True)
+    positions_count = Column(Integer, default=0)
+    payload_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_now_ist)
+
+
 # Async engine
 async_engine = create_async_engine(settings.database_url, echo=False)
 AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
@@ -385,6 +401,7 @@ async def init_db() -> None:
             # Strategy condition performance indexes
             "CREATE INDEX IF NOT EXISTS ix_scp_lookup ON strategy_condition_performance (instrument, strategy, condition_key)",
             "CREATE INDEX IF NOT EXISTS ix_scp_eval_date ON strategy_condition_performance (eval_date)",
+            "CREATE INDEX IF NOT EXISTS ix_broker_eod_snapshots_date ON broker_eod_snapshots (date)",
             # FIX 5: Partial exit columns
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS partial_exit_done BOOLEAN DEFAULT FALSE",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS partial_pnl FLOAT DEFAULT 0",
