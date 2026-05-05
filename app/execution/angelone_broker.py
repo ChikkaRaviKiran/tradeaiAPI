@@ -6,6 +6,7 @@ SRS Module 3.8: Trade Execution Engine — AngelOne implementation.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -27,6 +28,9 @@ from app.execution.broker_base import (
 
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
+
+ORDER_POLL_RETRIES = 8
+ORDER_POLL_DELAY_SECONDS = 1.0
 
 
 class AngelOneBroker(BaseBroker):
@@ -72,10 +76,25 @@ class AngelOneBroker(BaseBroker):
             if resp and resp.get("status"):
                 order_id = resp.get("data", {}).get("orderid", "")
                 logger.info("Order placed: %s | %s", order_id, request.trading_symbol)
+                # Poll briefly for terminal status so callers receive
+                # the fill price / confirmed status (mirrors KiteBroker).
+                info = self._wait_terminal_status(order_id, expected_qty=int(request.quantity))
+                state_raw = str(info.get("status", "") or "").lower()
+                avg_price = float(info.get("averageprice", 0) or 0)
+                filled_qty = int(float(info.get("filledshares", 0) or 0))
+                mapped = self._map_status(state_raw) if state_raw else OrderStatus.OPEN
+                if state_raw == "rejected":
+                    msg = info.get("text", "") or "rejected by broker"
+                    logger.error(
+                        "ANGEL ORDER REJECTED: %s | %s | %s",
+                        request.trading_symbol, order_id, msg,
+                    )
                 return OrderResponse(
                     order_id=order_id,
-                    status=OrderStatus.OPEN,
-                    message="Order placed successfully",
+                    status=mapped,
+                    message=info.get("text", "") or "Order placed successfully",
+                    filled_price=avg_price,
+                    filled_quantity=filled_qty,
                     timestamp=datetime.now(_IST),
                 )
             else:
@@ -212,3 +231,58 @@ class AngelOneBroker(BaseBroker):
             "rejected": OrderStatus.REJECTED,
         }
         return mapping.get(status_str.lower(), OrderStatus.PENDING)
+
+    # ── Order status polling (mirror of KiteBroker behaviour) ────────────
+
+    def _wait_terminal_status(self, order_id: str, expected_qty: int) -> dict:
+        """Poll SmartAPI until the order is terminal or fully filled."""
+        if not order_id:
+            return {}
+        for _ in range(ORDER_POLL_RETRIES):
+            info = self._get_order_info(order_id)
+            state = str(info.get("status", "") or "").strip().lower()
+            if state in {"complete", "rejected", "cancelled", "canceled"}:
+                return info
+            try:
+                filled = int(float(info.get("filledshares", 0) or 0))
+            except Exception:
+                filled = 0
+            avg = float(info.get("averageprice", 0) or 0)
+            if expected_qty > 0 and filled >= expected_qty and avg > 0:
+                info["status"] = "complete"
+                return info
+            time.sleep(ORDER_POLL_DELAY_SECONDS)
+        return self._get_order_info(order_id)
+
+    def _get_order_info(self, order_id: str) -> dict:
+        """Read order status from order book or individual_order_details."""
+        try:
+            if hasattr(self.client._smart_api, "individual_order_details"):
+                resp = self.client._smart_api.individual_order_details(order_id)
+                data = resp.get("data") if isinstance(resp, dict) else None
+                if data:
+                    rows = data if isinstance(data, list) else [data]
+                    for row in rows:
+                        if str(row.get("orderid", "")) == str(order_id):
+                            return {
+                                "status": row.get("orderstatus", ""),
+                                "text": row.get("text", ""),
+                                "averageprice": row.get("averageprice", 0),
+                                "filledshares": row.get("filledshares", "0"),
+                            }
+        except Exception:
+            pass
+        try:
+            resp = self.client._smart_api.orderBook()
+            rows = resp.get("data", []) if isinstance(resp, dict) else []
+            for row in rows or []:
+                if str(row.get("orderid", "")) == str(order_id):
+                    return {
+                        "status": row.get("orderstatus", ""),
+                        "text": row.get("text", ""),
+                        "averageprice": row.get("averageprice", 0),
+                        "filledshares": row.get("filledshares", "0"),
+                    }
+        except Exception:
+            logger.debug("Angel order info lookup failed for %s", order_id)
+        return {}

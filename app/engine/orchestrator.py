@@ -80,7 +80,8 @@ from app.engine.range_breakout_scanner import RangeBreakoutScanner
 from app.engine.atl_straddle_scanner import ATLStraddleScanner
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
-from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
+from app.execution.kite_broker import KiteBroker
+from app.execution.broker_base import BaseBroker, OrderRequest, OrderSide, OrderType, ProductType
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +248,17 @@ class Orchestrator:
         self.risk_manager = RiskManager()
         self.paper_trader = PaperTradingEngine()
         self.smart_exit = SmartExitEngine()  # V1 smart exit engine
-        self.broker = AngelOneBroker()
+        # Broker selection: chosen by TRADING_ACCOUNT ("angel" | "kite").
+        # Legacy USE_KITE_FOR_ORDERS=true still selects Kite when
+        # TRADING_ACCOUNT is left at default "angel". Data still flows
+        # from AngelOne in both modes (Phase 1).
+        _ta = (settings.trading_account or "angel").strip().lower()
+        _use_kite = _ta == "kite" or (_ta == "angel" and settings.use_kite_for_orders)
+        self.broker: BaseBroker = KiteBroker() if _use_kite else AngelOneBroker()
+        logger.info(
+            "Order broker: %s (trading_account=%s, paper=%s)",
+            self.broker.name, _ta, settings.paper_trading,
+        )
         self.trade_logger = TradeLogger()
         self.history_logger = HistoryLogger()
         self.alert_manager = AlertManager()
@@ -338,6 +349,7 @@ class Orchestrator:
         self.atl_straddle_scanner = ATLStraddleScanner(
             client=self.client,
             alert_manager=self.alert_manager,
+            broker=self.broker,
         )
 
         # Strategy selector — picks best strategies based on condition-performance data
@@ -753,13 +765,17 @@ class Orchestrator:
         # Authenticate broker for live trading
         if not settings.paper_trading:
             if self.broker.authenticate():
-                logger.info("AngelOneBroker authenticated for live trading")
+                logger.info("%s broker authenticated for live trading", self.broker.name)
             else:
-                logger.error("AngelOneBroker auth failed — falling back to paper trading for safety")
+                logger.error(
+                    "%s auth failed — falling back to paper trading for safety",
+                    self.broker.name,
+                )
                 await self.alert_manager.send_info(
                     "BROKER AUTH FAILED",
-                    "Live broker authentication failed. System will NOT place real orders today.\n"
-                    "Paper trading mode active as safety fallback.",
+                    f"Live broker ({self.broker.name}) authentication failed. "
+                    f"System will NOT place real orders today.\n"
+                    f"Paper trading mode active as safety fallback.",
                 )
 
         # ── Pre-market intelligence: AI analysis of all data sources ─────
@@ -2428,6 +2444,14 @@ class Orchestrator:
             quantity=trade.lot_size,
             price=0.0,
             trigger_price=0.0,
+            # Structured fields used by KiteBroker to look up the contract in
+            # the Kite instrument master directly (Kite tradingsymbols and
+            # tokens differ from AngelOne, especially for SENSEX/BFO).
+            underlying=instrument.option_symbol_prefix or instrument.symbol,
+            expiry_date=self._expiry_dates.get(instrument.symbol),
+            strike=float(trade.strike) if trade.strike else None,
+            option_type=("CE" if trade.option_type.value.upper().startswith("C") else "PE")
+                if trade.option_type else None,
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)
@@ -2534,6 +2558,11 @@ class Orchestrator:
             quantity=trade.lot_size,
             price=0.0,
             trigger_price=0.0,
+            underlying=instrument.option_symbol_prefix or instrument.symbol,
+            expiry_date=self._expiry_dates.get(instrument.symbol),
+            strike=float(trade.strike) if trade.strike else None,
+            option_type=("CE" if trade.option_type.value.upper().startswith("C") else "PE")
+                if trade.option_type else None,
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)

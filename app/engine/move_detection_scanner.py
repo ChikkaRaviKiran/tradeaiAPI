@@ -48,6 +48,13 @@ from app.engine.feature_engine import (
     select_production_trade,
 )
 from app.engine.lot_sizer import compute_buy_option_lots
+from app.execution.broker_base import (
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    ProductType,
+)
 from app.engine import scanner_exec_settings as exec_settings
 
 ORDER_POLL_RETRIES = 8
@@ -164,6 +171,7 @@ class MoveDetectionScanner:
         self._today_str: str = ""
         self._expiry: str = ""
         self._expiry_date: Optional[date] = None
+        self._expiry_skip_notified = False
 
     def reset_daily(self) -> None:
         """Reset state for a new trading day."""
@@ -173,6 +181,7 @@ class MoveDetectionScanner:
         self._signal_found_today = False
         self._active_trade = None
         self._today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        self._expiry_skip_notified = False
         # Don't reset _last_trade_week — persists across days for weekly filter
 
     def set_expiry(self, expiry: str, expiry_date: Optional[date] = None) -> None:
@@ -227,8 +236,29 @@ class MoveDetectionScanner:
         if self._signal_found_today:
             return
 
-        # ── Skip expiry day — avoid trading on weekly options expiry ─────
+        # ── Skip on options expiry day (weekly/monthly) ──────────────
+        # _expiry_date is sourced from the AngelOne instrument master via
+        # get_nearest_weekly_expiry() — it reflects the actual NSE-listed
+        # expiry contract date and is therefore holiday-adjusted. Both
+        # weekly and monthly expiries are covered (monthly = last weekly
+        # of the month, same date in the master).
         if self._expiry_date and now.date() == self._expiry_date:
+            self._signal_found_today = True  # stop scanning for the day
+            if not getattr(self, "_expiry_skip_notified", False):
+                self._expiry_skip_notified = True
+                logger.info(
+                    "[MoveDet] Day %s SKIPPED: options expiry day (expiry=%s)",
+                    self._today_str, self._expiry or self._expiry_date.isoformat(),
+                )
+                try:
+                    await self.alert_manager.telegram.send(
+                        f"📊 {SCANNER_TAG} — Day Skip\n"
+                        f"Date: {self._today_str}\n"
+                        f"Reason: Options expiry day ({self._expiry or self._expiry_date.isoformat()})\n"
+                        f"No trades today."
+                    )
+                except Exception:
+                    logger.exception("[MoveDet] Failed to send expiry-skip Telegram")
             return
 
         # ── Weekly filter: only 1 trade per ISO week ─────────────────
@@ -497,7 +527,7 @@ class MoveDetectionScanner:
 
         order_status = "OBSERVE ONLY — No auto-execution"
         if live_exec and self._active_trade.lots > 0:
-            ok, oid = await self._place_entry_order(self._active_trade)
+            ok, oid = await self._place_entry_order(instrument, self._active_trade)
             self._active_trade.entry_order_id = oid
             self._active_trade.live_executed = bool(ok)
             order_status = (
@@ -656,7 +686,7 @@ class MoveDetectionScanner:
 
         # ── LIVE EXIT ORDER (sell back the long PE) ──────────────────
         if trade.live_executed and trade.lots > 0 and trade.symboltoken:
-            ok, oid = await self._place_exit_order(trade, reason=exit_reason)
+            ok, oid = await self._place_exit_order(instrument, trade, reason=exit_reason)
             trade.exit_order_id = oid
             if not ok:
                 logger.error("[MoveDet] Exit order failed for %s reason=%s", trade.option_symbol, exit_reason)
@@ -736,7 +766,7 @@ class MoveDetectionScanner:
             if not self._active_trade.exited:
                 # Live exit if needed
                 if self._active_trade.live_executed and self._active_trade.lots > 0 and self._active_trade.symboltoken:
-                    ok, oid = await self._place_exit_order(self._active_trade, reason="eod_force")
+                    ok, oid = await self._place_exit_order(instrument, self._active_trade, reason="eod_force")
                     self._active_trade.exit_order_id = oid
                 self._active_trade.exited = True
                 self._active_trade.exit_reason = "eod_force"
@@ -750,26 +780,28 @@ class MoveDetectionScanner:
                 )
 
     # ── Live order helpers ───────────────────────────────────────────
-    async def _place_entry_order(self, trade: ActiveTrade) -> tuple[bool, str]:
+    async def _place_entry_order(
+        self, instrument: InstrumentConfig, trade: ActiveTrade,
+    ) -> tuple[bool, str]:
         """Place a BUY market order for the long PE leg."""
         qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
         return await self._place_order(
+            instrument=instrument,
+            trade=trade,
             side="BUY",
-            symbol=trade.option_symbol,
-            symboltoken=trade.symboltoken,
-            exchange=trade.exchange,
             quantity=qty,
             tag="md_entry",
         )
 
-    async def _place_exit_order(self, trade: ActiveTrade, reason: str) -> tuple[bool, str]:
+    async def _place_exit_order(
+        self, instrument: InstrumentConfig, trade: ActiveTrade, reason: str,
+    ) -> tuple[bool, str]:
         """Place a SELL market order to close the long PE leg."""
         qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
         return await self._place_order(
+            instrument=instrument,
+            trade=trade,
             side="SELL",
-            symbol=trade.option_symbol,
-            symboltoken=trade.symboltoken,
-            exchange=trade.exchange,
             quantity=qty,
             tag=f"md_exit_{reason}",
         )
@@ -777,48 +809,61 @@ class MoveDetectionScanner:
     async def _place_order(
         self,
         *,
+        instrument: InstrumentConfig,
+        trade: ActiveTrade,
         side: str,
-        symbol: str,
-        symboltoken: str,
-        exchange: str,
         quantity: int,
         tag: str,
     ) -> tuple[bool, str]:
-        if not symbol or not symboltoken or quantity <= 0:
+        """Route order through the configured broker abstraction.
+
+        Works for both AngelOne and Kite. The Kite adapter resolves the
+        broker-native tradingsymbol from the structured option fields
+        (underlying / expiry_date / strike / option_type), so MoveDet does
+        not need to know which broker is active.
+        """
+        if not trade.option_symbol or quantity <= 0:
             return False, ""
+        if self.broker is None:
+            logger.error("[MoveDet] No broker configured — cannot place %s order", side)
+            return False, ""
+        request = OrderRequest(
+            instrument=instrument,
+            trading_symbol=trade.option_symbol,
+            symbol_token=trade.symboltoken,
+            exchange=trade.exchange or "NFO",
+            side=OrderSide(side),
+            order_type=OrderType.MARKET,
+            product_type=ProductType.INTRADAY,
+            quantity=quantity,
+            price=0.0,
+            trigger_price=0.0,
+            underlying=instrument.option_symbol_prefix or instrument.symbol,
+            expiry_date=self._expiry_date,
+            strike=float(trade.strike_price or 0),
+            option_type="PE",
+        )
         try:
-            self.client.ensure_authenticated()
-            params = {
-                "variety": "NORMAL",
-                "tradingsymbol": symbol,
-                "symboltoken": symboltoken,
-                "transactiontype": side,
-                "exchange": exchange or "NFO",
-                "ordertype": "MARKET",
-                "producttype": "INTRADAY",
-                "duration": "DAY",
-                "quantity": str(quantity),
-                "price": "0",
-                "triggerprice": "0",
-            }
-            resp = await asyncio.to_thread(self.client._smart_api.placeOrder, params)
-            order_id = ""
-            if isinstance(resp, str):
-                order_id = resp.strip()
-            elif isinstance(resp, dict):
-                data = resp.get("data") or {}
-                if isinstance(data, dict):
-                    order_id = str(data.get("orderid") or data.get("orderId") or "").strip()
-                if not order_id:
-                    order_id = str(resp.get("orderid") or resp.get("orderId") or "").strip()
-            if not order_id:
-                logger.error("[MoveDet] Order placement returned no id (%s %s tag=%s) resp=%s", side, symbol, tag, resp)
-                return False, ""
-            logger.info("[MoveDet] %s order placed %s qty=%d id=%s tag=%s", side, symbol, quantity, order_id, tag)
-            return True, order_id
+            resp = await asyncio.to_thread(self.broker.place_order, request)
         except Exception:
-            logger.exception("[MoveDet] Order exception side=%s symbol=%s tag=%s", side, symbol, tag)
+            logger.exception(
+                "[MoveDet] Broker order exception side=%s symbol=%s tag=%s",
+                side, trade.option_symbol, tag,
+            )
             return False, ""
+        if not resp or resp.status == OrderStatus.REJECTED:
+            msg = (resp.message if resp else "no response") or "rejected"
+            logger.error(
+                "[MoveDet] Order rejected side=%s symbol=%s tag=%s msg=%s",
+                side, trade.option_symbol, tag, msg,
+            )
+            return False, getattr(resp, "order_id", "") or ""
+        order_id = resp.order_id or ""
+        logger.info(
+            "[MoveDet] %s order placed via %s: %s qty=%d id=%s tag=%s",
+            side, self.broker.name, trade.option_symbol, quantity, order_id, tag,
+        )
+        return True, order_id
 
     async def _fetch_option_quote(
         self,

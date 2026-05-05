@@ -26,6 +26,14 @@ from app.core.config import settings
 from app.core.instruments import InstrumentConfig
 from app.data.angelone_client import AngelOneClient
 from app.engine.atl_settings import load_atl_settings
+from app.execution.broker_base import (
+    BaseBroker,
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    ProductType,
+)
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -61,9 +69,15 @@ class ATLState:
 
 
 class ATLStraddleScanner:
-    def __init__(self, client: AngelOneClient, alert_manager: AlertManager):
+    def __init__(
+        self,
+        client: AngelOneClient,
+        alert_manager: AlertManager,
+        broker: Optional[BaseBroker] = None,
+    ):
         self.client = client
         self.alert_manager = alert_manager
+        self.broker = broker
         self._settings = load_atl_settings()
         self._today_str = ""
         self._expiry = ""
@@ -481,6 +495,78 @@ class ATLStraddleScanner:
             premium=ltp,
         )
 
+    async def _place_leg_order_via_broker(
+        self,
+        instrument: InstrumentConfig,
+        leg: ATLLeg,
+        side: str,
+        qty: int,
+        reason: str,
+    ) -> bool:
+        """Place an ATL leg via the configured broker (Kite/Angel) abstraction.
+
+        Symbol-string differences between brokers are absorbed inside each
+        broker adapter — KiteBroker translates Angel-format symbols to Kite
+        tradingsymbols on the fly via KiteClient.resolve_from_angel_symbol.
+        """
+        request = OrderRequest(
+            instrument=instrument,
+            trading_symbol=leg.symbol,
+            symbol_token=leg.symboltoken,
+            exchange=leg.exchange or "NFO",
+            side=OrderSide(side),
+            order_type=OrderType.MARKET,
+            product_type=ProductType.INTRADAY,
+            quantity=qty,
+            price=0.0,
+            trigger_price=0.0,
+            # Structured fields let the Kite adapter resolve the contract from
+            # the broker's instrument master without parsing symbol strings —
+            # important because SENSEX/BFO uses a different symbol format than
+            # NFO and the two brokers' tradingsymbols don't match either.
+            underlying=instrument.option_symbol_prefix or instrument.symbol,
+            expiry_date=self._expiry_date,
+            strike=float(leg.strike),
+            option_type=leg.option_type,
+        )
+        try:
+            resp = await asyncio.to_thread(self.broker.place_order, request)
+        except Exception:
+            logger.exception(
+                "ATL broker order exception (%s): %s %s %s",
+                self.broker.name if self.broker else "?", side, leg.symbol, reason,
+            )
+            self._record_event("order_error", f"{side} {leg.symbol} exception ({reason})")
+            return False
+
+        if not resp or resp.status == OrderStatus.REJECTED:
+            msg = (resp.message if resp else "no response") or "rejected"
+            logger.error(
+                "ATL broker order rejected: %s %s id=%s reason=%s msg=%s",
+                side, leg.symbol, getattr(resp, "order_id", ""), reason, msg,
+            )
+            self._record_event("order_error", f"{side} {leg.symbol} rejected ({msg})")
+            return False
+
+        if resp.status == OrderStatus.COMPLETE or resp.filled_price > 0:
+            if resp.filled_price > 0:
+                leg.premium = resp.filled_price
+            self._record_event(
+                "order",
+                f"{side} {leg.symbol} qty={qty} id={resp.order_id} ({reason})",
+            )
+            return True
+
+        logger.error(
+            "ATL broker order unresolved: %s %s id=%s status=%s",
+            side, leg.symbol, resp.order_id, resp.status.value,
+        )
+        self._record_event(
+            "order_error",
+            f"{side} {leg.symbol} unresolved status={resp.status.value} ({reason})",
+        )
+        return False
+
     async def _place_leg_order(
         self,
         instrument: InstrumentConfig,
@@ -494,6 +580,16 @@ class ATLStraddleScanner:
         if not leg.symbol or not leg.symboltoken:
             return False
         qty = max(1, int(lots)) * max(1, int(instrument.lot_size))
+
+        # Always route through the broker abstraction. The broker adapter
+        # (AngelOne or Kite) handles SmartAPI / KiteConnect specifics and
+        # the symbol-format translation. Falls back to legacy SmartAPI path
+        # only if no broker is configured (defensive — should not happen).
+        if self.broker is not None:
+            return await self._place_leg_order_via_broker(
+                instrument, leg, side, qty, reason
+            )
+
         try:
             self.client.ensure_authenticated()
             params = {

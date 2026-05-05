@@ -12,6 +12,25 @@ class Settings(BaseSettings):
     angelone_mpin: str = Field(default="", alias="ANGELONE_MPIN")
     angelone_totp_secret: str = Field(default="", alias="ANGELONE_TOTP_SECRET")
 
+    # Kite Connect (Zerodha) — alternate broker. Data still flows from
+    # AngelOne in both modes (Phase 1). Orders route to whichever broker
+    # is selected by TRADING_ACCOUNT ("angel" | "kite").
+    kite_api_key: str = Field(default="", alias="KITE_API_KEY")
+    kite_api_secret: str = Field(default="", alias="KITE_API_SECRET")
+    kite_access_token: str = Field(default="", alias="KITE_ACCESS_TOKEN")
+    kite_redirect_url: str = Field(
+        default="http://localhost:8000/api/auth/kite/callback",
+        alias="KITE_REDIRECT_URL",
+    )
+    # Canonical broker selection. Allowed values: "angel", "kite".
+    # Default "angel" preserves existing behavior.
+    trading_account: str = Field(default="angel", alias="TRADING_ACCOUNT")
+    # Legacy switch — still honored for backwards compatibility. If True
+    # and trading_account is left at default, behavior is equivalent to
+    # TRADING_ACCOUNT=kite.
+    use_kite_for_orders: bool = Field(default=False, alias="USE_KITE_FOR_ORDERS")
+    frontend_url: str = Field(default="http://localhost:3000", alias="FRONTEND_URL")
+
     # Database
     database_url: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5432/tradeai",

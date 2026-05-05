@@ -755,6 +755,100 @@ async def set_trading_mode(body: dict):
     return {"paper_trading": settings.paper_trading, "message": f"Switched to {mode.upper()} trading"}
 
 
+# ── Trading account selection (Angel vs Kite) ─────────────────────────────
+
+def _resolve_trading_account() -> str:
+    """Return canonical active trading account: 'angel' or 'kite'."""
+    ta = (getattr(settings, "trading_account", "angel") or "angel").strip().lower()
+    if ta not in ("angel", "kite"):
+        ta = "angel"
+    # Legacy compatibility: USE_KITE_FOR_ORDERS=true overrides default 'angel'.
+    if ta == "angel" and bool(getattr(settings, "use_kite_for_orders", False)):
+        ta = "kite"
+    return ta
+
+
+@app.get("/api/broker/trading-account")
+async def get_trading_account():
+    """Return the configured trading account and the broker actually active.
+
+    `selected` is what the user/config has set; `active` is the broker the
+    running orchestrator is using right now. They may differ until the
+    system is restarted after a change.
+    """
+    orch = _state.get("orchestrator")
+    broker = getattr(orch, "broker", None) if orch else None
+    selected = _resolve_trading_account()
+    active = None
+    if broker is not None:
+        active = "kite" if broker.__class__.__name__ == "KiteBroker" else "angel"
+    return {
+        "selected": selected,
+        "active": active,
+        "running": bool(getattr(orch, "running", False)) if orch else False,
+        "restart_required": active is not None and active != selected,
+        "trading_account_raw": getattr(settings, "trading_account", "angel"),
+        "use_kite_for_orders": bool(getattr(settings, "use_kite_for_orders", False)),
+    }
+
+
+@app.post("/api/broker/trading-account")
+async def set_trading_account(body: dict):
+    """Set the trading account ('angel' or 'kite'). Persists to .env.
+
+    Cannot be changed while the system is running. Takes effect on the
+    next system start (broker is constructed in Orchestrator.__init__).
+    """
+    import os
+    import re
+
+    account = (body.get("account") or "").strip().lower()
+    if account not in ("angel", "kite"):
+        raise HTTPException(status_code=400, detail="account must be 'angel' or 'kite'")
+
+    orch = _state.get("orchestrator")
+    if orch and getattr(orch, "running", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot change trading account while system is running. Stop the system first.",
+        )
+
+    env_path = os.path.abspath(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"
+    ))
+    content = ""
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+    # Write canonical TRADING_ACCOUNT and clear legacy USE_KITE_FOR_ORDERS
+    # so the two switches cannot disagree.
+    updates = {
+        "TRADING_ACCOUNT": account,
+        "USE_KITE_FOR_ORDERS": "true" if account == "kite" else "false",
+    }
+    for env_var, value in updates.items():
+        pattern = rf"^{re.escape(env_var)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, f"{env_var}={value}", content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\n{env_var}={value}\n"
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    # Reload in-memory settings
+    object.__setattr__(settings, "trading_account", account)
+    object.__setattr__(settings, "use_kite_for_orders", account == "kite")
+
+    logger.info("Trading account switched to: %s (restart required)", account.upper())
+    return {
+        "success": True,
+        "selected": account,
+        "message": f"Trading account set to {account.upper()}. Restart the system to activate.",
+    }
+
+
 
 @app.get("/api/strategy-settings/atl-straddle")
 async def get_atl_straddle_settings():
@@ -1427,6 +1521,271 @@ async def re_authenticate_broker():
     return {"success": False, "error": "Authentication failed — check logs for details"}
 
 
+# ── Kite (Zerodha) integration — used when AngelOne trading is blocked ─────
+
+@app.get("/api/broker/kite/status")
+async def get_kite_status():
+    """Return Kite broker config + auth health."""
+    orch = _state.get("orchestrator")
+    broker = getattr(orch, "broker", None) if orch else None
+    use_kite = bool(settings.use_kite_for_orders)
+    has_token = bool(settings.kite_access_token)
+    is_kite_active = use_kite and broker is not None and broker.__class__.__name__ == "KiteBroker"
+
+    authenticated = False
+    user_id = None
+    user_name = None
+    if is_kite_active and broker.client and has_token:
+        try:
+            broker.client.set_access_token(settings.kite_access_token)
+            profile = broker.client.get_profile() or {}
+            authenticated = bool(profile.get("user_id"))
+            user_id = profile.get("user_id")
+            user_name = profile.get("user_name")
+        except Exception as exc:
+            logger.warning("Kite profile check failed: %s", exc)
+
+    return {
+        "use_kite_for_orders": use_kite,
+        "trading_account": _resolve_trading_account(),
+        "active_broker": broker.name if broker else None,
+        "api_key_set": bool(settings.kite_api_key),
+        "api_secret_set": bool(settings.kite_api_secret),
+        "access_token_set": has_token,
+        "authenticated": authenticated,
+        "user_id": user_id,
+        "user_name": user_name,
+        "redirect_url": settings.kite_redirect_url,
+    }
+
+
+@app.get("/api/auth/kite/login-url")
+async def kite_login_url():
+    """Return the Kite Connect login URL for OAuth login.
+
+    User must visit this URL in a browser, log in to Zerodha, and the
+    callback (`/api/auth/kite/callback`) will exchange the request_token
+    for an access_token.
+    """
+    api_key = settings.kite_api_key
+    if not api_key:
+        return {"status": "error", "message": "KITE_API_KEY not configured"}
+    url = f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
+    return {"status": "ok", "login_url": url}
+
+
+@app.get("/api/auth/kite/callback")
+async def kite_oauth_callback(request_token: str = "", status: str = ""):
+    """Callback from Kite Connect login — exchanges request_token for access_token."""
+    from starlette.responses import RedirectResponse
+    import os
+    import re
+    import asyncio
+
+    frontend = settings.frontend_url
+
+    if not request_token or status != "success":
+        return RedirectResponse(url=f"{frontend}/?kite_auth_error=login_cancelled_or_failed")
+
+    api_key = settings.kite_api_key
+    api_secret = settings.kite_api_secret
+    if not api_key or not api_secret:
+        return RedirectResponse(url=f"{frontend}/?kite_auth_error=missing_credentials")
+
+    try:
+        from app.data.kite_client import KiteClient
+        kite = KiteClient(api_key=api_key)
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            None, lambda: kite.generate_session(request_token, api_secret)
+        )
+        access_token = data.get("access_token", "")
+        user_id = data.get("user_id", "")
+        if not access_token:
+            return RedirectResponse(url=f"{frontend}/?kite_auth_error=token_exchange_failed")
+
+        # Persist access token to .env so it survives restarts
+        env_path = os.path.abspath(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"
+        ))
+        content = ""
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        pattern = r"^KITE_ACCESS_TOKEN=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, f"KITE_ACCESS_TOKEN={access_token}", content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\nKITE_ACCESS_TOKEN={access_token}\n"
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        # Reload in-memory settings + reinit broker
+        object.__setattr__(settings, "kite_access_token", access_token)
+        orch = _state.get("orchestrator")
+        broker = getattr(orch, "broker", None) if orch else None
+        if broker is not None and broker.__class__.__name__ == "KiteBroker":
+            try:
+                broker.reload_credentials()
+                broker.authenticate()
+            except Exception:
+                logger.exception("KiteBroker reload after OAuth failed")
+
+        logger.info("Kite OAuth complete for user_id=%s", user_id)
+        return RedirectResponse(url=f"{frontend}/?kite_auth=success&user_id={user_id}")
+    except Exception as exc:
+        logger.exception("Kite OAuth callback failed")
+        return RedirectResponse(url=f"{frontend}/?kite_auth_error={str(exc)[:100]}")
+
+
+@app.post("/api/broker/kite/update-credentials")
+async def update_kite_credentials(body: dict):
+    """Update Kite credentials (api_key / api_secret) and the master switch.
+
+    Body fields (all optional, only provided ones are written):
+      - api_key, api_secret
+      - use_kite_for_orders: bool — flips the order-routing master switch
+      - access_token: bypass OAuth and set the token directly
+    """
+    import os
+    import re
+
+    orch = _state.get("orchestrator")
+    if orch and getattr(orch, "running", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot update credentials while system is running. Stop the system first.",
+        )
+
+    field_map = {
+        "api_key": "KITE_API_KEY",
+        "api_secret": "KITE_API_SECRET",
+        "access_token": "KITE_ACCESS_TOKEN",
+    }
+    updates: dict[str, str] = {}
+    for field, env_var in field_map.items():
+        value = (body.get(field) or "").strip()
+        if value:
+            updates[env_var] = value
+
+    if "use_kite_for_orders" in body:
+        updates["USE_KITE_FOR_ORDERS"] = "true" if body["use_kite_for_orders"] else "false"
+        # Keep canonical TRADING_ACCOUNT in lock-step with the legacy switch.
+        updates["TRADING_ACCOUNT"] = "kite" if body["use_kite_for_orders"] else "angel"
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided")
+
+    env_path = os.path.abspath(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"
+    ))
+    content = ""
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+    for env_var, value in updates.items():
+        pattern = rf"^{re.escape(env_var)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, f"{env_var}={value}", content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\n{env_var}={value}\n"
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    # Reload in-memory settings
+    for env_var, value in updates.items():
+        attr = env_var.lower()
+        if attr == "use_kite_for_orders":
+            object.__setattr__(settings, attr, value.lower() == "true")
+        elif attr == "trading_account":
+            object.__setattr__(settings, attr, value)
+        elif hasattr(settings, attr):
+            object.__setattr__(settings, attr, value)
+
+    return {
+        "success": True,
+        "updated_fields": list(updates.keys()),
+        "note": "Restart the system (stop → start) for use_kite_for_orders to swap brokers.",
+    }
+
+
+@app.get("/api/broker/kite/resolve-symbol")
+async def resolve_kite_symbol(
+    angel_symbol: str = "",
+    exchange: str = "NFO",
+    underlying: str = "",
+    expiry: str = "",        # ISO date YYYY-MM-DD
+    strike: float = 0,
+    option_type: str = "",   # CE or PE
+):
+    """Verify how an option contract maps to Kite's instrument master.
+
+    Two ways to query:
+      - by Angel-format symbol:   ?angel_symbol=NIFTY09APR2622500CE&exchange=NFO
+      - by structured fields:     ?underlying=SENSEX&expiry=2026-05-08&strike=80000&option_type=CE&exchange=BFO
+
+    Returns the resolved Kite tradingsymbol + instrument_token so you can
+    sanity-check before placing live orders.
+    """
+    orch = _state.get("orchestrator")
+    broker = getattr(orch, "broker", None) if orch else None
+    if broker is None or broker.__class__.__name__ != "KiteBroker":
+        return {"ok": False, "error": "Active broker is not Kite. Set USE_KITE_FOR_ORDERS=true and restart."}
+    return await asyncio.to_thread(
+        broker.resolve_symbol_debug,
+        angel_symbol, exchange, underlying, expiry, strike, option_type,
+    )
+
+
+@app.get("/api/broker/kite/instruments")
+async def list_kite_instruments(
+    exchange: str = "NFO",
+    name: str = "",
+    expiry: str = "",
+    option_type: str = "",
+    limit: int = 50,
+):
+    """List rows from Kite's instrument master, filtered for inspection.
+
+    Useful for verifying Kite's tradingsymbol format vs AngelOne's. Cached
+    once per IST trading day inside KiteClient so this is cheap.
+    """
+    orch = _state.get("orchestrator")
+    broker = getattr(orch, "broker", None) if orch else None
+    if broker is None or broker.__class__.__name__ != "KiteBroker" or broker.client is None:
+        return {"ok": False, "error": "Active broker is not Kite."}
+
+    def _fetch():
+        rows = broker.client.refresh_instruments(exchange=exchange, force=False) or []
+        out = []
+        name_u = (name or "").upper()
+        for inst in rows:
+            if name_u and (inst.get("name") or "").upper() != name_u:
+                continue
+            if option_type and inst.get("instrument_type") != option_type:
+                continue
+            if expiry and str(inst.get("expiry") or "") != expiry:
+                continue
+            out.append({
+                "tradingsymbol": inst.get("tradingsymbol"),
+                "instrument_token": inst.get("instrument_token"),
+                "name": inst.get("name"),
+                "expiry": str(inst.get("expiry") or ""),
+                "strike": inst.get("strike"),
+                "instrument_type": inst.get("instrument_type"),
+                "lot_size": inst.get("lot_size"),
+                "exchange": inst.get("exchange"),
+            })
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
+    rows = await asyncio.to_thread(_fetch)
+    return {"ok": True, "count": len(rows), "instruments": rows}
+
+
 @app.get("/api/positions")
 async def get_positions():
     """OptionSelling-style position book for primary account."""
@@ -1515,7 +1874,11 @@ async def get_positions():
 
 @app.post("/api/positions/exit")
 async def exit_positions(body: dict):
-    """Exit one or more open broker positions by placing opposite market orders."""
+    """Exit one or more open broker positions by placing opposite market orders.
+
+    Routes through the orchestrator's configured broker abstraction so the
+    correct broker (Angel or Kite) is used based on TRADING_ACCOUNT.
+    """
     if settings.paper_trading:
         return {"status": "ok", "exited": 0, "message": "Paper mode: broker exits skipped"}
 
@@ -1524,11 +1887,29 @@ async def exit_positions(body: dict):
         raise HTTPException(status_code=400, detail="positions is required")
 
     orch = _state.get("orchestrator")
-    client = orch.client if orch and hasattr(orch, "client") else None
-    if not client:
-        raise HTTPException(status_code=503, detail="Client not initialized")
+    broker = getattr(orch, "broker", None) if orch else None
+    if not broker:
+        raise HTTPException(status_code=503, detail="Broker not initialized")
 
-    client.ensure_authenticated()
+    # Lazy imports to avoid cycles at module load.
+    from app.execution.broker_base import (
+        OrderRequest,
+        OrderSide,
+        OrderStatus,
+        OrderType,
+        ProductType,
+    )
+
+    # Map persisted product strings to ProductType enum.
+    product_map = {
+        "INTRADAY": ProductType.INTRADAY,
+        "MIS": ProductType.INTRADAY,
+        "CARRYFORWARD": ProductType.CARRYFORWARD,
+        "NRML": ProductType.CARRYFORWARD,
+        "DELIVERY": ProductType.DELIVERY,
+        "CNC": ProductType.DELIVERY,
+    }
+
     exited = 0
     errors = []
     for it in items:
@@ -1536,31 +1917,36 @@ async def exit_positions(body: dict):
             symbol = str(it.get("tradingsymbol") or "")
             token = str(it.get("symboltoken") or "")
             exchange = str(it.get("exchange") or "NFO")
-            product = str(it.get("product") or "INTRADAY")
+            product = str(it.get("product") or "INTRADAY").upper()
             net_qty = int(it.get("net_qty") or 0)
-            if not symbol or not token or net_qty == 0:
+            if not symbol or net_qty == 0:
                 continue
-            side = "BUY" if net_qty < 0 else "SELL"
+            side = OrderSide.BUY if net_qty < 0 else OrderSide.SELL
             qty = abs(net_qty)
-            params = {
-                "variety": "NORMAL",
-                "tradingsymbol": symbol,
-                "symboltoken": token,
-                "transactiontype": side,
-                "exchange": exchange,
-                "ordertype": "MARKET",
-                "producttype": product,
-                "duration": "DAY",
-                "quantity": str(qty),
-                "price": "0",
-                "triggerprice": "0",
-            }
-            resp = client._smart_api.placeOrder(params)
-            ok = bool(resp and (resp.get("status") or resp.get("data")))
-            if ok:
+
+            # No InstrumentConfig is needed here — the broker adapter
+            # falls back to symbol-string resolution when `instrument` is
+            # None, and AngelOne does not reference it.
+            req = OrderRequest(
+                instrument=None,
+                trading_symbol=symbol,
+                symbol_token=token,
+                exchange=exchange,
+                side=side,
+                order_type=OrderType.MARKET,
+                product_type=product_map.get(product, ProductType.INTRADAY),
+                quantity=qty,
+                price=0.0,
+                trigger_price=0.0,
+            )
+            resp = await asyncio.to_thread(broker.place_order, req)
+            if resp and resp.status != OrderStatus.REJECTED:
                 exited += 1
             else:
-                errors.append({"symbol": symbol, "error": str(resp)})
+                errors.append({
+                    "symbol": symbol,
+                    "error": (resp.message if resp else "no response") or "rejected",
+                })
         except Exception as e:
             errors.append({"symbol": it.get("tradingsymbol"), "error": str(e)})
 

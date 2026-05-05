@@ -47,7 +47,7 @@ class OrderStatus(str, Enum):
 @dataclass
 class OrderRequest:
     """Order placement request."""
-    instrument: InstrumentConfig
+    instrument: Optional[InstrumentConfig]
     trading_symbol: str
     symbol_token: str
     exchange: str = "NFO"
@@ -57,6 +57,16 @@ class OrderRequest:
     quantity: int = 0
     price: float = 0.0            # For LIMIT orders
     trigger_price: float = 0.0    # For SL / SL-M orders
+    # ── Structured option fields (optional) ──────────────────────────
+    # When the caller already knows the option contract details, pass them
+    # here so cross-broker adapters (e.g. Kite) can look up the broker's
+    # native tradingsymbol / token by structured fields instead of parsing
+    # the AngelOne-format `trading_symbol` string. SENSEX/BFO uses a
+    # different format than NFO so string parsing is brittle.
+    underlying: Optional[str] = None       # e.g. "NIFTY", "SENSEX"
+    expiry_date: Optional[datetime] = None  # exchange-published expiry (date or datetime)
+    strike: Optional[float] = None
+    option_type: Optional[str] = None      # "CE" or "PE"
 
 
 @dataclass

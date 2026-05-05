@@ -41,6 +41,13 @@ from app.data.angelone_client import AngelOneClient
 from app.db.models import AsyncSessionLocal, IndexCandle
 from app.engine import scanner_exec_settings as exec_settings
 from app.engine.lot_sizer import compute_buy_option_lots
+from app.execution.broker_base import (
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    ProductType,
+)
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -143,6 +150,7 @@ class PDHPDLBreakoutScanner:
         self._active_trade: Optional[PDHPDLTrade] = None
         self._expiry: str = ""
         self._expiry_date: Optional[date] = None
+        self._expiry_skip_notified = False
 
     # ── Public API used by orchestrator ─────────────────────────────
 
@@ -154,6 +162,7 @@ class PDHPDLBreakoutScanner:
         self._prev_low = None
         self._signal_found_today = False
         self._active_trade = None
+        self._expiry_skip_notified = False
 
     def set_expiry(self, expiry: str, expiry_date: Optional[date] = None) -> None:
         self._expiry = expiry
@@ -201,6 +210,31 @@ class PDHPDLBreakoutScanner:
 
         # ── Already done for today ──────────────────────────────────
         if self._signal_found_today:
+            return
+
+        # ── Skip on options expiry day (weekly/monthly) ──────────────
+        # _expiry_date is sourced from the AngelOne instrument master via
+        # get_nearest_weekly_expiry() — it reflects the actual NSE-listed
+        # expiry contract date and is therefore holiday-adjusted. Both
+        # weekly and monthly expiries are covered (monthly = last weekly
+        # of the month, same date in the master).
+        if self._expiry_date and now.date() == self._expiry_date:
+            self._signal_found_today = True  # stop scanning for the day
+            if not self._expiry_skip_notified:
+                self._expiry_skip_notified = True
+                logger.info(
+                    "[PDHPDL] Day %s SKIPPED: options expiry day (expiry=%s)",
+                    self._today_str, self._expiry or self._expiry_date.isoformat(),
+                )
+                try:
+                    await self.alert_manager.telegram.send(
+                        f"📊 PDH/PDL — Day Skip\n"
+                        f"Date: {self._today_str}\n"
+                        f"Reason: Options expiry day ({self._expiry or self._expiry_date.isoformat()})\n"
+                        f"No trades today."
+                    )
+                except Exception:
+                    logger.exception("[PDHPDL] Failed to send expiry-skip Telegram")
             return
 
         # ── Setup check (one-shot, on first cycle of the day) ───────
@@ -338,7 +372,7 @@ class PDHPDLBreakoutScanner:
                 and lots > 0
             )
             if live_exec:
-                ok, oid = await self._place_entry_order(self._active_trade)
+                ok, oid = await self._place_entry_order(instrument, self._active_trade)
                 self._active_trade.entry_order_id = oid
                 self._active_trade.live_executed = bool(ok)
                 order_status = (
@@ -502,7 +536,7 @@ class PDHPDLBreakoutScanner:
 
         # ── LIVE EXIT ORDER ──────────────────────────────────────────
         if trade.live_executed and trade.lots > 0 and trade.symboltoken:
-            ok, oid = await self._place_exit_order(trade, reason=exit_reason)
+            ok, oid = await self._place_exit_order(instrument, trade, reason=exit_reason)
             trade.exit_order_id = oid
             if not ok:
                 logger.error("[PDHPDL] Exit order failed for %s reason=%s", trade.option_symbol, exit_reason)
@@ -575,7 +609,7 @@ class PDHPDLBreakoutScanner:
             await self._check_exit(df_today, instrument, now)
             if self._active_trade and not self._active_trade.exited:
                 if self._active_trade.live_executed and self._active_trade.lots > 0 and self._active_trade.symboltoken:
-                    ok, oid = await self._place_exit_order(self._active_trade, reason="eod_force")
+                    ok, oid = await self._place_exit_order(instrument, self._active_trade, reason="eod_force")
                     self._active_trade.exit_order_id = oid
                 self._active_trade.exited = True
                 self._active_trade.exit_reason = "eod_force"
@@ -589,24 +623,26 @@ class PDHPDLBreakoutScanner:
                 )
 
     # ── Live order helpers ──────────────────────────────────────────
-    async def _place_entry_order(self, trade: PDHPDLTrade) -> tuple[bool, str]:
+    async def _place_entry_order(
+        self, instrument: InstrumentConfig, trade: PDHPDLTrade,
+    ) -> tuple[bool, str]:
         qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
         return await self._place_order(
+            instrument=instrument,
+            trade=trade,
             side="BUY",
-            symbol=trade.option_symbol,
-            symboltoken=trade.symboltoken,
-            exchange=trade.exchange,
             quantity=qty,
             tag="pdhpdl_entry",
         )
 
-    async def _place_exit_order(self, trade: PDHPDLTrade, reason: str) -> tuple[bool, str]:
+    async def _place_exit_order(
+        self, instrument: InstrumentConfig, trade: PDHPDLTrade, reason: str,
+    ) -> tuple[bool, str]:
         qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
         return await self._place_order(
+            instrument=instrument,
+            trade=trade,
             side="SELL",
-            symbol=trade.option_symbol,
-            symboltoken=trade.symboltoken,
-            exchange=trade.exchange,
             quantity=qty,
             tag=f"pdhpdl_exit_{reason}",
         )
@@ -614,48 +650,59 @@ class PDHPDLBreakoutScanner:
     async def _place_order(
         self,
         *,
+        instrument: InstrumentConfig,
+        trade: PDHPDLTrade,
         side: str,
-        symbol: str,
-        symboltoken: str,
-        exchange: str,
         quantity: int,
         tag: str,
     ) -> tuple[bool, str]:
-        if not symbol or not symboltoken or quantity <= 0:
+        """Route order through the configured broker abstraction.
+
+        Works for both AngelOne and Kite. The Kite adapter resolves the
+        broker-native tradingsymbol from the structured option fields.
+        """
+        if not trade.option_symbol or quantity <= 0:
             return False, ""
+        if self.broker is None:
+            logger.error("[PDHPDL] No broker configured — cannot place %s order", side)
+            return False, ""
+        request = OrderRequest(
+            instrument=instrument,
+            trading_symbol=trade.option_symbol,
+            symbol_token=trade.symboltoken,
+            exchange=trade.exchange or "NFO",
+            side=OrderSide(side),
+            order_type=OrderType.MARKET,
+            product_type=ProductType.INTRADAY,
+            quantity=quantity,
+            price=0.0,
+            trigger_price=0.0,
+            underlying=instrument.option_symbol_prefix or instrument.symbol,
+            expiry_date=self._expiry_date,
+            strike=float(trade.strike_price or 0),
+            option_type=trade.side,  # 'CE' or 'PE'
+        )
         try:
-            self.client.ensure_authenticated()
-            params = {
-                "variety": "NORMAL",
-                "tradingsymbol": symbol,
-                "symboltoken": symboltoken,
-                "transactiontype": side,
-                "exchange": exchange or "NFO",
-                "ordertype": "MARKET",
-                "producttype": "INTRADAY",
-                "duration": "DAY",
-                "quantity": str(quantity),
-                "price": "0",
-                "triggerprice": "0",
-            }
-            resp = await asyncio.to_thread(self.client._smart_api.placeOrder, params)
-            order_id = ""
-            if isinstance(resp, str):
-                order_id = resp.strip()
-            elif isinstance(resp, dict):
-                data = resp.get("data") or {}
-                if isinstance(data, dict):
-                    order_id = str(data.get("orderid") or data.get("orderId") or "").strip()
-                if not order_id:
-                    order_id = str(resp.get("orderid") or resp.get("orderId") or "").strip()
-            if not order_id:
-                logger.error("[PDHPDL] Order placement returned no id (%s %s tag=%s) resp=%s", side, symbol, tag, resp)
-                return False, ""
-            logger.info("[PDHPDL] %s order placed %s qty=%d id=%s tag=%s", side, symbol, quantity, order_id, tag)
-            return True, order_id
+            resp = await asyncio.to_thread(self.broker.place_order, request)
         except Exception:
-            logger.exception("[PDHPDL] Order exception side=%s symbol=%s tag=%s", side, symbol, tag)
+            logger.exception(
+                "[PDHPDL] Broker order exception side=%s symbol=%s tag=%s",
+                side, trade.option_symbol, tag,
+            )
             return False, ""
+        if not resp or resp.status == OrderStatus.REJECTED:
+            msg = (resp.message if resp else "no response") or "rejected"
+            logger.error(
+                "[PDHPDL] Order rejected side=%s symbol=%s tag=%s msg=%s",
+                side, trade.option_symbol, tag, msg,
+            )
+            return False, getattr(resp, "order_id", "") or ""
+        order_id = resp.order_id or ""
+        logger.info(
+            "[PDHPDL] %s order placed via %s: %s qty=%d id=%s tag=%s",
+            side, self.broker.name, trade.option_symbol, quantity, order_id, tag,
+        )
+        return True, order_id
 
     # ── Helpers ─────────────────────────────────────────────────────
 
