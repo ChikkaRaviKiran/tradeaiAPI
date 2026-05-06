@@ -758,14 +758,21 @@ async def set_trading_mode(body: dict):
 # ── Trading account selection (Angel vs Kite) ─────────────────────────────
 
 def _resolve_trading_account() -> str:
-    """Return canonical active trading account: 'angel' or 'kite'."""
+    """Return canonical active trading account: 'angel', 'kite', or 'dhan'."""
     ta = (getattr(settings, "trading_account", "angel") or "angel").strip().lower()
-    if ta not in ("angel", "kite"):
+    if ta not in ("angel", "kite", "dhan"):
         ta = "angel"
     # Legacy compatibility: USE_KITE_FOR_ORDERS=true overrides default 'angel'.
     if ta == "angel" and bool(getattr(settings, "use_kite_for_orders", False)):
         ta = "kite"
     return ta
+
+
+_BROKER_NAME_TO_KEY = {
+    "KiteBroker": "kite",
+    "DhanBroker": "dhan",
+    "AngelOneBroker": "angel",
+}
 
 
 @app.get("/api/broker/trading-account")
@@ -781,7 +788,7 @@ async def get_trading_account():
     selected = _resolve_trading_account()
     active = None
     if broker is not None:
-        active = "kite" if broker.__class__.__name__ == "KiteBroker" else "angel"
+        active = _BROKER_NAME_TO_KEY.get(broker.__class__.__name__, "angel")
     return {
         "selected": selected,
         "active": active,
@@ -803,8 +810,10 @@ async def set_trading_account(body: dict):
     import re
 
     account = (body.get("account") or "").strip().lower()
-    if account not in ("angel", "kite"):
-        raise HTTPException(status_code=400, detail="account must be 'angel' or 'kite'")
+    if account not in ("angel", "kite", "dhan"):
+        raise HTTPException(
+            status_code=400, detail="account must be 'angel', 'kite', or 'dhan'"
+        )
 
     orch = _state.get("orchestrator")
     if orch and getattr(orch, "running", False):
@@ -822,7 +831,8 @@ async def set_trading_account(body: dict):
             content = f.read()
 
     # Write canonical TRADING_ACCOUNT and clear legacy USE_KITE_FOR_ORDERS
-    # so the two switches cannot disagree.
+    # so the two switches cannot disagree. USE_KITE_FOR_ORDERS is only
+    # 'true' when account==kite; for 'dhan' it must be cleared.
     updates = {
         "TRADING_ACCOUNT": account,
         "USE_KITE_FOR_ORDERS": "true" if account == "kite" else "false",
@@ -1784,6 +1794,215 @@ async def list_kite_instruments(
 
     rows = await asyncio.to_thread(_fetch)
     return {"ok": True, "count": len(rows), "instruments": rows}
+
+
+# ── Dhan integration — used when TRADING_ACCOUNT=dhan ─────────────────────
+
+@app.get("/api/broker/dhan/status")
+async def get_dhan_status():
+    """Return Dhan broker config + auth health."""
+    orch = _state.get("orchestrator")
+    broker = getattr(orch, "broker", None) if orch else None
+    selected = _resolve_trading_account()
+    is_dhan_active = (
+        broker is not None and broker.__class__.__name__ == "DhanBroker"
+    )
+
+    authenticated = False
+    available_balance = None
+    error = None
+    if is_dhan_active and getattr(broker, "client", None):
+        try:
+            data = await asyncio.to_thread(broker.client.get_fund_limits)
+            if data:
+                authenticated = True
+                available_balance = (
+                    data.get("availabelBalance")
+                    or data.get("availableBalance")
+                    or data.get("withdrawableBalance")
+                )
+            else:
+                error = "Fund limits returned empty (token may be invalid/expired)"
+        except Exception as exc:
+            error = str(exc)
+
+    return {
+        "trading_account": selected,
+        "active_broker": broker.name if broker else None,
+        "client_id_set": bool(settings.dhan_client_id),
+        "access_token_set": bool(settings.dhan_access_token),
+        "authenticated": authenticated,
+        "available_balance": available_balance,
+        "error": error,
+        "client_id": (
+            settings.dhan_client_id[:4] + "***" if settings.dhan_client_id else None
+        ),
+    }
+
+
+@app.post("/api/broker/dhan/test")
+async def test_dhan_connection():
+    """Test Dhan authentication with current credentials.
+
+    Builds a fresh DhanClient from settings (does not require the
+    orchestrator to be running) and pings the fund-limits endpoint.
+    """
+    if not settings.dhan_client_id:
+        return {"success": False, "error": "DHAN_CLIENT_ID is not configured"}
+    if not settings.dhan_access_token:
+        return {"success": False, "error": "DHAN_ACCESS_TOKEN is not configured"}
+    try:
+        from app.data.dhan_client import DhanClient
+        client = DhanClient(
+            client_id=settings.dhan_client_id,
+            access_token=settings.dhan_access_token,
+        )
+        data = await asyncio.to_thread(client.get_fund_limits)
+        if not data:
+            return {
+                "success": False,
+                "error": "Empty response from Dhan fund-limits (token expired?)",
+            }
+        return {
+            "success": True,
+            "message": "Authentication successful",
+            "available_balance": (
+                data.get("availabelBalance")
+                or data.get("availableBalance")
+                or data.get("withdrawableBalance")
+            ),
+            "client_id": settings.dhan_client_id[:4] + "***",
+        }
+    except Exception as exc:
+        logger.exception("Dhan test connection failed")
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/broker/dhan/update-credentials")
+async def update_dhan_credentials(body: dict):
+    """Update Dhan credentials (client_id / access_token) and master switch.
+
+    Body fields (all optional, only provided ones written):
+      - client_id, access_token
+      - activate: bool — when true, sets TRADING_ACCOUNT=dhan
+    """
+    import os
+    import re
+
+    orch = _state.get("orchestrator")
+    if orch and getattr(orch, "running", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot update credentials while system is running. "
+                   "Stop the system first.",
+        )
+
+    field_map = {
+        "client_id": "DHAN_CLIENT_ID",
+        "access_token": "DHAN_ACCESS_TOKEN",
+        "partner_id": "DHAN_PARTNER_ID",
+        "partner_secret": "DHAN_PARTNER_SECRET",
+    }
+    updates: dict[str, str] = {}
+    for field, env_var in field_map.items():
+        value = (body.get(field) or "").strip()
+        if value:
+            updates[env_var] = value
+
+    if body.get("activate"):
+        updates["TRADING_ACCOUNT"] = "dhan"
+        updates["USE_KITE_FOR_ORDERS"] = "false"
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided")
+
+    env_path = os.path.abspath(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"
+    ))
+    content = ""
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+    for env_var, value in updates.items():
+        pattern = rf"^{re.escape(env_var)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, f"{env_var}={value}", content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\n{env_var}={value}\n"
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    # Reload in-memory settings
+    for env_var, value in updates.items():
+        attr = env_var.lower()
+        if attr == "use_kite_for_orders":
+            object.__setattr__(settings, attr, value.lower() == "true")
+        elif hasattr(settings, attr):
+            object.__setattr__(settings, attr, value)
+
+    # If Dhan broker is already constructed, reload its credentials so the
+    # new access token takes effect immediately (token rotation).
+    broker = getattr(orch, "broker", None) if orch else None
+    if broker is not None and broker.__class__.__name__ == "DhanBroker":
+        try:
+            broker.reload_credentials()
+        except Exception:
+            logger.exception("DhanBroker reload after credential update failed")
+
+    return {
+        "success": True,
+        "updated_fields": list(updates.keys()),
+        "note": (
+            "Restart the system for TRADING_ACCOUNT change to take effect."
+            if "TRADING_ACCOUNT" in updates else
+            "Credentials reloaded."
+        ),
+    }
+
+
+@app.get("/api/broker/dhan/resolve-symbol")
+async def resolve_dhan_symbol(
+    angel_symbol: str = "",
+    exchange: str = "NFO",
+    underlying: str = "",
+    expiry: str = "",        # ISO date YYYY-MM-DD
+    strike: float = 0,
+    option_type: str = "",   # CE or PE
+):
+    """Verify how an option contract maps to Dhan's scrip master.
+
+    Two ways to query:
+      - by Angel-format symbol:   ?angel_symbol=NIFTY09APR2622500CE&exchange=NFO
+      - by structured fields:     ?underlying=SENSEX&expiry=2026-05-08&strike=80000&option_type=CE&exchange=BFO
+    """
+    orch = _state.get("orchestrator")
+    broker = getattr(orch, "broker", None) if orch else None
+    if broker is None or broker.__class__.__name__ != "DhanBroker":
+        return {
+            "ok": False,
+            "error": "Active broker is not Dhan. Set TRADING_ACCOUNT=dhan and restart.",
+        }
+    return await asyncio.to_thread(
+        broker.resolve_symbol_debug,
+        angel_symbol, exchange, underlying, expiry, strike, option_type,
+    )
+
+
+@app.post("/api/broker/dhan/refresh-instruments")
+async def refresh_dhan_instruments():
+    """Force a re-download of the Dhan scrip master CSV."""
+    orch = _state.get("orchestrator")
+    broker = getattr(orch, "broker", None) if orch else None
+    if (
+        broker is None
+        or broker.__class__.__name__ != "DhanBroker"
+        or broker.client is None
+    ):
+        return {"ok": False, "error": "Active broker is not Dhan."}
+    count = await asyncio.to_thread(broker.client.refresh_scrip_master, True)
+    return {"ok": True, "instruments_loaded": count}
 
 
 @app.get("/api/positions")

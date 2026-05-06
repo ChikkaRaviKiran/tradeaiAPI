@@ -22,13 +22,21 @@ class Settings(BaseSettings):
         default="http://localhost:8000/api/auth/kite/callback",
         alias="KITE_REDIRECT_URL",
     )
-    # Canonical broker selection. Allowed values: "angel", "kite".
+    # Canonical broker selection. Allowed values: "angel", "kite", "dhan".
     # Default "angel" preserves existing behavior.
     trading_account: str = Field(default="angel", alias="TRADING_ACCOUNT")
     # Legacy switch — still honored for backwards compatibility. If True
     # and trading_account is left at default, behavior is equivalent to
     # TRADING_ACCOUNT=kite.
     use_kite_for_orders: bool = Field(default=False, alias="USE_KITE_FOR_ORDERS")
+
+    # DhanHQ trading (alternate broker — order routing only). Data still
+    # flows from AngelOne. Activated when TRADING_ACCOUNT=dhan.
+    # `dhan_access_token` and `dhan_client_id` already defined below for
+    # the expired-options data fetcher; the same credentials are reused
+    # for order placement.
+    dhan_partner_id: str = Field(default="", alias="DHAN_PARTNER_ID")
+    dhan_partner_secret: str = Field(default="", alias="DHAN_PARTNER_SECRET")
     frontend_url: str = Field(default="http://localhost:3000", alias="FRONTEND_URL")
 
     # Database

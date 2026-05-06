@@ -81,6 +81,7 @@ from app.engine.atl_straddle_scanner import ATLStraddleScanner
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
 from app.execution.kite_broker import KiteBroker
+from app.execution.dhan_broker import DhanBroker
 from app.execution.broker_base import BaseBroker, OrderRequest, OrderSide, OrderType, ProductType
 
 logger = logging.getLogger(__name__)
@@ -248,13 +249,16 @@ class Orchestrator:
         self.risk_manager = RiskManager()
         self.paper_trader = PaperTradingEngine()
         self.smart_exit = SmartExitEngine()  # V1 smart exit engine
-        # Broker selection: chosen by TRADING_ACCOUNT ("angel" | "kite").
+        # Broker selection: chosen by TRADING_ACCOUNT ("angel" | "kite" | "dhan").
         # Legacy USE_KITE_FOR_ORDERS=true still selects Kite when
         # TRADING_ACCOUNT is left at default "angel". Data still flows
-        # from AngelOne in both modes (Phase 1).
+        # from AngelOne in all modes (Phase 1).
         _ta = (settings.trading_account or "angel").strip().lower()
-        _use_kite = _ta == "kite" or (_ta == "angel" and settings.use_kite_for_orders)
-        self.broker: BaseBroker = KiteBroker() if _use_kite else AngelOneBroker()
+        if _ta == "dhan":
+            self.broker: BaseBroker = DhanBroker()
+        else:
+            _use_kite = _ta == "kite" or (_ta == "angel" and settings.use_kite_for_orders)
+            self.broker = KiteBroker() if _use_kite else AngelOneBroker()
         logger.info(
             "Order broker: %s (trading_account=%s, paper=%s)",
             self.broker.name, _ta, settings.paper_trading,

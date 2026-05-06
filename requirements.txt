@@ -21,6 +21,9 @@ websocket-client==1.7.0
 # Kite Connect (Zerodha) — used when AngelOne account is blocked / USE_KITE_FOR_ORDERS=true
 kiteconnect==5.1.0
 
+# DhanHQ — used when TRADING_ACCOUNT=dhan (order routing only; data still from AngelOne)
+dhanhq==2.1.0
+
 # Database
 sqlalchemy==2.0.48
 asyncpg==0.31.0
