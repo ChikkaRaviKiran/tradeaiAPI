@@ -12,33 +12,6 @@ class Settings(BaseSettings):
     angelone_mpin: str = Field(default="", alias="ANGELONE_MPIN")
     angelone_totp_secret: str = Field(default="", alias="ANGELONE_TOTP_SECRET")
 
-    # Kite Connect (Zerodha) — alternate broker. Data still flows from
-    # AngelOne in both modes (Phase 1). Orders route to whichever broker
-    # is selected by TRADING_ACCOUNT ("angel" | "kite").
-    kite_api_key: str = Field(default="", alias="KITE_API_KEY")
-    kite_api_secret: str = Field(default="", alias="KITE_API_SECRET")
-    kite_access_token: str = Field(default="", alias="KITE_ACCESS_TOKEN")
-    kite_redirect_url: str = Field(
-        default="http://localhost:8000/api/auth/kite/callback",
-        alias="KITE_REDIRECT_URL",
-    )
-    # Canonical broker selection. Allowed values: "angel", "kite", "dhan".
-    # Default "angel" preserves existing behavior.
-    trading_account: str = Field(default="angel", alias="TRADING_ACCOUNT")
-    # Legacy switch — still honored for backwards compatibility. If True
-    # and trading_account is left at default, behavior is equivalent to
-    # TRADING_ACCOUNT=kite.
-    use_kite_for_orders: bool = Field(default=False, alias="USE_KITE_FOR_ORDERS")
-
-    # DhanHQ trading (alternate broker — order routing only). Data still
-    # flows from AngelOne. Activated when TRADING_ACCOUNT=dhan.
-    # `dhan_access_token` and `dhan_client_id` already defined below for
-    # the expired-options data fetcher; the same credentials are reused
-    # for order placement.
-    dhan_partner_id: str = Field(default="", alias="DHAN_PARTNER_ID")
-    dhan_partner_secret: str = Field(default="", alias="DHAN_PARTNER_SECRET")
-    frontend_url: str = Field(default="http://localhost:3000", alias="FRONTEND_URL")
-
     # Database
     database_url: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5432/tradeai",
@@ -56,33 +29,15 @@ class Settings(BaseSettings):
     ai_gpt_scanner_enabled: bool = Field(default=False, alias="AI_GPT_SCANNER_ENABLED")
     ai_gpt_scanner_model: str = Field(default="gpt-5", alias="AI_GPT_SCANNER_MODEL")
 
-    # Config-P scanner (legacy scanner; default OFF)
-    config_p_scanner_enabled: bool = Field(default=False, alias="CONFIG_P_SCANNER_ENABLED")
-
     # NR5 Breakout Scanner (volatility contraction → expansion, paper-only)
     # Backtest: N=23 trades, WR=43.5%, PF=3.21 over 131 days. Bidirectional.
     # Honoured 3-way mutex with Config-P / Move-Det.
-    nr5_scanner_enabled: bool = Field(default=False, alias="NR5_SCANNER_ENABLED")
+    nr5_scanner_enabled: bool = Field(default=True, alias="NR5_SCANNER_ENABLED")
 
     # PDH/PDL Breakout Scanner (previous day high/low breakout, paper-only)
     # Backtest: N=121 trades, Spot WR ~64% PF 1.45, Opt WR 72.7% Opt PF 4.86
     # over 131 days. Stop=15 pts, Target=60 pts (R:R 1:4). Mutex w/ peers.
     pdh_pdl_scanner_enabled: bool = Field(default=True, alias="PDH_PDL_SCANNER_ENABLED")
-
-    # 14:30 Liquidity-Vacuum Scanner (afternoon coil break, paper-only)
-    # Backtest: N=18 trades, Opt WR 66.7%, Opt PF 5.80, +178 pts/lot over
-    # 131 days. Coil < 60% avg | Premium SL -25% TGT +40% | Time exit 14:55.
-    vacuum_scanner_enabled: bool = Field(default=False, alias="VACUUM_SCANNER_ENABLED")
-
-    # Range Breakout Scanner (09:45-10:30 consolidation → breakout, paper-only)
-    # Backtest (Option C): N=41 trades, WR=68.3%, PF=3.52, Max DD ₹9,823/lot
-    # ADX<20 | RSI 58/42 | Body≥0.45 | MinPremium≥80 | SL=15% | T1=+15% | T2=+30%
-    range_breakout_scanner_enabled: bool = Field(default=False, alias="RANGE_BREAKOUT_SCANNER_ENABLED")
-
-    # Scanner concurrency control
-    # True: all scanners can open/manage trades independently (no peer mutex)
-    # False: legacy mutex mode (only one scanner trade at a time)
-    scanners_allow_concurrent: bool = Field(default=True, alias="SCANNERS_ALLOW_CONCURRENT")
 
     # DhanHQ (expired options data only)
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
@@ -104,10 +59,8 @@ class Settings(BaseSettings):
     max_trades_per_day: int = Field(default=3, alias="MAX_TRADES_PER_DAY")  # LOCKED v1.0
     max_daily_loss_pct: float = Field(default=3.0, alias="MAX_DAILY_LOSS_PCT")
     risk_per_trade_pct: float = Field(default=1.0, alias="RISK_PER_TRADE_PCT")
-    # Paper-trading observation mode: limits raised so we can see every strategy fire.
-    # Lower these (e.g. 2 / 1) before going live.
-    max_concurrent_positions: int = Field(default=30, alias="MAX_CONCURRENT_POSITIONS")  # Total across all instruments
-    max_concurrent_per_instrument: int = Field(default=10, alias="MAX_CONCURRENT_PER_INSTRUMENT")  # Per-index limit
+    max_concurrent_positions: int = Field(default=2, alias="MAX_CONCURRENT_POSITIONS")  # Total across all instruments
+    max_concurrent_per_instrument: int = Field(default=1, alias="MAX_CONCURRENT_PER_INSTRUMENT")  # Per-index limit
     consecutive_loss_limit: int = Field(default=3, alias="CONSECUTIVE_LOSS_LIMIT")
     nifty_lot_size: int = Field(default=65, alias="NIFTY_LOT_SIZE")
 
@@ -129,13 +82,6 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
     min_margin_required: float = Field(default=5000, alias="MIN_MARGIN_REQUIRED")
-
-    # Move Detection live execution + dynamic sizing
-    move_det_live_execution: bool = Field(default=False, alias="MOVE_DET_LIVE_EXECUTION")
-    move_det_max_funds: float = Field(default=150000.0, alias="MOVE_DET_MAX_FUNDS")  # ₹ allocation cap; 0 = use full available
-    move_det_funds_buffer_pct: float = Field(default=5.0, alias="MOVE_DET_FUNDS_BUFFER_PCT")  # safety margin %
-    move_det_max_lots: int = Field(default=20, alias="MOVE_DET_MAX_LOTS")  # hard cap
-    move_det_priority_over_atl: bool = Field(default=True, alias="MOVE_DET_PRIORITY_OVER_ATL")
 
     # Dual-Engine Control
     v1_enabled: bool = Field(default=True, alias="V1_ENABLED")

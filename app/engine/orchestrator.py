@@ -74,15 +74,10 @@ from app.engine.move_detection_scanner import MoveDetectionScanner
 from app.engine.ai_gpt_scanner import AIGPTScanner
 from app.engine.nr5_breakout_scanner import NR5BreakoutScanner
 from app.engine.pdh_pdl_scanner import PDHPDLBreakoutScanner
-from app.engine.vacuum_1430_scanner import VacuumBreakoutScanner
 from app.ai.ai_gpt_pipeline import AIGPTPipeline
-from app.engine.range_breakout_scanner import RangeBreakoutScanner
-from app.engine.atl_straddle_scanner import ATLStraddleScanner
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
-from app.execution.kite_broker import KiteBroker
-from app.execution.dhan_broker import DhanBroker
-from app.execution.broker_base import BaseBroker, OrderRequest, OrderSide, OrderType, ProductType
+from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
 
 logger = logging.getLogger(__name__)
 
@@ -249,20 +244,7 @@ class Orchestrator:
         self.risk_manager = RiskManager()
         self.paper_trader = PaperTradingEngine()
         self.smart_exit = SmartExitEngine()  # V1 smart exit engine
-        # Broker selection: chosen by TRADING_ACCOUNT ("angel" | "kite" | "dhan").
-        # Legacy USE_KITE_FOR_ORDERS=true still selects Kite when
-        # TRADING_ACCOUNT is left at default "angel". Data still flows
-        # from AngelOne in all modes (Phase 1).
-        _ta = (settings.trading_account or "angel").strip().lower()
-        if _ta == "dhan":
-            self.broker: BaseBroker = DhanBroker()
-        else:
-            _use_kite = _ta == "kite" or (_ta == "angel" and settings.use_kite_for_orders)
-            self.broker = KiteBroker() if _use_kite else AngelOneBroker()
-        logger.info(
-            "Order broker: %s (trading_account=%s, paper=%s)",
-            self.broker.name, _ta, settings.paper_trading,
-        )
+        self.broker = AngelOneBroker()
         self.trade_logger = TradeLogger()
         self.history_logger = HistoryLogger()
         self.alert_manager = AlertManager()
@@ -279,15 +261,12 @@ class Orchestrator:
             feature_engine=self.feature_engine,
             alert_manager=self.alert_manager,
         )
-        if not settings.config_p_scanner_enabled:
-            logger.info("[ConfigP] Scanner disabled via config (CONFIG_P_SCANNER_ENABLED=false)")
 
         # ── Move Detection Scanner (Production v2 AGGRESSIVE, scan_all_moves based) ──
         self.move_detection_scanner = MoveDetectionScanner(
             client=self.client,
             feature_engine=self.feature_engine,
             alert_manager=self.alert_manager,
-            broker=self.broker,
         )
 
         # ── AI-GPT Scanner (3-stage GPT pipeline, 5-min cadence) ──
@@ -324,37 +303,13 @@ class Orchestrator:
         if not settings.nr5_scanner_enabled:
             logger.info("[NR5] Scanner disabled via config (NR5_SCANNER_ENABLED=false)")
 
-        # ── PDH/PDL Breakout Scanner (prev-day H/L breakout) ──
+        # ── PDH/PDL Breakout Scanner (prev-day H/L breakout, PAPER-ONLY) ──
         self.pdh_pdl_scanner = PDHPDLBreakoutScanner(
             client=self.client,
             alert_manager=self.alert_manager,
-            broker=self.broker,
         )
         if not settings.pdh_pdl_scanner_enabled:
             logger.info("[PDHPDL] Scanner disabled via config (PDH_PDL_SCANNER_ENABLED=false)")
-
-        # ── 14:30 Liquidity-Vacuum Scanner (afternoon coil break, PAPER-ONLY) ──
-        self.vacuum_scanner = VacuumBreakoutScanner(
-            client=self.client,
-            alert_manager=self.alert_manager,
-        )
-        if not settings.vacuum_scanner_enabled:
-            logger.info("[VACUUM] Scanner disabled via config (VACUUM_SCANNER_ENABLED=false)")
-
-        # ── Range Breakout Scanner (09:45-10:30 consolidation, PAPER-ONLY) ──
-        self.range_breakout_scanner = RangeBreakoutScanner(
-            client=self.client,
-            alert_manager=self.alert_manager,
-        )
-        if not settings.range_breakout_scanner_enabled:
-            logger.info("[RB] Scanner disabled via config (RANGE_BREAKOUT_SCANNER_ENABLED=false)")
-
-        # ── ATL Straddle Scanner (OptionSelling-style paper engine) ──
-        self.atl_straddle_scanner = ATLStraddleScanner(
-            client=self.client,
-            alert_manager=self.alert_manager,
-            broker=self.broker,
-        )
 
         # Strategy selector — picks best strategies based on condition-performance data
         from app.engine.strategy_selector import StrategySelector
@@ -405,8 +360,6 @@ class Orchestrator:
         self._traded_strikes_today: set[tuple[str, float, str]] = {}
         # Daily SL circuit breaker: stop after 2 consecutive SL hits per symbol
         self._daily_sl_hit: dict[str, int] = {}  # {symbol: count of SL hits today}
-        # Broker EOD snapshot capture guard
-        self._eod_broker_snapshot_done: bool = False
         # ORB trade limit: max 1 ORB per day per instrument (avoid doubling down)
         self._orb_trades_today: dict[str, int] = {}  # {symbol: count of ORB trades today}
         # No Trade Day guard: if no signal > 55 by 11:30, skip rest of day
@@ -527,7 +480,6 @@ class Orchestrator:
         self._sl_cooldowns = {}
         self._traded_strikes_today = set()
         self._daily_sl_hit = {}
-        self._eod_broker_snapshot_done = False
         self._orb_trades_today = {}
         self._no_trade_day = {}
         self._best_score_today = {}
@@ -555,12 +507,6 @@ class Orchestrator:
         self.nr5_scanner.reset_daily()
         # Reset PDH/PDL scanner daily state
         self.pdh_pdl_scanner.reset_daily()
-        # Reset 14:30 Vacuum scanner daily state
-        self.vacuum_scanner.reset_daily()
-        # Reset Range Breakout scanner daily state
-        self.range_breakout_scanner.reset_daily()
-        # Reset ATL scanner daily state
-        self.atl_straddle_scanner.reset_daily()
         self.running = False
         logger.info("Daily state reset complete")
 
@@ -642,10 +588,6 @@ class Orchestrator:
         self.ai_gpt_scanner.reset_daily()
         self.nr5_scanner.reset_daily()
         self.pdh_pdl_scanner.reset_daily()
-        self.vacuum_scanner.reset_daily()
-        self.range_breakout_scanner.reset_daily()
-        self.atl_straddle_scanner.reset_daily()
-        self._eod_broker_snapshot_done = False
 
         self.running = True
 
@@ -717,10 +659,7 @@ class Orchestrator:
                 self.ai_gpt_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.nr5_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.pdh_pdl_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                self.vacuum_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                self.range_breakout_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                self.atl_straddle_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                logger.info("[ConfigP+MoveDet+AIGPT+NR5+PDHPDL+VACUUM+RB] Expiry set: %s", nifty_expiry)
+                logger.info("[ConfigP+MoveDet+AIGPT+NR5+PDHPDL] Expiry set: %s", nifty_expiry)
         except Exception:
             logger.exception("Failed to determine expiries — options data may be unavailable")
             self._log_event("setup", "Expiry discovery FAILED — continuing without options")
@@ -769,17 +708,13 @@ class Orchestrator:
         # Authenticate broker for live trading
         if not settings.paper_trading:
             if self.broker.authenticate():
-                logger.info("%s broker authenticated for live trading", self.broker.name)
+                logger.info("AngelOneBroker authenticated for live trading")
             else:
-                logger.error(
-                    "%s auth failed — falling back to paper trading for safety",
-                    self.broker.name,
-                )
+                logger.error("AngelOneBroker auth failed — falling back to paper trading for safety")
                 await self.alert_manager.send_info(
                     "BROKER AUTH FAILED",
-                    f"Live broker ({self.broker.name}) authentication failed. "
-                    f"System will NOT place real orders today.\n"
-                    f"Paper trading mode active as safety fallback.",
+                    "Live broker authentication failed. System will NOT place real orders today.\n"
+                    "Paper trading mode active as safety fallback.",
                 )
 
         # ── Pre-market intelligence: AI analysis of all data sources ─────
@@ -906,14 +841,6 @@ class Orchestrator:
             # Pre-close: close open trades
             if PRE_CLOSE <= current_time < MARKET_CLOSE:
                 await self._close_all_trades()
-                if not self._eod_broker_snapshot_done:
-                    try:
-                        from app.api.routes import capture_eod_broker_snapshot
-                        snap_result = await capture_eod_broker_snapshot()
-                        logger.info("EOD broker snapshot: %s", snap_result)
-                    except Exception:
-                        logger.exception("EOD broker snapshot capture failed")
-                    self._eod_broker_snapshot_done = True
                 await asyncio.sleep(60)
                 continue
 
@@ -1529,83 +1456,29 @@ class Orchestrator:
             # trade at any given time. Each is told whether ANY peer is
             # currently in a trade so it can skip new entries.
             if symbol == "NIFTY":
-                cp_in_trade = self.config_p_scanner.is_in_trade() if settings.config_p_scanner_enabled else False
+                cp_in_trade = self.config_p_scanner.is_in_trade()
                 md_in_trade = self.move_detection_scanner.is_in_trade()
                 nr5_in_trade = self.nr5_scanner.is_in_trade()
                 pdh_in_trade = self.pdh_pdl_scanner.is_in_trade()
-                vac_in_trade = self.vacuum_scanner.is_in_trade()
-                rb_in_trade = self.range_breakout_scanner.is_in_trade()
-                allow_concurrent = settings.scanners_allow_concurrent
-                if settings.config_p_scanner_enabled:
-                    await self.config_p_scanner.run_cycle(
-                        df_today, instrument, cycle,
-                        peer_in_trade=(False if allow_concurrent else (md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
-                    )
+                await self.config_p_scanner.run_cycle(
+                    df_today, instrument, cycle,
+                    peer_in_trade=(md_in_trade or nr5_in_trade or pdh_in_trade),
+                )
                 await self.move_detection_scanner.run_cycle(
                     df_today, instrument, cycle,
-                    peer_in_trade=(False if allow_concurrent else (cp_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
+                    peer_in_trade=(cp_in_trade or nr5_in_trade or pdh_in_trade),
                 )
-                # ── Priority handover: MoveDet wins over ATL ──
-                # If MoveDet just entered a trade and ATL was holding
-                # positions, force-close ATL immediately so MoveDet has
-                # full account focus. Skip ATL run for this cycle.
-                md_just_entered = (not md_in_trade) and self.move_detection_scanner.is_in_trade()
-                atl_preempted = False
-                if (
-                    settings.move_det_priority_over_atl
-                    and md_just_entered
-                    and self.atl_straddle_scanner.is_in_trade()
-                ):
-                    logger.warning(
-                        "[Priority] MoveDet signal detected — force-closing ATL to hand over control"
-                    )
-                    self._log_event(
-                        "priority_handover",
-                        "MoveDet entered → force-closing ATL",
-                        cycle=cycle, instrument=symbol,
-                    )
-                    try:
-                        await self.atl_straddle_scanner.force_close(df_today, instrument)
-                    except Exception:
-                        logger.exception("[Priority] ATL force_close failed")
-                    atl_preempted = True
-                    try:
-                        await self.alert_manager.telegram.send(
-                            "⚡ PRIORITY HANDOVER\n"
-                            "MoveDet found a signal — closing ATL straddle and prioritising MoveDet entry."
-                        )
-                    except Exception:
-                        pass
-                # Refresh MoveDet trade flag so downstream scanners respect it
-                md_in_trade = self.move_detection_scanner.is_in_trade()
                 if settings.nr5_scanner_enabled:
                     await self.nr5_scanner.run_cycle(
                         df_today, instrument, cycle,
-                        peer_in_trade=(False if allow_concurrent else (cp_in_trade or md_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
+                        peer_in_trade=(cp_in_trade or md_in_trade or pdh_in_trade),
                     )
                 if settings.pdh_pdl_scanner_enabled:
                     await self.pdh_pdl_scanner.run_cycle(
                         df_today, instrument, cycle,
-                        peer_in_trade=(False if allow_concurrent else (cp_in_trade or md_in_trade or nr5_in_trade or vac_in_trade or rb_in_trade)),
+                        peer_in_trade=(cp_in_trade or md_in_trade or nr5_in_trade),
                     )
-                if settings.vacuum_scanner_enabled:
-                    await self.vacuum_scanner.run_cycle(
-                        df_today, instrument, cycle,
-                        peer_in_trade=(False if allow_concurrent else (cp_in_trade or md_in_trade or nr5_in_trade or pdh_in_trade or rb_in_trade)),
-                    )
-                if settings.range_breakout_scanner_enabled:
-                    await self.range_breakout_scanner.run_cycle(
-                        df_today, instrument, cycle,
-                        peer_in_trade=(False if allow_concurrent else (cp_in_trade or md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade)),
-                    )
-                await self.atl_straddle_scanner.run_cycle(
-                    df_today,
-                    instrument,
-                    cycle,
-                    peer_in_trade=(False if allow_concurrent else (atl_preempted or cp_in_trade or md_in_trade or nr5_in_trade or pdh_in_trade or vac_in_trade or rb_in_trade)),
-                )
-                if settings.ai_gpt_scanner_enabled:
-                    await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
+                await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
             return
 
             # 8. Time-of-day circuit breaker — no new entries after cutoff
@@ -2448,14 +2321,6 @@ class Orchestrator:
             quantity=trade.lot_size,
             price=0.0,
             trigger_price=0.0,
-            # Structured fields used by KiteBroker to look up the contract in
-            # the Kite instrument master directly (Kite tradingsymbols and
-            # tokens differ from AngelOne, especially for SENSEX/BFO).
-            underlying=instrument.option_symbol_prefix or instrument.symbol,
-            expiry_date=self._expiry_dates.get(instrument.symbol),
-            strike=float(trade.strike) if trade.strike else None,
-            option_type=("CE" if trade.option_type.value.upper().startswith("C") else "PE")
-                if trade.option_type else None,
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)
@@ -2562,11 +2427,6 @@ class Orchestrator:
             quantity=trade.lot_size,
             price=0.0,
             trigger_price=0.0,
-            underlying=instrument.option_symbol_prefix or instrument.symbol,
-            expiry_date=self._expiry_dates.get(instrument.symbol),
-            strike=float(trade.strike) if trade.strike else None,
-            option_type=("CE" if trade.option_type.value.upper().startswith("C") else "PE")
-                if trade.option_type else None,
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)
@@ -3213,8 +3073,6 @@ class Orchestrator:
         await self.nr5_scanner.force_close(nifty_df, _NIFTY_INST)
         # Close PDH/PDL Breakout scanner trade
         await self.pdh_pdl_scanner.force_close(nifty_df, _NIFTY_INST)
-        # Close ATL Straddle scanner trade
-        await self.atl_straddle_scanner.force_close(nifty_df, _NIFTY_INST)
 
         all_traders = [("v1", self.paper_trader)]
         for engine_label, trader in all_traders:
