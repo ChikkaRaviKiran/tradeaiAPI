@@ -51,25 +51,15 @@ class KiteClient:
         self.api_key = api_key
         self.account_name = account_name or "kite"
         self.proxy_url = proxy_url or ""
-        self._kite = KiteConnect(api_key=api_key)
+        kite_kwargs: dict = {"api_key": api_key}
         if self.proxy_url:
-            try:
-                import requests  # noqa: WPS433 — lazy to avoid hard dep at import
-                sess = requests.Session()
-                sess.proxies = {"http": self.proxy_url, "https": self.proxy_url}
-                # KiteConnect uses self.reqsession for all HTTP calls
-                self._kite.reqsession = sess
-                logger.info(
-                    "KiteClient[%s] routing via proxy %s",
-                    self.account_name,
-                    self._safe_proxy_repr(self.proxy_url),
-                )
-            except Exception as exc:  # pragma: no cover
-                logger.warning(
-                    "KiteClient[%s] failed to install proxy session (%s); falling back to direct",
-                    self.account_name,
-                    exc,
-                )
+            kite_kwargs["proxies"] = {"http": self.proxy_url, "https": self.proxy_url}
+            logger.info(
+                "KiteClient[%s] routing via proxy %s",
+                self.account_name,
+                self._safe_proxy_repr(self.proxy_url),
+            )
+        self._kite = KiteConnect(**kite_kwargs)
         if access_token:
             self._kite.set_access_token(access_token)
         self._instrument_cache_date = None
