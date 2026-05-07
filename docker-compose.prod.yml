@@ -53,6 +53,10 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
+      # Mount .env so credentials saved via the API (Kite/Dhan/Angel) persist
+      # across container restarts. Without this, _persist_env_vars writes to
+      # the ephemeral container layer and is lost on every redeploy.
+      - ./.env:/app/.env
     networks:
       - tradeai-net
     depends_on:
