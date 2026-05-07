@@ -36,8 +36,8 @@ from sqlalchemy import select
 from app.alerts.alert_manager import AlertManager
 from app.core.config import settings
 from app.core.instruments import InstrumentConfig
-from app.core.models import (
-    AlertItem,
+from app.core.models import AlertItem
+from app.execution.broker_base import (
     OrderRequest,
     OrderSide,
     OrderStatus,
