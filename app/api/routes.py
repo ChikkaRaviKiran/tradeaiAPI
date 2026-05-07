@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 
 import pyotp
 import pytz
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
@@ -1247,16 +1247,41 @@ async def kite_login_url():
 
 
 @app.get("/api/auth/kite/callback")
-async def kite_oauth_callback(request_token: str = "", status: str = "", action: str = ""):
+async def kite_oauth_callback(
+    request: Request,
+    request_token: str = "",
+    status: str = "",
+    action: str = "",
+):
     """OAuth callback target registered in the Kite developer console.
 
     Exchanges the request_token for an access_token, persists it to .env,
     then redirects the browser back to the BrokerSettings page.
+
+    Redirect target resolution (first match wins):
+      1. KITE_POST_LOGIN_REDIRECT env var (if set to non-default)
+      2. Origin/Referer header from the request (so prod auto-uses
+         tradeai.tavabharat.com and dev auto-uses localhost:3000)
+      3. Hard fallback to "/settings" on the same host
     """
     from fastapi.responses import RedirectResponse
     from urllib.parse import urlencode, urlparse
 
-    base = settings.kite_post_login_redirect or "/"
+    _DEFAULT = "http://localhost:3000/settings"
+    configured = (settings.kite_post_login_redirect or "").strip()
+    base = configured if configured and configured != _DEFAULT else ""
+
+    if not base:
+        # Derive from the public host the callback was reached at. When the
+        # backend sits behind nginx (prod), X-Forwarded-* headers carry the
+        # original scheme/host that the browser used.
+        fwd_proto = request.headers.get("x-forwarded-proto")
+        fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if fwd_host:
+            scheme = fwd_proto or request.url.scheme or "https"
+            base = f"{scheme}://{fwd_host}/settings"
+        else:
+            base = _DEFAULT
 
     def _redirect(params: dict) -> RedirectResponse:
         sep = "&" if urlparse(base).query else "?"
