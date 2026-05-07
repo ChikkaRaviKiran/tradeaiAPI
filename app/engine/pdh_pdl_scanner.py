@@ -36,18 +36,17 @@ from sqlalchemy import select
 from app.alerts.alert_manager import AlertManager
 from app.core.config import settings
 from app.core.instruments import InstrumentConfig
-from app.core.models import AlertItem
-from app.data.angelone_client import AngelOneClient
-from app.db.models import AsyncSessionLocal, IndexCandle
-from app.engine import scanner_exec_settings as exec_settings
-from app.engine.lot_sizer import compute_buy_option_lots
-from app.execution.broker_base import (
+from app.core.models import (
+    AlertItem,
     OrderRequest,
     OrderSide,
     OrderStatus,
     OrderType,
     ProductType,
 )
+from app.data.angelone_client import AngelOneClient
+from app.db.models import AsyncSessionLocal, IndexCandle
+from app.engine import scanner_exec_settings as exec_settings
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -99,20 +98,20 @@ class PDHPDLTrade:
         self.option_symbol = option_symbol
         self.option_entry_price = option_entry_price
         self.strike_price = strike_price
-        # Execution metadata
-        self.lots: int = 0
-        self.lot_size: int = 0
-        self.symboltoken: str = ""
-        self.exchange: str = "NFO"
-        self.live_executed: bool = False
-        self.entry_order_id: str = ""
-        self.exit_order_id: str = ""
         # Exit tracking
         self.exited = False
         self.exit_time: str = ""
         self.exit_spot: float = 0.0
         self.exit_reason: str = ""
         self.option_exit_price: float = 0.0
+        # Live execution tracking
+        self.symboltoken: str = ""
+        self.exchange: str = "NFO"
+        self.lot_size: int = 0
+        self.lots: int = 0
+        self.live_executed: bool = False
+        self.entry_order_id: str = ""
+        self.exit_order_id: str = ""
 
 
 class PDHPDLBreakoutScanner:
@@ -150,7 +149,6 @@ class PDHPDLBreakoutScanner:
         self._active_trade: Optional[PDHPDLTrade] = None
         self._expiry: str = ""
         self._expiry_date: Optional[date] = None
-        self._expiry_skip_notified = False
 
     # ── Public API used by orchestrator ─────────────────────────────
 
@@ -162,7 +160,6 @@ class PDHPDLBreakoutScanner:
         self._prev_low = None
         self._signal_found_today = False
         self._active_trade = None
-        self._expiry_skip_notified = False
 
     def set_expiry(self, expiry: str, expiry_date: Optional[date] = None) -> None:
         self._expiry = expiry
@@ -210,31 +207,6 @@ class PDHPDLBreakoutScanner:
 
         # ── Already done for today ──────────────────────────────────
         if self._signal_found_today:
-            return
-
-        # ── Skip on options expiry day (weekly/monthly) ──────────────
-        # _expiry_date is sourced from the AngelOne instrument master via
-        # get_nearest_weekly_expiry() — it reflects the actual NSE-listed
-        # expiry contract date and is therefore holiday-adjusted. Both
-        # weekly and monthly expiries are covered (monthly = last weekly
-        # of the month, same date in the master).
-        if self._expiry_date and now.date() == self._expiry_date:
-            self._signal_found_today = True  # stop scanning for the day
-            if not self._expiry_skip_notified:
-                self._expiry_skip_notified = True
-                logger.info(
-                    "[PDHPDL] Day %s SKIPPED: options expiry day (expiry=%s)",
-                    self._today_str, self._expiry or self._expiry_date.isoformat(),
-                )
-                try:
-                    await self.alert_manager.telegram.send(
-                        f"📊 PDH/PDL — Day Skip\n"
-                        f"Date: {self._today_str}\n"
-                        f"Reason: Options expiry day ({self._expiry or self._expiry_date.isoformat()})\n"
-                        f"No trades today."
-                    )
-                except Exception:
-                    logger.exception("[PDHPDL] Failed to send expiry-skip Telegram")
             return
 
         # ── Setup check (one-shot, on first cycle of the day) ───────
@@ -319,67 +291,40 @@ class PDHPDLBreakoutScanner:
         )
         self._signal_found_today = True
 
-        # ── DYNAMIC LOT SIZING + LIVE ORDER ──────────────────────────
-        token_info = self.client._search_symbol(option_symbol) if option_symbol else None
-        symboltoken = (token_info or {}).get("token", "")
-        exchange = (token_info or {}).get("exch_seg", "NFO")
+        # Resolve symbol token + lot size for live execution
+        symboltoken = ""
+        exchange = "NFO"
+        if option_symbol:
+            token_info = self.client._search_symbol(option_symbol)
+            if token_info:
+                symboltoken = token_info.get("token", "")
+                exchange = token_info.get("exch_seg", "NFO")
         self._active_trade.symboltoken = symboltoken
         self._active_trade.exchange = exchange
         self._active_trade.lot_size = int(instrument.lot_size)
 
-        exec_summary = ""
-        order_status = "OBSERVE ONLY — paper trade, no execution"
-        if self.broker is not None and option_ltp > 0:
-            cfg = exec_settings.load("pdh_pdl")
-            if cfg.get("lots_mode") == "manual":
-                lots = max(0, min(int(cfg.get("manual_lots", 1)), int(cfg.get("max_lots", 20))))
-                cost_per_lot = option_ltp * int(instrument.lot_size)
-                sizing = {
-                    "available": 0.0,
-                    "max_funds_cap": cfg.get("max_funds", 0),
-                    "cost_per_lot": round(cost_per_lot, 2),
-                    "deployed_capital": round(lots * cost_per_lot, 2),
-                    "mode": "manual",
-                }
-            else:
-                lots, sizing = compute_buy_option_lots(
-                    self.broker,
-                    premium=option_ltp,
-                    lot_size=int(instrument.lot_size),
-                    max_funds_cap=cfg.get("max_funds", 0),
-                    buffer_pct=cfg.get("buffer_pct", 5.0),
-                    max_lots_cap=cfg.get("max_lots", 20),
-                    min_lots=1,
-                )
-                sizing["mode"] = "auto"
+        # Decide whether to place a live order
+        cfg = exec_settings.load("pdh_pdl")
+        live_exec = (
+            bool(cfg.get("live_execution"))
+            and not settings.paper_trading
+            and self.broker is not None
+            and option_ltp > 0
+            and bool(symboltoken)
+        )
+        order_status = "OBSERVE ONLY — paper trade"
+        if live_exec:
+            lots = max(1, int(cfg.get("manual_lots", 1) or 1))
             self._active_trade.lots = lots
-            exec_summary = (
-                f"\n💰 SIZING ({sizing.get('mode', 'auto')})\n"
-                f"  Available: ₹{sizing.get('available', 0):,.0f}"
-                f" | Cap: ₹{sizing.get('max_funds_cap', 0):,.0f}\n"
-                f"  Cost/lot: ₹{sizing.get('cost_per_lot', 0):,.0f}"
-                f" | Lots: {lots}"
-                f" | Capital: ₹{sizing.get('deployed_capital', 0):,.0f}"
+            qty = lots * int(instrument.lot_size)
+            ok, oid = await self._place_option_order(
+                instrument, self._active_trade, "BUY", qty, tag="entry",
             )
-            if lots == 0:
-                exec_summary += f"\n  ⚠️ {sizing.get('reason', 'no_lots')}"
-
-            live_exec = (
-                bool(cfg.get("live_execution"))
-                and not settings.paper_trading
-                and option_ltp > 0
-                and bool(symboltoken)
-                and lots > 0
+            self._active_trade.entry_order_id = oid
+            self._active_trade.live_executed = bool(ok)
+            order_status = (
+                f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
             )
-            if live_exec:
-                ok, oid = await self._place_entry_order(instrument, self._active_trade)
-                self._active_trade.entry_order_id = oid
-                self._active_trade.live_executed = bool(ok)
-                order_status = (
-                    f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
-                )
-            elif bool(cfg.get("live_execution")) and not settings.paper_trading and lots == 0:
-                order_status = "LIVE skipped — insufficient funds for 1 lot"
 
         expiry_display = self._expiry or "N/A"
         days_to_expiry = (
@@ -415,9 +360,8 @@ class PDHPDLBreakoutScanner:
             f"  1. Spot stop: {stop_level:.2f}\n"
             f"  2. Spot target: {target_level:.2f}\n"
             f"  3. EOD: 15:20 force close\n"
-            f"{exec_summary}\n"
             f"\n"
-            f"⚠️ {order_status}"
+            f"🛒 {order_status}"
         )
         await self.alert_manager.telegram.send(msg)
         logger.info(
@@ -534,13 +478,6 @@ class PDHPDLBreakoutScanner:
         trade.exit_spot = exit_spot
         trade.exit_reason = exit_reason
 
-        # ── LIVE EXIT ORDER ──────────────────────────────────────────
-        if trade.live_executed and trade.lots > 0 and trade.symboltoken:
-            ok, oid = await self._place_exit_order(instrument, trade, reason=exit_reason)
-            trade.exit_order_id = oid
-            if not ok:
-                logger.error("[PDHPDL] Exit order failed for %s reason=%s", trade.option_symbol, exit_reason)
-
         spot_pnl = (exit_spot - trade.entry_spot) if trade.side == "CE" else (trade.entry_spot - exit_spot)
         is_win = spot_pnl > 0
 
@@ -562,6 +499,17 @@ class PDHPDLBreakoutScanner:
             )
 
         emoji = "✅" if is_win else "❌"
+        # Place SELL exit order if we placed a live BUY entry
+        exit_order_status = "OBSERVE ONLY — paper trade"
+        if trade.live_executed and trade.lots > 0:
+            qty = trade.lots * int(instrument.lot_size)
+            ok, oid = await self._place_option_order(
+                instrument, trade, "SELL", qty, tag=f"exit_{exit_reason}",
+            )
+            trade.exit_order_id = oid
+            exit_order_status = (
+                f"LIVE EXIT PLACED — id={oid}" if ok else "LIVE EXIT FAILED"
+            )
         msg = (
             f"{emoji} PDH/PDL — EXIT {'WIN' if is_win else 'LOSS'} (PAPER)\n"
             f"{'=' * 36}\n"
@@ -583,7 +531,7 @@ class PDHPDLBreakoutScanner:
             f"\n"
             f"📋 Exit Reason: {exit_reason}\n"
             f"\n"
-            f"⚠️ OBSERVE ONLY — paper trade"
+            f"🛒 {exit_order_status}"
         )
         await self.alert_manager.telegram.send(msg)
         logger.info(
@@ -608,9 +556,6 @@ class PDHPDLBreakoutScanner:
             now = datetime.now(IST)
             await self._check_exit(df_today, instrument, now)
             if self._active_trade and not self._active_trade.exited:
-                if self._active_trade.live_executed and self._active_trade.lots > 0 and self._active_trade.symboltoken:
-                    ok, oid = await self._place_exit_order(instrument, self._active_trade, reason="eod_force")
-                    self._active_trade.exit_order_id = oid
                 self._active_trade.exited = True
                 self._active_trade.exit_reason = "eod_force"
                 if df_today is not None and not df_today.empty:
@@ -622,45 +567,17 @@ class PDHPDLBreakoutScanner:
                     f"Reason: End of day"
                 )
 
-    # ── Live order helpers ──────────────────────────────────────────
-    async def _place_entry_order(
-        self, instrument: InstrumentConfig, trade: PDHPDLTrade,
-    ) -> tuple[bool, str]:
-        qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
-        return await self._place_order(
-            instrument=instrument,
-            trade=trade,
-            side="BUY",
-            quantity=qty,
-            tag="pdhpdl_entry",
-        )
+    # ── Helpers ─────────────────────────────────────────────────────
 
-    async def _place_exit_order(
-        self, instrument: InstrumentConfig, trade: PDHPDLTrade, reason: str,
-    ) -> tuple[bool, str]:
-        qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
-        return await self._place_order(
-            instrument=instrument,
-            trade=trade,
-            side="SELL",
-            quantity=qty,
-            tag=f"pdhpdl_exit_{reason}",
-        )
-
-    async def _place_order(
+    async def _place_option_order(
         self,
-        *,
         instrument: InstrumentConfig,
         trade: PDHPDLTrade,
         side: str,
         quantity: int,
         tag: str,
     ) -> tuple[bool, str]:
-        """Route order through the configured broker abstraction.
-
-        Works for both AngelOne and Kite. The Kite adapter resolves the
-        broker-native tradingsymbol from the structured option fields.
-        """
+        """Place an option order via the configured broker abstraction."""
         if not trade.option_symbol or quantity <= 0:
             return False, ""
         if self.broker is None:
@@ -680,7 +597,7 @@ class PDHPDLBreakoutScanner:
             underlying=instrument.option_symbol_prefix or instrument.symbol,
             expiry_date=self._expiry_date,
             strike=float(trade.strike_price or 0),
-            option_type=trade.side,  # 'CE' or 'PE'
+            option_type=trade.side,
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)
@@ -703,8 +620,6 @@ class PDHPDLBreakoutScanner:
             side, self.broker.name, trade.option_symbol, quantity, order_id, tag,
         )
         return True, order_id
-
-    # ── Helpers ─────────────────────────────────────────────────────
 
     async def _fetch_option_quote(
         self,

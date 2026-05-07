@@ -268,6 +268,7 @@ class Orchestrator:
             client=self.client,
             feature_engine=self.feature_engine,
             alert_manager=self.alert_manager,
+            broker=self._build_atl_broker(),
         )
 
         # ── AI-GPT Scanner (3-stage GPT pipeline, 5-min cadence) ──
@@ -304,10 +305,11 @@ class Orchestrator:
         if not settings.nr5_scanner_enabled:
             logger.info("[NR5] Scanner disabled via config (NR5_SCANNER_ENABLED=false)")
 
-        # ── PDH/PDL Breakout Scanner (prev-day H/L breakout, PAPER-ONLY) ──
+        # ── PDH/PDL Breakout Scanner (prev-day H/L breakout) ──
         self.pdh_pdl_scanner = PDHPDLBreakoutScanner(
             client=self.client,
             alert_manager=self.alert_manager,
+            broker=self._build_atl_broker(),
         )
         if not settings.pdh_pdl_scanner_enabled:
             logger.info("[PDHPDL] Scanner disabled via config (PDH_PDL_SCANNER_ENABLED=false)")
