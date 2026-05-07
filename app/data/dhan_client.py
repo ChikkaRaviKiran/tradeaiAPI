@@ -30,6 +30,14 @@ try:
 except Exception:  # pragma: no cover — soft import so app boots without dhanhq installed
     _DhanSDK = None  # type: ignore
 
+# v3.x of the SDK requires a DhanContext wrapper rather than passing
+# (client_id, access_token) directly to dhanhq(). Import is optional so
+# older v2.x installs still work.
+try:
+    from dhanhq import DhanContext as _DhanContext  # type: ignore
+except Exception:  # pragma: no cover
+    _DhanContext = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
 
@@ -78,13 +86,22 @@ class DhanClient:
     def __init__(self, client_id: str, access_token: str) -> None:
         if _DhanSDK is None:
             raise RuntimeError(
-                "dhanhq is not installed. Run `pip install dhanhq==2.1.0`."
+                "dhanhq is not installed. Run `pip install dhanhq`."
             )
         if not client_id or not access_token:
             raise RuntimeError("DhanClient requires client_id and access_token")
         self.client_id = client_id
         self.access_token = access_token
-        self._dhan = _DhanSDK(client_id, access_token)
+        # SDK shape changed in v3.x: dhanhq(client_id, token) → dhanhq(DhanContext(...))
+        # Try the new style first, fall back to legacy positional args.
+        if _DhanContext is not None:
+            try:
+                ctx = _DhanContext(client_id, access_token)
+                self._dhan = _DhanSDK(ctx)
+            except TypeError:
+                self._dhan = _DhanSDK(client_id, access_token)
+        else:
+            self._dhan = _DhanSDK(client_id, access_token)
         self._instrument_cache: list[dict] = []
         self._instrument_cache_date: Optional[date] = None
 

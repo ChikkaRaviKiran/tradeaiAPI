@@ -17,7 +17,7 @@ from sqlalchemy import (
     create_engine,
     text,
 )
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.core.config import settings
@@ -346,15 +346,32 @@ class BrokerEODSnapshot(Base):
     created_at = Column(DateTime, default=_now_ist)
 
 
-# Async engine
-async_engine = create_async_engine(settings.database_url, echo=False)
-AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+# Async engine — pool tuned for concurrent orchestrator + API access.
+# pool_pre_ping checks each connection before use (recovers from dropped
+# Postgres connections automatically).
+# Using async_sessionmaker (not the legacy sync sessionmaker) so each
+# `async with AsyncSessionLocal() as s:` block gets its own dedicated
+# connection — prevents asyncpg "another operation in progress" errors
+# when multiple coroutines hit the DB simultaneously.
+def _build_engine():
+    return create_async_engine(
+        settings.database_url,
+        echo=False,
+        pool_size=10,
+        max_overflow=20,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+
+
+async_engine = _build_engine()
+AsyncSessionLocal = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
 
 
 def create_new_async_session_factory():
     """Create a NEW async engine + session factory — use from separate threads."""
-    engine = create_async_engine(settings.database_url, echo=False)
-    return sessionmaker(engine, class_=AsyncSession, expire_on_commit=False), engine
+    engine = _build_engine()
+    return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False), engine
 
 
 async def get_db() -> AsyncSession:
@@ -367,8 +384,8 @@ async def init_db() -> None:
     # Use a fresh engine bound to the current event loop to avoid
     # 'attached to a different loop' errors on container startup.
     global async_engine, AsyncSessionLocal
-    async_engine = create_async_engine(settings.database_url, echo=False)
-    AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+    async_engine = _build_engine()
+    AsyncSessionLocal = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

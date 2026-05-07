@@ -260,6 +260,7 @@ async def get_system_status():
 
     # Quick DB connectivity check
     db_ok = False
+    db_error: str | None = None
     try:
         from sqlalchemy import text
         from app.db.models import AsyncSessionLocal
@@ -267,6 +268,7 @@ async def get_system_status():
             await session.execute(text("SELECT 1"))
         db_ok = True
     except Exception as e:
+        db_error = str(e)[:300]
         logger.warning("DB health check failed: %s", e)
 
     # WebSocket status
@@ -403,6 +405,7 @@ async def get_system_status():
         "last_snapshot_time": snapshot.timestamp.isoformat() if snapshot else None,
         "open_trades_count": len(_state.get("open_trades", [])),
         "db_connected": db_ok,
+        "db_error": db_error,
         "scanners": scanner_info,
         "websocket": {
             "status": ws_status,

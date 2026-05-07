@@ -84,12 +84,14 @@ class ATLStraddleScanner:
         self._expiry_date: Optional[date] = None
         self._state = ATLState()
         self._events: list[dict] = []
+        self._diag_last: dict[str, datetime] = {}
 
     def reset_daily(self) -> None:
         self._today_str = datetime.now(IST).strftime("%Y-%m-%d")
         self._settings = load_atl_settings()
         self._state = ATLState()
         self._events = []
+        self._diag_last = {}
 
     def get_runtime_state(self) -> dict:
         st = self._state
@@ -131,6 +133,7 @@ class ATLStraddleScanner:
 
     async def run_cycle(self, df_today: pd.DataFrame, instrument: InstrumentConfig, cycle: int, peer_in_trade: bool = False) -> None:
         if df_today is None or df_today.empty:
+            self._record_diag("no_data", f"No 1-min candles for {instrument.symbol}; data feed empty")
             return
 
         now = datetime.now(IST)
@@ -143,9 +146,20 @@ class ATLStraddleScanner:
             self._settings = load_atl_settings()
 
         if not self._settings.get("enabled", False):
+            self._record_diag(
+                "disabled",
+                "Strategy disabled (enabled=false in atl_straddle_settings.json). "
+                "Click 'Create' or 'Create & Place Now' on Settings → Strategy.",
+            )
             return
 
-        if instrument.symbol != self._settings.get("index", "NIFTY"):
+        configured_index = self._settings.get("index", "NIFTY")
+        if instrument.symbol != configured_index:
+            # This fires once per non-matching instrument per minute — fine.
+            self._record_diag(
+                f"wrong_index_{instrument.symbol}",
+                f"Skipping {instrument.symbol}; strategy is configured for {configured_index}",
+            )
             return
 
         trading_day = str(self._settings.get("trading_day", "Daily")).title()
@@ -159,6 +173,10 @@ class ATLStraddleScanner:
             }
             target = weekdays.get(trading_day)
             if target is not None and now.weekday() != target:
+                self._record_diag(
+                    "wrong_day",
+                    f"Today is {now.strftime('%A')}; strategy runs only on {trading_day}",
+                )
                 return
 
         try:
@@ -173,9 +191,14 @@ class ATLStraddleScanner:
             return
 
         if self._state.done_for_day:
+            self._record_diag("done_for_day", "Strategy already completed for the day")
             return
 
         if peer_in_trade and not self.is_in_trade():
+            self._record_diag(
+                "peer_in_trade",
+                "Peer strategy holds a position; waiting for it to close (mutex)",
+            )
             return
 
         spot = float(df_today.iloc[-1]["close"])
@@ -206,6 +229,10 @@ class ATLStraddleScanner:
         # Initial entry
         if not self._state.entered:
             if now.hour < entry_h or (now.hour == entry_h and now.minute < entry_m):
+                self._record_diag(
+                    "before_entry_time",
+                    f"Waiting for entry time {entry_h:02d}:{entry_m:02d} (now {now.strftime('%H:%M:%S')})",
+                )
                 return
             rounded = round(spot / interval) * interval
             ce_strike = rounded + offset
@@ -213,13 +240,25 @@ class ATLStraddleScanner:
             ce_q = await self._fetch_option_quote(instrument, ce_strike, "CE")
             pe_q = await self._fetch_option_quote(instrument, pe_strike, "PE")
             if not ce_q or not pe_q:
+                self._record_diag(
+                    "no_option_quote",
+                    f"Could not fetch option quotes (CE={int(ce_strike)} {'OK' if ce_q else 'MISS'}, "
+                    f"PE={int(pe_strike)} {'OK' if pe_q else 'MISS'}); will retry",
+                )
                 return
             ce_leg = await self._build_leg(instrument, ce_strike, "CE", fallback_quote=ce_q)
             pe_leg = await self._build_leg(instrument, pe_strike, "PE", fallback_quote=pe_q)
             if not ce_leg or not pe_leg:
+                self._record_diag(
+                    "leg_build_fail",
+                    f"Failed to build option legs (CE={'OK' if ce_leg else 'FAIL'}, "
+                    f"PE={'OK' if pe_leg else 'FAIL'}); check broker symbol resolver",
+                )
                 return
 
             if not await self._execute_entry_legs(instrument, ce_leg, pe_leg, reason="initial_entry"):
+                # _execute_entry_legs already logs order_error events with the
+                # broker rejection message — no extra diag needed here.
                 return
 
             self._state.ce = ce_leg
@@ -458,6 +497,20 @@ class ATLStraddleScanner:
         })
         if len(self._events) > 200:
             self._events = self._events[-200:]
+
+    def _record_diag(self, key: str, message: str) -> None:
+        """Record a diagnostic gate-skip event without spamming the timeline.
+
+        Same `key` only emits once per minute per state so the user can see
+        WHY the scanner is idle without flooding the UI with duplicates.
+        """
+        now = datetime.now(IST)
+        last = self._diag_last.get(key)
+        if last and (now - last).total_seconds() < 60:
+            return
+        self._diag_last[key] = now
+        self._record_event("skip", message)
+        logger.info("ATL[%s] skip: %s", self._settings.get("index", "?"), message)
 
     def _leg_dict(self, leg: Optional[ATLLeg]) -> Optional[dict]:
         if not leg:
