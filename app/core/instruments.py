@@ -59,8 +59,38 @@ class InstrumentConfig:
         return base
 
     def build_option_symbol(self, expiry: str, strike: float, option_type: str) -> str:
-        """Build NFO trading symbol. e.g. NIFTY17MAR202622500CE"""
+        """Build the exchange trading symbol for an option contract.
+
+        NFO weekly (NIFTY/BANKNIFTY/...): PREFIX + DDMMMYY + STRIKE + CE/PE
+            e.g. NIFTY12MAY2622500CE
+        BFO weekly (SENSEX/BANKEX): PREFIX + YY + M + DD + STRIKE + CE/PE
+            (M = month with NO leading zero) e.g. SENSEX2650777800CE
+        BFO monthly: PREFIX + YYMMM + STRIKE + CE/PE  e.g. SENSEX26JUN66200PE
+
+        The caller normally passes `expiry` already in DDMMMYY (the format
+        AngelOne returns from the instrument master). We re-encode it here
+        for BFO weeklies so the symbol matches the master row.
+        """
         prefix = self.option_symbol_prefix or self.symbol
+        if self.option_exchange == Exchange.BFO and expiry:
+            try:
+                from datetime import datetime as _dt
+                d = _dt.strptime(expiry, "%d%b%y").date()
+                # Detect monthly (last Tuesday-ish of month) vs weekly. Monthly
+                # SENSEX symbols use YYMMM (e.g. 26JUN). Weekly SENSEX uses
+                # YY+M+DD with no leading-zero month. We treat any contract
+                # whose date is in the *last 7 days* of its month as monthly.
+                from calendar import monthrange
+                last_day = monthrange(d.year, d.month)[1]
+                is_monthly = (last_day - d.day) < 7
+                if is_monthly:
+                    exp_str = f"{d.strftime('%y')}{d.strftime('%b').upper()}"
+                else:
+                    exp_str = f"{d.strftime('%y')}{d.month}{d.strftime('%d')}"
+                return f"{prefix}{exp_str}{int(strike)}{option_type}"
+            except Exception:
+                # Fall through to default formatting on parse failure
+                pass
         return f"{prefix}{expiry}{int(strike)}{option_type}"
 
     def build_futures_symbol(self, expiry: str) -> str:
