@@ -111,6 +111,48 @@ class ATLStraddleScanner:
     def _mode_label(self) -> str:
         return "LIVE" if self._is_live() else "PAPER"
 
+    def _resolve_broker(self):
+        """Pick the broker for this cycle based on the strategy's
+        execution_account setting. Allows per-strategy override of the
+        global TRADING_ACCOUNT.
+
+        Values:
+          'Paper' / ''        → simulated, no broker call
+          'Primary'           → use the orchestrator-injected default broker
+          'Kite' / 'Live (Kite)' / case-insensitive variants → Kite
+          'Dhan' / 'Live (Dhan)'                              → Dhan
+          'Angel' / 'AngelOne' / 'Live (Angel)'              → AngelOne
+        Falls back to self.broker on any failure.
+        """
+        raw = str(self._settings.get("execution_account", "Primary")).strip().lower()
+        if raw in ("", "paper"):
+            return None
+        if raw in ("primary", "live (primary)"):
+            return self.broker
+        # Extract the broker token from labels like "live (kite)"
+        token = raw
+        if "(" in raw and ")" in raw:
+            token = raw[raw.find("(") + 1: raw.find(")")].strip()
+        try:
+            if token in ("kite", "zerodha"):
+                from app.execution.kite_broker import KiteBroker
+                if not isinstance(self.broker, KiteBroker):
+                    return KiteBroker()
+                return self.broker
+            if token == "dhan":
+                from app.execution.dhan_broker import DhanBroker
+                if not isinstance(self.broker, DhanBroker):
+                    return DhanBroker()
+                return self.broker
+            if token in ("angel", "angelone", "smartapi"):
+                from app.execution.angelone_broker import AngelOneBroker
+                if not isinstance(self.broker, AngelOneBroker):
+                    return AngelOneBroker()
+                return self.broker
+        except Exception:
+            logger.exception("ATL: failed to instantiate broker for account=%s", raw)
+        return self.broker
+
     def get_runtime_state(self) -> dict:
         st = self._state
         return {
@@ -287,6 +329,12 @@ class ATLStraddleScanner:
             # Margin-friendly sequence: BUY hedges FIRST so the broker
             # treats the SELL legs as a covered position. Selling naked first
             # spikes margin requirement and risks rejection.
+            sel_broker = self._resolve_broker()
+            self._record_event(
+                "broker",
+                f"Routing via {(sel_broker.name if sel_broker else 'PAPER')} "
+                f"(execution_account={self._settings.get('execution_account', 'Primary')})",
+            )
             hedges_placed = False
             if self._settings.get("hedge_enabled", False):
                 await self._ensure_hedges(instrument, rounded)
@@ -595,13 +643,16 @@ class ATLStraddleScanner:
         side: str,
         qty: int,
         reason: str,
+        broker=None,
     ) -> bool:
-        """Place an ATL leg via the configured broker (Kite/Angel) abstraction.
+        """Place an ATL leg via the configured broker (Kite/Angel/Dhan)
+        abstraction.
 
         Symbol-string differences between brokers are absorbed inside each
         broker adapter — KiteBroker translates Angel-format symbols to Kite
         tradingsymbols on the fly via KiteClient.resolve_from_angel_symbol.
         """
+        target = broker if broker is not None else self.broker
         request = OrderRequest(
             instrument=instrument,
             trading_symbol=leg.symbol,
@@ -623,11 +674,11 @@ class ATLStraddleScanner:
             option_type=leg.option_type,
         )
         try:
-            resp = await asyncio.to_thread(self.broker.place_order, request)
+            resp = await asyncio.to_thread(target.place_order, request)
         except Exception:
             logger.exception(
                 "ATL broker order exception (%s): %s %s %s",
-                self.broker.name if self.broker else "?", side, leg.symbol, reason,
+                target.name if target else "?", side, leg.symbol, reason,
             )
             self._record_event("order_error", f"{side} {leg.symbol} exception ({reason})")
             return False
@@ -675,12 +726,13 @@ class ATLStraddleScanner:
         qty = max(1, int(lots)) * max(1, int(instrument.lot_size))
 
         # Always route through the broker abstraction. The broker adapter
-        # (AngelOne or Kite) handles SmartAPI / KiteConnect specifics and
-        # the symbol-format translation. Falls back to legacy SmartAPI path
-        # only if no broker is configured (defensive — should not happen).
-        if self.broker is not None:
+        # (AngelOne / Kite / Dhan) handles SDK-specific details. Per-strategy
+        # override: pick from execution_account each cycle so the user can
+        # change the strategy's broker without restarting the orchestrator.
+        broker = self._resolve_broker()
+        if broker is not None:
             return await self._place_leg_order_via_broker(
-                instrument, leg, side, qty, reason
+                instrument, leg, side, qty, reason, broker=broker,
             )
 
         try:
