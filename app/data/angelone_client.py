@@ -318,6 +318,9 @@ class AngelOneClient:
             # Determine instrument type — FUTIDX for indices, FUTSTK for stocks
             fut_type = "FUTIDX"
 
+            # SENSEX/BANKEX futures live on BFO; everything else on NFO.
+            target_segment = "BFO" if index_name.upper() in {"SENSEX", "BANKEX"} else "NFO"
+
             for inst in instruments:
                 name = inst.get("name", "")
                 exch_seg = inst.get("exch_seg", "")
@@ -325,7 +328,7 @@ class AngelOneClient:
                 expiry_str = inst.get("expiry", "")
                 inst_type = inst.get("instrumenttype", "")
 
-                if exch_seg != "NFO" or name != index_name:
+                if exch_seg != target_segment or name != index_name:
                     continue
                 if inst_type != fut_type:
                     continue
@@ -595,13 +598,17 @@ class AngelOneClient:
             today = datetime.now(_IST).date()
             expiry_dates: set[datetime] = set()
 
+            # SENSEX & BANKEX options trade on BSE (BFO segment), everything
+            # else (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY) is on NFO.
+            target_segment = "BFO" if instrument_name.upper() in {"SENSEX", "BANKEX"} else "NFO"
+
             for inst in instruments:
                 name = inst.get("name", "")
                 exch_seg = inst.get("exch_seg", "")
                 symbol = inst.get("symbol", "")
                 expiry_str = inst.get("expiry", "")
 
-                if exch_seg != "NFO" or name != instrument_name:
+                if exch_seg != target_segment or name != instrument_name:
                     continue
                 # Only option contracts (CE/PE in symbol)
                 if "CE" not in symbol and "PE" not in symbol:
