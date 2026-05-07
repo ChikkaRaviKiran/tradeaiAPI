@@ -1539,6 +1539,24 @@ async def place_now_atm():
     return {"ok": True, "message": "ATL scanner will attempt entry on next cycle"}
 
 
+@app.post("/api/atm/reset")
+async def reset_atm():
+    """Clear the per-day circuit breaker so the scanner may retry entries.
+
+    Use this after fixing whatever caused the broker rejection (e.g. IP
+    whitelist, margin, credentials). Without this, the scanner stays halted
+    for the day after the first failed entry.
+    """
+    scanner = _get_atl_scanner()
+    if scanner is None:
+        raise HTTPException(status_code=503, detail="ATL scanner not initialised")
+    try:
+        scanner.reset_halt()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True, "message": "ATL scanner halt cleared"}
+
+
 # ── Strategy Analytics & Today's Plan ─────────────────────────────────────
 
 @app.get("/api/strategy-analytics")

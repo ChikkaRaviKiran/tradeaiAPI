@@ -66,6 +66,8 @@ class ATLState:
     hedge_pe: Optional[ATLLeg] = None
     entered: bool = False
     done_for_day: bool = False
+    halted: bool = False           # circuit-breaker tripped
+    halt_reason: str = ""          # human-readable reason for the halt
 
 
 class ATLStraddleScanner:
@@ -164,6 +166,8 @@ class ATLStraddleScanner:
             "phase": st.phase,
             "in_trade": self.is_in_trade(),
             "done_for_day": st.done_for_day,
+            "halted": st.halted,
+            "halt_reason": st.halt_reason,
             "index": self._settings.get("index", "NIFTY"),
             "trading_day": self._settings.get("trading_day", "Daily"),
             "expiry": self._expiry,
@@ -256,6 +260,13 @@ class ATLStraddleScanner:
             self._record_diag("done_for_day", "Strategy already completed for the day")
             return
 
+        if self._state.halted:
+            self._record_diag(
+                "halted",
+                f"Halted for the day: {self._state.halt_reason}. Click 'Force Close ATM' or restart to retry.",
+            )
+            return
+
         if peer_in_trade and not self.is_in_trade():
             self._record_diag(
                 "peer_in_trade",
@@ -336,9 +347,18 @@ class ATLStraddleScanner:
                 f"(execution_account={self._settings.get('execution_account', 'Primary')})",
             )
             hedges_placed = False
+            hedges_required = False
             if self._settings.get("hedge_enabled", False):
+                hedges_required = True
                 await self._ensure_hedges(instrument, rounded)
                 hedges_placed = bool(self._state.hedge_ce or self._state.hedge_pe)
+                if not hedges_placed:
+                    # Hedge orders all rejected — do NOT proceed to sell naked.
+                    self._trip_halt(
+                        "Hedge BUY orders rejected; refusing to sell naked. "
+                        "Fix the broker rejection reason and reset before retrying."
+                    )
+                    return
 
             if not await self._execute_entry_legs(instrument, ce_leg, pe_leg, reason="initial_entry"):
                 # _execute_entry_legs already logs order_error events with the
@@ -349,6 +369,8 @@ class ATLStraddleScanner:
                     await self._close_hedges(instrument, "rollback_initial_entry")
                     self._state.hedge_ce = None
                     self._state.hedge_pe = None
+                # Trip the circuit breaker so we stop spamming the broker.
+                self._trip_halt("Short legs rejected by broker. Fix the rejection reason and reset before retrying.")
                 return
 
             self._state.ce = ce_leg
@@ -599,6 +621,31 @@ class ATLStraddleScanner:
         self._diag_last[key] = now
         self._record_event("skip", message)
         logger.info("ATL[%s] skip: %s", self._settings.get("index", "?"), message)
+
+    def _trip_halt(self, reason: str) -> None:
+        """Trip the per-day circuit breaker. Stops further entry attempts
+        until the user explicitly resets via /api/atm/reset or the next
+        trading day.
+        """
+        if self._state.halted:
+            return
+        self._state.halted = True
+        self._state.halt_reason = reason
+        self._state.done_for_day = True  # also stop other gates
+        self._record_event("halt", reason)
+        logger.error("ATL[%s] HALTED: %s", self._settings.get("index", "?"), reason)
+
+    def reset_halt(self) -> None:
+        """Clear the circuit breaker so the strategy can attempt entry again
+        (typically called from a UI 'Reset' button after the user fixed the
+        broker-side issue)."""
+        was = self._state.halted
+        self._state.halted = False
+        self._state.halt_reason = ""
+        self._state.done_for_day = False
+        self._diag_last.clear()
+        if was:
+            self._record_event("reset", "Halt cleared by user — strategy may retry entry")
 
     def _leg_dict(self, leg: Optional[ATLLeg]) -> Optional[dict]:
         if not leg:
