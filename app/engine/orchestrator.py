@@ -677,6 +677,21 @@ class Orchestrator:
                 self.nr5_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.pdh_pdl_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 logger.info("[ConfigP+MoveDet+AIGPT+NR5+PDHPDL] Expiry set: %s", nifty_expiry)
+
+            # Pass the ATL-configured index's expiry to the ATL scanner.
+            # Strategy may be set to NIFTY or SENSEX in the UI; honour that.
+            try:
+                from app.engine.atl_settings import load_atl_settings
+                atl_idx = (load_atl_settings().get("index") or "NIFTY").upper()
+                atl_exp = self._expiries.get(atl_idx)
+                atl_exp_date = self._expiry_dates.get(atl_idx)
+                if atl_exp:
+                    self.atl_straddle_scanner.set_expiry(atl_exp, atl_exp_date)
+                    logger.info("[ATL] Expiry set for %s: %s", atl_idx, atl_exp)
+                else:
+                    logger.warning("[ATL] No expiry available for %s — option quotes will MISS", atl_idx)
+            except Exception:
+                logger.exception("[ATL] Failed to push expiry to scanner")
         except Exception:
             logger.exception("Failed to determine expiries — options data may be unavailable")
             self._log_event("setup", "Expiry discovery FAILED — continuing without options")
