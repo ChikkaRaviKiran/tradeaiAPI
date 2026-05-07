@@ -74,6 +74,7 @@ from app.engine.move_detection_scanner import MoveDetectionScanner
 from app.engine.ai_gpt_scanner import AIGPTScanner
 from app.engine.nr5_breakout_scanner import NR5BreakoutScanner
 from app.engine.pdh_pdl_scanner import PDHPDLBreakoutScanner
+from app.engine.atl_straddle_scanner import ATLStraddleScanner
 from app.ai.ai_gpt_pipeline import AIGPTPipeline
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
@@ -310,6 +311,22 @@ class Orchestrator:
         )
         if not settings.pdh_pdl_scanner_enabled:
             logger.info("[PDHPDL] Scanner disabled via config (PDH_PDL_SCANNER_ENABLED=false)")
+
+        # ── ATL Straddle Scanner (UI-driven ATM straddle on NIFTY/SENSEX) ──
+        # Routes orders through the broker matching settings.trading_account
+        # (kite/dhan/angel). Falls back to the angel broker if the configured
+        # broker can't be initialised (e.g. missing creds), so paper trades
+        # still work via simulation.
+        atl_broker = self._build_atl_broker()
+        self.atl_straddle_scanner = ATLStraddleScanner(
+            client=self.client,
+            alert_manager=self.alert_manager,
+            broker=atl_broker,
+        )
+        logger.info(
+            "[ATL] Straddle scanner initialised (broker=%s, trading_account=%s)",
+            getattr(atl_broker, "name", "?"), settings.trading_account,
+        )
 
         # Strategy selector — picks best strategies based on condition-performance data
         from app.engine.strategy_selector import StrategySelector
@@ -1479,6 +1496,12 @@ class Orchestrator:
                         peer_in_trade=(cp_in_trade or md_in_trade or nr5_in_trade),
                     )
                 await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
+            # ATL Straddle scanner runs for whichever index it is configured
+            # for (NIFTY or SENSEX) — internal symbol gate skips other instruments.
+            try:
+                await self.atl_straddle_scanner.run_cycle(df_today, instrument, cycle)
+            except Exception:
+                logger.exception("[ATL] scanner cycle failed for %s", symbol)
             return
 
             # 8. Time-of-day circuit breaker — no new entries after cutoff
@@ -2157,6 +2180,29 @@ class Orchestrator:
             logger.exception("[%s] Error in instrument analysis", symbol)
 
     # ── Support Methods ──────────────────────────────────────────────────
+
+    def _build_atl_broker(self):
+        """Pick the broker for ATL straddle orders based on TRADING_ACCOUNT.
+
+        - "kite" → KiteBroker
+        - "dhan" → DhanBroker
+        - anything else → AngelOne broker (already self.broker)
+
+        Returns None if the chosen adapter can't be created (e.g. SDK missing
+        or creds blank); the scanner then runs in alert-only / paper mode.
+        """
+        account = (settings.trading_account or "angel").strip().lower()
+        try:
+            if account == "kite":
+                from app.execution.kite_broker import KiteBroker
+                return KiteBroker()
+            if account == "dhan":
+                from app.execution.dhan_broker import DhanBroker
+                return DhanBroker()
+        except Exception:
+            logger.exception("ATL broker init failed for trading_account=%s; "
+                             "falling back to AngelOne", account)
+        return self.broker
 
     def _resolve_instruments(self) -> list[InstrumentConfig]:
         """Resolve which instruments to trade.

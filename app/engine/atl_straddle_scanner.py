@@ -85,6 +85,7 @@ class ATLStraddleScanner:
         self._state = ATLState()
         self._events: list[dict] = []
         self._diag_last: dict[str, datetime] = {}
+        self._force_entry: bool = False
 
     def reset_daily(self) -> None:
         self._today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -92,12 +93,31 @@ class ATLStraddleScanner:
         self._state = ATLState()
         self._events = []
         self._diag_last = {}
+        self._force_entry = False
+
+    def _is_live(self) -> bool:
+        """True only when global mode is LIVE AND the strategy's execution
+        account is set to a real broker (anything other than 'Paper').
+
+        Per-strategy 'Paper' account simulates even when global is LIVE.
+        Global 'paper_trading=True' acts as a kill-switch — every strategy
+        runs in simulation regardless of its execution_account.
+        """
+        if bool(getattr(settings, "paper_trading", True)):
+            return False
+        account = str(self._settings.get("execution_account", "Primary")).strip().lower()
+        return account not in ("", "paper")
+
+    def _mode_label(self) -> str:
+        return "LIVE" if self._is_live() else "PAPER"
 
     def get_runtime_state(self) -> dict:
         st = self._state
         return {
             "enabled": bool(self._settings.get("enabled", False)),
-            "live_mode": not settings.paper_trading,
+            "live_mode": self._is_live(),
+            "global_live": not bool(getattr(settings, "paper_trading", True)),
+            "execution_account": self._settings.get("execution_account", "Primary"),
             "strategy_type": self._settings.get("strategy_type", "ATM_STRADDLE"),
             "phase": st.phase,
             "in_trade": self.is_in_trade(),
@@ -228,12 +248,20 @@ class ATLStraddleScanner:
 
         # Initial entry
         if not self._state.entered:
-            if now.hour < entry_h or (now.hour == entry_h and now.minute < entry_m):
+            if not self._force_entry and (
+                now.hour < entry_h or (now.hour == entry_h and now.minute < entry_m)
+            ):
                 self._record_diag(
                     "before_entry_time",
                     f"Waiting for entry time {entry_h:02d}:{entry_m:02d} (now {now.strftime('%H:%M:%S')})",
                 )
                 return
+            if self._force_entry:
+                self._record_event(
+                    "force_entry",
+                    f"Manual 'Place Now' bypassing entry-time gate at {now.strftime('%H:%M:%S')}",
+                )
+                self._force_entry = False
             rounded = round(spot / interval) * interval
             ce_strike = rounded + offset
             pe_strike = rounded - offset
@@ -270,7 +298,7 @@ class ATLStraddleScanner:
                 await self._ensure_hedges(instrument, rounded)
             self._record_event("entry", f"STRANGLE CE {int(ce_strike)} PE {int(pe_strike)} @ spot {spot:.2f}")
             await self.alert_manager.telegram.send(
-                f"⚡ ATL ENTRY ({'LIVE' if not settings.paper_trading else 'PAPER'})\n"
+                f"⚡ ATL ENTRY ({self._mode_label()})\n"
                 f"Index: {instrument.symbol}\n"
                 f"Spot: {spot:.2f}\n"
                 f"SELL CE {int(ce_strike)} @ ₹{self._state.ce.premium:.2f}\n"
@@ -386,7 +414,7 @@ class ATLStraddleScanner:
         tag = "REFORM" if reform else "AT-STRIKE"
         self._record_event("straddle", f"{tag} strike {int(strike)} spot {spot:.2f} sl {self._state.straddle_sl_points:.2f}")
         await self.alert_manager.telegram.send(
-            f"⚡ ATL {tag} STRADDLE ({'LIVE' if not settings.paper_trading else 'PAPER'})\n"
+            f"⚡ ATL {tag} STRADDLE ({self._mode_label()})\n"
             f"Spot: {spot:.2f}\n"
             f"Strike: {int(strike)}\n"
             f"CE ₹{self._state.ce.premium:.2f} + PE ₹{self._state.pe.premium:.2f}\n"
@@ -402,7 +430,7 @@ class ATLStraddleScanner:
         if self._settings.get("hedge_mode", "none") != "none" and (self._state.hedge_ce or self._state.hedge_pe):
             await self._close_hedges(instrument, reason="eod_force_close")
             await self.alert_manager.telegram.send(
-                f"🛡️ ATL Hedge Close ({'LIVE' if not settings.paper_trading else 'PAPER'})\n"
+                f"🛡️ ATL Hedge Close ({self._mode_label()})\n"
                 f"BUY hedges exit: CE {int(self._state.hedge_ce.strike) if self._state.hedge_ce else '-'} / "
                 f"PE {int(self._state.hedge_pe.strike) if self._state.hedge_pe else '-'}"
             )
@@ -455,7 +483,7 @@ class ATLStraddleScanner:
             pe_px = f"₹{self._state.hedge_pe.premium:.2f}" if self._state.hedge_pe else "-"
             self._record_event("hedge", f"Hedge CE {ce_strike} / PE {pe_strike}")
             await self.alert_manager.telegram.send(
-                f"🛡️ ATL Hedge Entry ({'LIVE' if not settings.paper_trading else 'PAPER'})\n"
+                f"🛡️ ATL Hedge Entry ({self._mode_label()})\n"
                 f"BUY CE {ce_strike} @ {ce_px} / "
                 f"BUY PE {pe_strike} @ {pe_px}"
             )
@@ -493,7 +521,7 @@ class ATLStraddleScanner:
             "time": datetime.now(IST).strftime("%H:%M:%S"),
             "event": event_type,
             "message": message,
-            "mode": "live" if not settings.paper_trading else "paper",
+            "mode": "live" if self._is_live() else "paper",
         })
         if len(self._events) > 200:
             self._events = self._events[-200:]
@@ -628,7 +656,7 @@ class ATLStraddleScanner:
         lots: int,
         reason: str,
     ) -> bool:
-        if settings.paper_trading:
+        if not self._is_live():
             return True
         if not leg.symbol or not leg.symboltoken:
             return False

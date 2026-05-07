@@ -514,6 +514,11 @@ async def set_trading_mode(body: dict):
         )
 
     settings.paper_trading = mode == "paper"
+    # Persist so the mode survives container restarts
+    try:
+        _persist_env_vars({"PAPER_TRADING": "false" if mode == "live" else "true"})
+    except Exception:
+        logger.exception("Failed to persist PAPER_TRADING to .env")
     # Reset auto-pause flag when user explicitly switches to live
     orch = _state.get("orchestrator")
     if orch and mode == "live":
@@ -1444,6 +1449,94 @@ async def get_pdh_pdl_settings():
 @app.put("/api/strategy-settings/pdh-pdl")
 async def update_pdh_pdl_settings(body: dict):
     return _scanner_exec_put("pdh_pdl", body)
+
+
+# ── ATM Straddle Strategy runtime (ATLStraddleScanner) ────────────────────
+
+def _get_atl_scanner():
+    """Return the live ATL straddle scanner instance, or None."""
+    orch = _state.get("orchestrator")
+    if orch is None:
+        return None
+    return getattr(orch, "atl_straddle_scanner", None)
+
+
+@app.get("/api/atm/runtime")
+async def get_atm_runtime():
+    """Snapshot of the ATM straddle scanner: settings, phase, in_trade, events.
+
+    Always returns 200 with a stable shape so the UI can render even when
+    the orchestrator is still warming up.
+    """
+    scanner = _get_atl_scanner()
+    if scanner is None:
+        from app.engine.atl_settings import load_atl_settings
+        return {
+            "runtime": {
+                "live_mode": not bool(getattr(settings, "paper_trading", True)),
+                "phase": "INIT",
+                "in_trade": False,
+                "settings": load_atl_settings(),
+                "events": [],
+                "scanner_ready": False,
+            }
+        }
+    try:
+        rt = scanner.get_runtime_state()
+    except Exception as exc:
+        logger.exception("ATL get_runtime_state failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+    rt["scanner_ready"] = True
+    rt["live_mode"] = not bool(getattr(settings, "paper_trading", True))
+    rt["trading_account"] = getattr(settings, "trading_account", "angel")
+    return {"runtime": rt}
+
+
+@app.post("/api/atm/force-close")
+async def force_close_atm():
+    scanner = _get_atl_scanner()
+    if scanner is None:
+        raise HTTPException(status_code=503, detail="ATL scanner not initialised")
+    if not scanner.is_in_trade():
+        return {"ok": True, "message": "No open ATL trade"}
+    orch = _state.get("orchestrator")
+    df_today = None
+    instrument = None
+    try:
+        # Pull the live frame for the configured index from the orchestrator
+        from app.engine.atl_settings import load_atl_settings
+        idx = (load_atl_settings().get("index") or "NIFTY").upper()
+        for inst in getattr(orch, "_active_instruments", []) or []:
+            if inst.symbol == idx:
+                instrument = inst
+                df_today = getattr(orch, "_df_today_cache", {}).get(idx)
+                break
+    except Exception:
+        logger.exception("ATL force-close: could not assemble live frame")
+    if df_today is None or instrument is None:
+        raise HTTPException(status_code=409, detail="Live frame for ATL index not available")
+    try:
+        await scanner.force_close(df_today, instrument)
+        return {"ok": True}
+    except Exception as exc:
+        logger.exception("ATL force_close failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/atm/place-now")
+async def place_now_atm():
+    """Force the ATL scanner to attempt entry on its next cycle.
+
+    Sets an internal flag the scanner checks before the entry-time gate.
+    """
+    scanner = _get_atl_scanner()
+    if scanner is None:
+        raise HTTPException(status_code=503, detail="ATL scanner not initialised")
+    try:
+        scanner._force_entry = True  # noqa: SLF001
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True, "message": "ATL scanner will attempt entry on next cycle"}
 
 
 # ── Strategy Analytics & Today's Plan ─────────────────────────────────────
