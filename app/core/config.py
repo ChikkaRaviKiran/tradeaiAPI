@@ -162,6 +162,26 @@ class Settings(BaseSettings):
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
     dhan_client_id: str = Field(default="", alias="DHAN_CLIENT_ID")
 
+    # Zerodha Kite Connect — daily OAuth flow for order routing
+    kite_api_key: str = Field(default="", alias="KITE_API_KEY")
+    kite_api_secret: str = Field(default="", alias="KITE_API_SECRET")
+    kite_access_token: str = Field(default="", alias="KITE_ACCESS_TOKEN")
+    # Public callback URL registered in the Kite developer console.
+    # Must point at this backend's /api/auth/kite/callback endpoint.
+    kite_redirect_url: str = Field(
+        default="http://localhost:8000/api/auth/kite/callback",
+        alias="KITE_REDIRECT_URL",
+    )
+    # Where to redirect the browser after callback handling completes
+    # (frontend BrokerSettings page reads ?kite_auth=success / error params).
+    kite_post_login_redirect: str = Field(
+        default="http://localhost:3000/settings",
+        alias="KITE_POST_LOGIN_REDIRECT",
+    )
+
+    # Active trading account: "angel" | "kite" | "dhan"
+    trading_account: str = Field(default="angel", alias="TRADING_ACCOUNT")
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_active_instrument_list(self) -> list[str]:

@@ -1100,6 +1100,260 @@ async def re_authenticate_broker():
     return {"success": False, "error": "Authentication failed — check logs for details"}
 
 
+# ── Trading account selector (Angel / Kite / Dhan) ────────────────────────
+
+_VALID_TRADING_ACCOUNTS = {"angel", "kite", "dhan"}
+
+
+def _persist_env_vars(updates: dict[str, str]) -> None:
+    """Write/replace env vars in backend/.env and reload `settings` in-memory."""
+    import os
+    import re
+
+    env_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    )
+    content = ""
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    for env_var, value in updates.items():
+        pattern = rf"^{re.escape(env_var)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, f"{env_var}={value}", content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\n{env_var}={value}\n"
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    for env_var, value in updates.items():
+        attr = env_var.lower()
+        if hasattr(settings, attr):
+            object.__setattr__(settings, attr, value)
+
+
+@app.get("/api/broker/trading-account")
+async def get_trading_account():
+    """Return the currently active trading account and orchestrator state."""
+    orch = _state.get("orchestrator")
+    return {
+        "selected": (settings.trading_account or "angel").lower(),
+        "running": bool(orch and getattr(orch, "running", False)),
+        "options": sorted(_VALID_TRADING_ACCOUNTS),
+    }
+
+
+@app.post("/api/broker/trading-account")
+async def set_trading_account(body: dict):
+    """Switch the active trading account. System must be stopped."""
+    account = (body.get("account") or "").strip().lower()
+    if account not in _VALID_TRADING_ACCOUNTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid account '{account}'. Must be one of {sorted(_VALID_TRADING_ACCOUNTS)}.",
+        )
+    orch = _state.get("orchestrator")
+    if orch and getattr(orch, "running", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot switch trading account while system is running. Stop the system first.",
+        )
+    _persist_env_vars({"TRADING_ACCOUNT": account})
+    logger.info("Trading account switched to %s", account)
+    return {"success": True, "selected": account, "message": f"Trading account set to {account}"}
+
+
+# ── Kite (Zerodha) — daily OAuth + credential management ──────────────────
+
+def _kite_configured() -> bool:
+    return bool(settings.kite_api_key and settings.kite_api_secret)
+
+
+@app.get("/api/broker/kite/status")
+async def get_kite_status():
+    """Kite credential + access-token health for the BrokerSettings UI."""
+    api_key = settings.kite_api_key
+    api_secret = settings.kite_api_secret
+    access_token = settings.kite_access_token
+
+    result = {
+        "configured": bool(api_key and api_secret),
+        "api_key_set": bool(api_key),
+        "api_secret_set": bool(api_secret),
+        "access_token_set": bool(access_token),
+        "authenticated": False,
+        "user_id": None,
+        "user_name": None,
+        "auth_error": None,
+        "redirect_url": settings.kite_redirect_url,
+    }
+    if not (api_key and access_token):
+        return result
+
+    try:
+        from app.data.kite_client import KiteClient
+
+        client = KiteClient(api_key=api_key, access_token=access_token)
+        profile = client.get_profile() or {}
+        if profile.get("user_id"):
+            result["authenticated"] = True
+            result["user_id"] = profile.get("user_id")
+            result["user_name"] = profile.get("user_name")
+    except Exception as exc:
+        result["auth_error"] = str(exc)
+    return result
+
+
+@app.post("/api/broker/kite/update-credentials")
+async def update_kite_credentials(body: dict):
+    """Save Kite api_key / api_secret to .env. System must be stopped."""
+    orch = _state.get("orchestrator")
+    if orch and getattr(orch, "running", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot update credentials while system is running. Stop the system first.",
+        )
+    field_map = {
+        "api_key": "KITE_API_KEY",
+        "api_secret": "KITE_API_SECRET",
+        "access_token": "KITE_ACCESS_TOKEN",
+        "redirect_url": "KITE_REDIRECT_URL",
+    }
+    updates: dict[str, str] = {}
+    for field, env_var in field_map.items():
+        value = (body.get(field) or "").strip()
+        if value:
+            updates[env_var] = value
+    if not updates:
+        raise HTTPException(status_code=400, detail="No Kite credentials provided")
+    _persist_env_vars(updates)
+    logger.info("Kite credentials updated: %s", list(updates.keys()))
+    return {"success": True, "updated_fields": list(updates.keys())}
+
+
+@app.get("/api/auth/kite/login-url")
+async def kite_login_url():
+    """Return the Kite Connect OAuth login URL for the configured api_key."""
+    if not settings.kite_api_key:
+        return {"login_url": None, "message": "KITE_API_KEY not configured"}
+    try:
+        from kiteconnect import KiteConnect
+
+        kc = KiteConnect(api_key=settings.kite_api_key)
+        url = kc.login_url()
+        return {"login_url": url, "redirect_url": settings.kite_redirect_url}
+    except Exception as exc:
+        logger.exception("Failed to build Kite login URL")
+        return {"login_url": None, "message": str(exc)}
+
+
+@app.get("/api/auth/kite/callback")
+async def kite_oauth_callback(request_token: str = "", status: str = "", action: str = ""):
+    """OAuth callback target registered in the Kite developer console.
+
+    Exchanges the request_token for an access_token, persists it to .env,
+    then redirects the browser back to the BrokerSettings page.
+    """
+    from fastapi.responses import RedirectResponse
+    from urllib.parse import urlencode, urlparse
+
+    base = settings.kite_post_login_redirect or "/"
+
+    def _redirect(params: dict) -> RedirectResponse:
+        sep = "&" if urlparse(base).query else "?"
+        return RedirectResponse(url=f"{base}{sep}{urlencode(params)}", status_code=302)
+
+    if not request_token:
+        return _redirect({"kite_auth_error": status or "missing_request_token"})
+    if not (settings.kite_api_key and settings.kite_api_secret):
+        return _redirect({"kite_auth_error": "kite_credentials_not_configured"})
+
+    try:
+        from kiteconnect import KiteConnect
+
+        kc = KiteConnect(api_key=settings.kite_api_key)
+        data = kc.generate_session(request_token, api_secret=settings.kite_api_secret)
+        access_token = (data or {}).get("access_token", "")
+        user_id = (data or {}).get("user_id", "")
+        if not access_token:
+            return _redirect({"kite_auth_error": "no_access_token_in_response"})
+        _persist_env_vars({"KITE_ACCESS_TOKEN": access_token})
+        logger.info("Kite OAuth complete for user_id=%s", user_id)
+        return _redirect({"kite_auth": "success", "user_id": user_id})
+    except Exception as exc:
+        logger.exception("Kite OAuth callback failed")
+        return _redirect({"kite_auth_error": str(exc)[:200]})
+
+
+# ── Dhan — daily access-token rotation + credential management ────────────
+
+@app.get("/api/broker/dhan/status")
+async def get_dhan_status():
+    client_id = settings.dhan_client_id
+    access_token = settings.dhan_access_token
+    return {
+        "configured": bool(client_id and access_token),
+        "client_id_set": bool(client_id),
+        "access_token_set": bool(access_token),
+        "client_id": (client_id[:2] + "***") if client_id else None,
+    }
+
+
+@app.post("/api/broker/dhan/test")
+async def test_dhan_connection():
+    if not (settings.dhan_client_id and settings.dhan_access_token):
+        return {"success": False, "error": "Dhan client_id or access_token not configured"}
+    try:
+        from app.data.dhan_client import DhanClient
+
+        client = DhanClient(settings.dhan_client_id, settings.dhan_access_token)
+        funds = client.get_fund_limits()
+        if funds:
+            return {"success": True, "message": "Dhan authentication successful", "funds": funds}
+        return {"success": False, "error": "Empty response from Dhan get_fund_limits"}
+    except Exception as exc:
+        logger.exception("Dhan test connection failed")
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/broker/dhan/update-credentials")
+async def update_dhan_credentials(body: dict):
+    orch = _state.get("orchestrator")
+    if orch and getattr(orch, "running", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot update credentials while system is running. Stop the system first.",
+        )
+    field_map = {
+        "client_id": "DHAN_CLIENT_ID",
+        "access_token": "DHAN_ACCESS_TOKEN",
+    }
+    updates: dict[str, str] = {}
+    for field, env_var in field_map.items():
+        value = (body.get(field) or "").strip()
+        if value:
+            updates[env_var] = value
+    if not updates:
+        raise HTTPException(status_code=400, detail="No Dhan credentials provided")
+    _persist_env_vars(updates)
+    logger.info("Dhan credentials updated: %s", list(updates.keys()))
+    return {"success": True, "updated_fields": list(updates.keys())}
+
+
+@app.post("/api/broker/dhan/refresh-instruments")
+async def refresh_dhan_instruments():
+    if not (settings.dhan_client_id and settings.dhan_access_token):
+        return {"ok": False, "error": "Dhan client_id or access_token not configured"}
+    try:
+        from app.data.dhan_client import DhanClient
+
+        client = DhanClient(settings.dhan_client_id, settings.dhan_access_token)
+        n = await asyncio.to_thread(client.refresh_scrip_master, True)
+        return {"ok": True, "instruments_loaded": n}
+    except Exception as exc:
+        logger.exception("Dhan scrip master refresh failed")
+        return {"ok": False, "error": str(exc)}
+
+
 # ── Strategy Analytics & Today's Plan ─────────────────────────────────────
 
 @app.get("/api/strategy-analytics")
