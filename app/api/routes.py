@@ -1135,8 +1135,10 @@ def _persist_env_vars(updates: dict[str, str]) -> None:
 async def get_trading_account():
     """Return the currently active trading account and orchestrator state."""
     orch = _state.get("orchestrator")
+    selected = (settings.trading_account or "angel").lower()
     return {
-        "selected": (settings.trading_account or "angel").lower(),
+        "selected": selected,
+        "active": selected,
         "running": bool(orch and getattr(orch, "running", False)),
         "options": sorted(_VALID_TRADING_ACCOUNTS),
     }
