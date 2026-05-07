@@ -284,9 +284,23 @@ class ATLStraddleScanner:
                 )
                 return
 
+            # Margin-friendly sequence: BUY hedges FIRST so the broker
+            # treats the SELL legs as a covered position. Selling naked first
+            # spikes margin requirement and risks rejection.
+            hedges_placed = False
+            if self._settings.get("hedge_enabled", False):
+                await self._ensure_hedges(instrument, rounded)
+                hedges_placed = bool(self._state.hedge_ce or self._state.hedge_pe)
+
             if not await self._execute_entry_legs(instrument, ce_leg, pe_leg, reason="initial_entry"):
                 # _execute_entry_legs already logs order_error events with the
                 # broker rejection message — no extra diag needed here.
+                # Roll back the hedges we just placed so we don't sit on
+                # naked long premium when the shorts couldn't be opened.
+                if hedges_placed:
+                    await self._close_hedges(instrument, "rollback_initial_entry")
+                    self._state.hedge_ce = None
+                    self._state.hedge_pe = None
                 return
 
             self._state.ce = ce_leg
@@ -294,8 +308,6 @@ class ATLStraddleScanner:
             self._state.entered = True
             self._state.phase = "STRANGLE"
             self._state.ref_spot = spot
-            if self._settings.get("hedge_enabled", False):
-                await self._ensure_hedges(instrument, rounded)
             self._record_event("entry", f"STRANGLE CE {int(ce_strike)} PE {int(pe_strike)} @ spot {spot:.2f}")
             await self.alert_manager.telegram.send(
                 f"⚡ ATL ENTRY ({self._mode_label()})\n"
