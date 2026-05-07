@@ -78,7 +78,7 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
     out["strike_mode"] = "ITM" if mode == "ITM" else "ATM"
     out["lots"] = max(1, int(out.get("lots", 1)))
     out["strike_interval"] = max(1, int(out.get("strike_interval", 50)))
-    out["offset_points"] = max(1, int(out.get("offset_points", 500)))
+    out["offset_points"] = max(0, int(out.get("offset_points", 500)))
     out["rolling_points"] = max(1, int(out.get("rolling_points", 300)))
 
     sl_type = str(out.get("sl_type", "premium_pct")).strip().lower()

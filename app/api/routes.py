@@ -1379,6 +1379,68 @@ async def refresh_dhan_instruments():
         return {"ok": False, "error": str(exc)}
 
 
+# ── Strategy Settings (per-scanner exec params + ATL straddle) ────────────
+
+@app.get("/api/strategy-settings/atl-straddle")
+async def get_atl_straddle_settings():
+    from app.engine.atl_settings import load_atl_settings
+
+    return load_atl_settings()
+
+
+@app.put("/api/strategy-settings/atl-straddle")
+async def update_atl_straddle_settings(body: dict):
+    from app.engine.atl_settings import save_atl_settings
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    try:
+        saved = save_atl_settings(body)
+        logger.info("ATL straddle settings updated")
+        return saved
+    except Exception as exc:
+        logger.exception("Failed to save ATL straddle settings")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _scanner_exec_get(scanner: str) -> dict:
+    from app.engine import scanner_exec_settings as exec_settings
+
+    return exec_settings.load(scanner)
+
+
+def _scanner_exec_put(scanner: str, body: dict) -> dict:
+    from app.engine import scanner_exec_settings as exec_settings
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    try:
+        return exec_settings.save(scanner, body)
+    except Exception as exc:
+        logger.exception("Failed to save %s exec settings", scanner)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/strategy-settings/move-det")
+async def get_move_det_settings():
+    return _scanner_exec_get("move_det")
+
+
+@app.put("/api/strategy-settings/move-det")
+async def update_move_det_settings(body: dict):
+    return _scanner_exec_put("move_det", body)
+
+
+@app.get("/api/strategy-settings/pdh-pdl")
+async def get_pdh_pdl_settings():
+    return _scanner_exec_get("pdh_pdl")
+
+
+@app.put("/api/strategy-settings/pdh-pdl")
+async def update_pdh_pdl_settings(body: dict):
+    return _scanner_exec_put("pdh_pdl", body)
+
+
 # ── Strategy Analytics & Today's Plan ─────────────────────────────────────
 
 @app.get("/api/strategy-analytics")

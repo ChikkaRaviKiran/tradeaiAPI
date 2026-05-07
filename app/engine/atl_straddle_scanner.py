@@ -180,7 +180,7 @@ class ATLStraddleScanner:
 
         spot = float(df_today.iloc[-1]["close"])
         interval = max(1, int(self._settings.get("strike_interval", 50)))
-        offset = max(1, int(self._settings.get("offset_points", 500)))
+        offset = max(0, int(self._settings.get("offset_points", 500)))
         rolling = max(1, int(self._settings.get("rolling_points", 300)))
         sl_type = str(self._settings.get("sl_type", "premium_pct")).lower()
         sl_lower = float(self._settings.get("sl_lower", 0) or 0)
