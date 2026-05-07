@@ -178,6 +178,11 @@ class Settings(BaseSettings):
         default="http://localhost:3000/settings",
         alias="KITE_POST_LOGIN_REDIRECT",
     )
+    # Optional outbound proxy for Kite API calls (e.g. when broker rate-limits
+    # or blocks the main server IP). Format: socks5://user:pass@host:port or
+    # socks5h://user:pass@host:port (h = resolve DNS through proxy). Leave
+    # empty to call Kite directly.
+    kite_proxy_url: str = Field(default="", alias="KITE_PROXY_URL")
 
     # Active trading account: "angel" | "kite" | "dhan"
     trading_account: str = Field(default="angel", alias="TRADING_ACCOUNT")

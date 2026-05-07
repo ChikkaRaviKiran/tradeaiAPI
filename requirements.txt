@@ -42,6 +42,8 @@ jinja2==3.1.2
 httpx==0.25.2
 aiohttp==3.9.1
 websockets>=13.0
+# SOCKS5 proxy support for `requests` (used by Kite client when KITE_PROXY_URL is set)
+PySocks==1.7.1
 
 # Scheduling
 apscheduler==3.10.4

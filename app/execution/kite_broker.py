@@ -65,6 +65,7 @@ class KiteBroker(BaseBroker):
             self._client = KiteClient(
                 api_key=settings.kite_api_key,
                 access_token=settings.kite_access_token,
+                proxy_url=settings.kite_proxy_url,
             )
         except Exception:
             logger.exception("KiteBroker: failed to initialise KiteClient")

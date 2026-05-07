@@ -37,18 +37,58 @@ class KiteClient:
     `asyncio.to_thread(...)` from the orchestrator's async context.
     """
 
-    def __init__(self, api_key: str, access_token: str = "", account_name: str = ""):
+    def __init__(
+        self,
+        api_key: str,
+        access_token: str = "",
+        account_name: str = "",
+        proxy_url: str = "",
+    ):
         if KiteConnect is None:
             raise RuntimeError(
                 "kiteconnect is not installed. Run `pip install kiteconnect==5.1.0`."
             )
         self.api_key = api_key
         self.account_name = account_name or "kite"
+        self.proxy_url = proxy_url or ""
         self._kite = KiteConnect(api_key=api_key)
+        if self.proxy_url:
+            try:
+                import requests  # noqa: WPS433 — lazy to avoid hard dep at import
+                sess = requests.Session()
+                sess.proxies = {"http": self.proxy_url, "https": self.proxy_url}
+                # KiteConnect uses self.reqsession for all HTTP calls
+                self._kite.reqsession = sess
+                logger.info(
+                    "KiteClient[%s] routing via proxy %s",
+                    self.account_name,
+                    self._safe_proxy_repr(self.proxy_url),
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "KiteClient[%s] failed to install proxy session (%s); falling back to direct",
+                    self.account_name,
+                    exc,
+                )
         if access_token:
             self._kite.set_access_token(access_token)
         self._instrument_cache_date = None
         self._instruments_by_exchange: dict[str, list[dict]] = {}
+
+    @staticmethod
+    def _safe_proxy_repr(url: str) -> str:
+        """Mask credentials in proxy URL for logs."""
+        try:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(url)
+            if p.username:
+                netloc = f"***:***@{p.hostname}"
+                if p.port:
+                    netloc += f":{p.port}"
+                return urlunparse((p.scheme, netloc, p.path, "", "", ""))
+        except Exception:
+            pass
+        return url
 
     @property
     def kite(self):

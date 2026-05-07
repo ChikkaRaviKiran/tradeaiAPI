@@ -1195,6 +1195,8 @@ async def get_kite_status():
         "user_name": None,
         "auth_error": None,
         "redirect_url": settings.kite_redirect_url,
+        "proxy_url": settings.kite_proxy_url,
+        "proxy_enabled": bool(settings.kite_proxy_url),
     }
     if not (api_key and access_token):
         return result
@@ -1202,7 +1204,11 @@ async def get_kite_status():
     try:
         from app.data.kite_client import KiteClient
 
-        client = KiteClient(api_key=api_key, access_token=access_token)
+        client = KiteClient(
+            api_key=api_key,
+            access_token=access_token,
+            proxy_url=settings.kite_proxy_url,
+        )
         profile = client.get_profile() or {}
         if profile.get("user_id"):
             result["authenticated"] = True
@@ -1227,11 +1233,18 @@ async def update_kite_credentials(body: dict):
         "api_secret": "KITE_API_SECRET",
         "access_token": "KITE_ACCESS_TOKEN",
         "redirect_url": "KITE_REDIRECT_URL",
+        "proxy_url": "KITE_PROXY_URL",
     }
     updates: dict[str, str] = {}
     for field, env_var in field_map.items():
-        value = (body.get(field) or "").strip()
-        if value:
+        # proxy_url may legitimately be cleared (empty string disables proxy)
+        raw = body.get(field)
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if field == "proxy_url":
+            updates[env_var] = value
+        elif value:
             updates[env_var] = value
     if not updates:
         raise HTTPException(status_code=400, detail="No Kite credentials provided")
@@ -1246,10 +1259,13 @@ async def kite_login_url():
     if not settings.kite_api_key:
         return {"login_url": None, "message": "KITE_API_KEY not configured"}
     try:
-        from kiteconnect import KiteConnect
+        from app.data.kite_client import KiteClient
 
-        kc = KiteConnect(api_key=settings.kite_api_key)
-        url = kc.login_url()
+        client = KiteClient(
+            api_key=settings.kite_api_key,
+            proxy_url=settings.kite_proxy_url,
+        )
+        url = client.kite.login_url()
         return {"login_url": url, "redirect_url": settings.kite_redirect_url}
     except Exception as exc:
         logger.exception("Failed to build Kite login URL")
@@ -1303,10 +1319,15 @@ async def kite_oauth_callback(
         return _redirect({"kite_auth_error": "kite_credentials_not_configured"})
 
     try:
-        from kiteconnect import KiteConnect
+        from app.data.kite_client import KiteClient
 
-        kc = KiteConnect(api_key=settings.kite_api_key)
-        data = kc.generate_session(request_token, api_secret=settings.kite_api_secret)
+        client = KiteClient(
+            api_key=settings.kite_api_key,
+            proxy_url=settings.kite_proxy_url,
+        )
+        data = client.kite.generate_session(
+            request_token, api_secret=settings.kite_api_secret
+        )
         access_token = (data or {}).get("access_token", "")
         user_id = (data or {}).get("user_id", "")
         if not access_token:
