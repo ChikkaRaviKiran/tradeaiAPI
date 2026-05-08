@@ -66,6 +66,7 @@ class KiteBroker(BaseBroker):
                 api_key=settings.kite_api_key,
                 access_token=settings.kite_access_token,
                 proxy_url=settings.kite_proxy_url,
+                market_protection_pct=float(settings.kite_market_protection_pct or 0),
             )
         except Exception:
             logger.exception("KiteBroker: failed to initialise KiteClient")
@@ -110,6 +111,12 @@ class KiteBroker(BaseBroker):
         if not self._client:
             return OrderResponse(status=OrderStatus.REJECTED, message="Kite client not initialised")
 
+        # Global execution policy: all live orders must be MARKET + CARRYFORWARD.
+        request.order_type = OrderType.MARKET
+        request.product_type = ProductType.CARRYFORWARD
+        request.price = 0.0
+        request.trigger_price = 0.0
+
         exchange = request.exchange or "NFO"
         kite_symbol = self._resolve_symbol(request, exchange)
         if not kite_symbol:
@@ -139,6 +146,16 @@ class KiteBroker(BaseBroker):
                 "KITE ORDER PLACED: %s %s qty=%s id=%s",
                 request.side.value, kite_symbol, request.quantity, order_id,
             )
+            if not settings.wait_for_terminal_order_status:
+                return OrderResponse(
+                    order_id=order_id,
+                    status=OrderStatus.OPEN,
+                    message="Order accepted by broker",
+                    filled_price=0.0,
+                    filled_quantity=0,
+                    timestamp=datetime.now(_IST),
+                )
+
             info = self._wait_terminal_status(order_id, expected_qty=int(request.quantity))
             status_raw = (info.get("status") or "").upper()
             avg_price = float(info.get("average_price", 0) or 0)
@@ -343,7 +360,9 @@ class KiteBroker(BaseBroker):
     def _wait_terminal_status(self, order_id: str, expected_qty: int) -> dict:
         """Poll Kite order_history until COMPLETE/REJECTED/CANCELLED or timeout."""
         last: dict = {}
-        for _ in range(ORDER_POLL_RETRIES):
+        retries = max(1, int(settings.order_status_poll_retries or ORDER_POLL_RETRIES))
+        delay = max(0.05, float(settings.order_status_poll_delay_seconds or ORDER_POLL_DELAY_SECONDS))
+        for _ in range(retries):
             try:
                 history = self._client.get_order_history(order_id) if self._client else []
                 if history:
@@ -358,7 +377,7 @@ class KiteBroker(BaseBroker):
                         return last
             except Exception:
                 logger.debug("Kite order poll error for %s", order_id)
-            time.sleep(ORDER_POLL_DELAY_SECONDS)
+            time.sleep(delay)
         return last
 
     def _simulate_order(self, request: OrderRequest) -> OrderResponse:

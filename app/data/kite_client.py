@@ -43,6 +43,7 @@ class KiteClient:
         access_token: str = "",
         account_name: str = "",
         proxy_url: str = "",
+        market_protection_pct: float = 0.0,
     ):
         if KiteConnect is None:
             raise RuntimeError(
@@ -64,6 +65,7 @@ class KiteClient:
             self._kite.set_access_token(access_token)
         self._instrument_cache_date = None
         self._instruments_by_exchange: dict[str, list[dict]] = {}
+        self.market_protection_pct = max(0.0, float(market_protection_pct or 0.0))
 
     @staticmethod
     def _safe_proxy_repr(url: str) -> str:
@@ -113,8 +115,8 @@ class KiteClient:
             "order_type": order_type,
             "product": product,
         }
-        if order_type == "MARKET":
-            kwargs["market_protection"] = 5
+        if order_type == "MARKET" and self.market_protection_pct > 0:
+            kwargs["market_protection"] = self.market_protection_pct
         if order_type in ("LIMIT", "SL"):
             kwargs["price"] = price
         if order_type in ("SL", "SL-M"):

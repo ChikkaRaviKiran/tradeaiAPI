@@ -82,6 +82,18 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
     min_margin_required: float = Field(default=5000, alias="MIN_MARGIN_REQUIRED")
+    # Order execution behavior:
+    # False = return immediately after broker accepts order (faster).
+    # True  = block briefly and poll for terminal status/fill price.
+    wait_for_terminal_order_status: bool = Field(
+        default=False,
+        alias="WAIT_FOR_TERMINAL_ORDER_STATUS",
+    )
+    order_status_poll_retries: int = Field(default=3, alias="ORDER_STATUS_POLL_RETRIES")
+    order_status_poll_delay_seconds: float = Field(
+        default=0.25,
+        alias="ORDER_STATUS_POLL_DELAY_SECONDS",
+    )
 
     # Dual-Engine Control
     v1_enabled: bool = Field(default=True, alias="V1_ENABLED")
@@ -183,6 +195,12 @@ class Settings(BaseSettings):
     # socks5h://user:pass@host:port (h = resolve DNS through proxy). Leave
     # empty to call Kite directly.
     kite_proxy_url: str = Field(default="", alias="KITE_PROXY_URL")
+    # Optional protective cap (%) for Kite MARKET orders.
+    # Set 0 to place pure MARKET orders without protection.
+    kite_market_protection_pct: float = Field(
+        default=0.0,
+        alias="KITE_MARKET_PROTECTION_PCT",
+    )
 
     # Active trading account: "angel" | "kite" | "dhan"
     trading_account: str = Field(default="angel", alias="TRADING_ACCOUNT")

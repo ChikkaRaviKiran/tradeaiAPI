@@ -461,6 +461,9 @@ class Orchestrator:
         while True:
             try:
                 await self._run_trading_day()
+            except asyncio.CancelledError:
+                await self.stop(reason="task_cancelled")
+                raise
             except Exception:
                 logger.exception("Unhandled error in trading day loop")
                 self._log_event("error", "Trading day crashed with unhandled error")
@@ -481,6 +484,22 @@ class Orchestrator:
             # After each day, reset state and wait until next pre-market
             self._reset_for_new_day()
             await self._sleep_until_premarket()
+
+    async def stop(self, reason: str = "manual") -> None:
+        """Gracefully stop orchestrator background activity.
+
+        Also flips global paper mode as a hard guard against late/queued
+        background tasks attempting live orders during shutdown.
+        """
+        self.running = False
+        settings.paper_trading = True
+        try:
+            if getattr(self.client, "ws", None):
+                self.client.ws.disconnect()
+        except Exception:
+            logger.debug("WS disconnect during stop failed", exc_info=True)
+        self._log_event("system", f"Orchestrator stopped ({reason})")
+        logger.info("Orchestrator stop requested (%s)", reason)
 
     def _reset_for_new_day(self) -> None:
         """Reset daily state for a fresh trading day."""

@@ -72,6 +72,14 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down...")
+    # Safety kill-switch: prevent any new real order execution during shutdown.
+    settings.paper_trading = True
+    orch = _state.get("orchestrator")
+    if orch is not None:
+        try:
+            await orch.stop(reason="app_shutdown")
+        except Exception:
+            logger.exception("Orchestrator stop hook failed during shutdown")
     orchestrator_task.cancel()
     try:
         await orchestrator_task

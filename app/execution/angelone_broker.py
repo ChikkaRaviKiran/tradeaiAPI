@@ -57,6 +57,12 @@ class AngelOneBroker(BaseBroker):
         if settings.paper_trading:
             return self._simulate_order(request)
 
+        # Global execution policy: all live orders must be MARKET + CARRYFORWARD.
+        request.order_type = OrderType.MARKET
+        request.product_type = ProductType.CARRYFORWARD
+        request.price = 0.0
+        request.trigger_price = 0.0
+
         self.client.ensure_authenticated()
         try:
             params = {
@@ -76,6 +82,15 @@ class AngelOneBroker(BaseBroker):
             if resp and resp.get("status"):
                 order_id = resp.get("data", {}).get("orderid", "")
                 logger.info("Order placed: %s | %s", order_id, request.trading_symbol)
+                if not settings.wait_for_terminal_order_status:
+                    return OrderResponse(
+                        order_id=order_id,
+                        status=OrderStatus.OPEN,
+                        message="Order accepted by broker",
+                        filled_price=0.0,
+                        filled_quantity=0,
+                        timestamp=datetime.now(_IST),
+                    )
                 # Poll briefly for terminal status so callers receive
                 # the fill price / confirmed status (mirrors KiteBroker).
                 info = self._wait_terminal_status(order_id, expected_qty=int(request.quantity))
@@ -238,7 +253,9 @@ class AngelOneBroker(BaseBroker):
         """Poll SmartAPI until the order is terminal or fully filled."""
         if not order_id:
             return {}
-        for _ in range(ORDER_POLL_RETRIES):
+        retries = max(1, int(settings.order_status_poll_retries or ORDER_POLL_RETRIES))
+        delay = max(0.05, float(settings.order_status_poll_delay_seconds or ORDER_POLL_DELAY_SECONDS))
+        for _ in range(retries):
             info = self._get_order_info(order_id)
             state = str(info.get("status", "") or "").strip().lower()
             if state in {"complete", "rejected", "cancelled", "canceled"}:
@@ -251,7 +268,7 @@ class AngelOneBroker(BaseBroker):
             if expected_qty > 0 and filled >= expected_qty and avg > 0:
                 info["status"] = "complete"
                 return info
-            time.sleep(ORDER_POLL_DELAY_SECONDS)
+            time.sleep(delay)
         return self._get_order_info(order_id)
 
     def _get_order_info(self, order_id: str) -> dict:
