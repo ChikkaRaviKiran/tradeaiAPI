@@ -47,6 +47,7 @@ from app.execution.broker_base import (
 from app.data.angelone_client import AngelOneClient
 from app.db.models import AsyncSessionLocal, IndexCandle
 from app.engine import scanner_exec_settings as exec_settings
+from app.engine.lot_sizer import compute_buy_option_lots
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -151,6 +152,7 @@ class PDHPDLBreakoutScanner:
         self._active_trade: Optional[PDHPDLTrade] = None
         self._expiry: str = ""
         self._expiry_date: Optional[date] = None
+        self._expiry_skip_notified = False
 
     # ── Public API used by orchestrator ─────────────────────────────
 
@@ -162,6 +164,7 @@ class PDHPDLBreakoutScanner:
         self._prev_low = None
         self._signal_found_today = False
         self._active_trade = None
+        self._expiry_skip_notified = False
 
     def set_expiry(self, expiry: str, expiry_date: Optional[date] = None) -> None:
         self._expiry = expiry
@@ -213,6 +216,30 @@ class PDHPDLBreakoutScanner:
 
         # ── Already done for today ──────────────────────────────────
         if self._signal_found_today:
+            return
+
+        # ── Skip on options expiry day (weekly/monthly) ────────────
+        # _expiry_date is sourced from the instrument master and reflects
+        # the actual listed expiry date; if today is expiry, we disable
+        # entries completely for this strategy.
+        if self._expiry_date and now.date() == self._expiry_date:
+            self._signal_found_today = True
+            if not self._expiry_skip_notified:
+                self._expiry_skip_notified = True
+                logger.info(
+                    "[PDHPDL] Day %s SKIPPED: options expiry day (expiry=%s)",
+                    self._today_str,
+                    self._expiry or self._expiry_date.isoformat(),
+                )
+                try:
+                    await self.alert_manager.telegram.send(
+                        f"📊 PDH/PDL — Day Skip\n"
+                        f"Date: {self._today_str}\n"
+                        f"Reason: Options expiry day ({self._expiry or self._expiry_date.isoformat()})\n"
+                        f"No trades today."
+                    )
+                except Exception:
+                    logger.exception("[PDHPDL] Failed to send expiry-skip Telegram")
             return
 
         # ── Setup check (one-shot, on first cycle of the day) ───────
@@ -330,8 +357,30 @@ class PDHPDLBreakoutScanner:
             and bool(symboltoken)
         )
         order_status = "OBSERVE ONLY — paper trade"
-        if live_exec:
-            lots = max(1, int(cfg.get("manual_lots", 1) or 1))
+        if self.broker is not None and option_ltp > 0:
+            if cfg.get("lots_mode") == "manual":
+                lots = max(1, min(int(cfg.get("manual_lots", 1) or 1), int(cfg.get("max_lots", 20) or 20)))
+            else:
+                lots, _sizing = compute_buy_option_lots(
+                    self.broker,
+                    premium=option_ltp,
+                    lot_size=int(instrument.lot_size),
+                    max_funds_cap=cfg.get("max_funds", 0),
+                    buffer_pct=cfg.get("buffer_pct", 5),
+                    max_lots_cap=cfg.get("max_lots", 20),
+                    min_lots=1,
+                )
+            self._active_trade.lots = lots
+            live_exec = (
+                bool(cfg.get("live_execution"))
+                and not settings.paper_trading
+                and option_ltp > 0
+                and bool(symboltoken)
+                and lots > 0
+            )
+
+        if live_exec and self._active_trade.lots > 0:
+            lots = int(self._active_trade.lots)
             self._active_trade.lots = lots
             qty = lots * int(instrument.lot_size)
             ok, oid = await self._place_option_order(
@@ -342,6 +391,9 @@ class PDHPDLBreakoutScanner:
             order_status = (
                 f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
             )
+        elif bool(cfg.get("live_execution")) and not settings.paper_trading:
+            if int(self._active_trade.lots or 0) == 0:
+                order_status = "LIVE skipped — insufficient funds for 1 lot"
 
         expiry_display = self._expiry or "N/A"
         days_to_expiry = (
