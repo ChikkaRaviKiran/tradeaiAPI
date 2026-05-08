@@ -71,11 +71,11 @@ class AngelOneBroker(BaseBroker):
                 "symboltoken": request.symbol_token,
                 "transactiontype": request.side.value,
                 "exchange": request.exchange,
-                "ordertype": request.order_type.value,
-                "producttype": self._map_product(request.product_type),
+                "ordertype": OrderType.MARKET.value,
+                "producttype": self._map_product(ProductType.CARRYFORWARD),
                 "duration": "DAY",
                 "quantity": str(request.quantity),
-                "price": str(request.price) if request.order_type == OrderType.LIMIT else "0",
+                "price": "0",
                 "triggerprice": str(request.trigger_price) if request.trigger_price > 0 else "0",
             }
             resp = self.client._smart_api.placeOrder(params)

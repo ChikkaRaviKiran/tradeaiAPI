@@ -203,6 +203,10 @@ class MoveDetectionScanner:
         peer_in_trade: bool = False,
     ) -> None:
         """Run one Move Detection scan cycle. Called every 60s by orchestrator."""
+        cfg = exec_settings.load("move_det")
+        if not bool(cfg.get("enabled", True)):
+            return
+
         if df_today is None or df_today.empty:
             return
 
@@ -847,7 +851,7 @@ class MoveDetectionScanner:
             exchange=trade.exchange or "NFO",
             side=OrderSide(side),
             order_type=OrderType.MARKET,
-            product_type=ProductType.INTRADAY,
+            product_type=ProductType.CARRYFORWARD,
             quantity=quantity,
             price=0.0,
             trigger_price=0.0,

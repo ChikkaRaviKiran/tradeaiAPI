@@ -134,8 +134,8 @@ class KiteBroker(BaseBroker):
                 exchange=exchange,
                 transaction_type=request.side.value,
                 quantity=int(request.quantity),
-                order_type=self._map_order_type(request.order_type),
-                product=self._map_product(request.product_type),
+                order_type=self._map_order_type(OrderType.MARKET),
+                product=self._map_product(ProductType.CARRYFORWARD),
                 price=float(request.price or 0),
                 trigger_price=float(request.trigger_price or 0),
             )

@@ -3,6 +3,7 @@
 Each scanner has its own JSON file under backend/data/.
 
 Schema:
+    enabled        : bool   — master scanner switch (false = scanner idle)
     live_execution : bool   — place real orders when paper_trading=False
     lots_mode      : str    — "auto" (size by available funds) or "manual"
     manual_lots    : int    — used when lots_mode == "manual"
@@ -21,6 +22,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {
+    "enabled": True,
     "live_execution": False,
     "lots_mode": "auto",        # "auto" | "manual"
     "manual_lots": 1,
@@ -47,6 +49,7 @@ def normalize(payload: dict[str, Any]) -> dict[str, Any]:
     out = dict(DEFAULTS)
     out.update(payload or {})
 
+    out["enabled"] = bool(out.get("enabled", True))
     out["live_execution"] = bool(out.get("live_execution", False))
 
     mode = str(out.get("lots_mode", "auto")).strip().lower()

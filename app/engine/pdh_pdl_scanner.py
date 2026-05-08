@@ -177,6 +177,10 @@ class PDHPDLBreakoutScanner:
         cycle: int,
         peer_in_trade: bool = False,
     ) -> None:
+        cfg = exec_settings.load("pdh_pdl")
+        if not bool(cfg.get("enabled", True)):
+            return
+
         if df_today is None or df_today.empty:
             return
         if isinstance(df_today.index, pd.DatetimeIndex):
@@ -603,7 +607,7 @@ class PDHPDLBreakoutScanner:
             exchange=trade.exchange or "NFO",
             side=OrderSide(side),
             order_type=OrderType.MARKET,
-            product_type=ProductType.INTRADAY,
+            product_type=ProductType.CARRYFORWARD,
             quantity=quantity,
             price=0.0,
             trigger_price=0.0,

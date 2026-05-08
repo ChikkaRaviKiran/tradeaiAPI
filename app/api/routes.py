@@ -687,21 +687,27 @@ async def start_system():
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
     if orch.running:
         return {"message": "System already running"}
-    # Launch a new trading day in the orchestrator's thread
-    import threading, asyncio
-    def _run():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # Guard against duplicate starts: only one manual trading-day task at a time.
+    task = _state.get("manual_start_task")
+    if task is not None and not task.done():
+        return {"message": "System start already in progress"}
+
+    async def _run_manual_day_once():
         try:
-            loop.run_until_complete(orch._run_trading_day())
+            await orch._run_trading_day()
+        except asyncio.CancelledError:
+            logger.info("Manual trading day task cancelled")
+            raise
         except Exception as e:
-            logger.exception("Trading day thread crashed: %s", e)
+            logger.exception("Manual trading day task crashed: %s", e)
             orch.running = False
-            if hasattr(orch, '_log_event'):
-                orch._log_event("error", f"Trading day crashed: {e}")
-    t = threading.Thread(target=_run, daemon=True, name="trading-day")
-    t.start()
-    return {"message": "System started"}
+            if hasattr(orch, "_log_event"):
+                orch._log_event("error", f"Manual trading day crashed: {e}")
+        finally:
+            _state["manual_start_task"] = None
+
+    _state["manual_start_task"] = asyncio.create_task(_run_manual_day_once())
+    return {"message": "System start requested"}
 
 
 @app.post("/api/system/stop")
@@ -710,6 +716,9 @@ async def stop_system():
     orch = _state.get("orchestrator")
     if orch:
         orch.running = False
+        task = _state.get("manual_start_task")
+        if task is not None and not task.done():
+            task.cancel()
         return {"message": "System stopped"}
     raise HTTPException(status_code=503, detail="Orchestrator not initialized")
 

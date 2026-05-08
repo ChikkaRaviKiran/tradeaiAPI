@@ -65,6 +65,7 @@ class ATLState:
     hedge_ce: Optional[ATLLeg] = None
     hedge_pe: Optional[ATLLeg] = None
     entered: bool = False
+    entry_in_progress: bool = False
     done_for_day: bool = False
     halted: bool = False           # circuit-breaker tripped
     halt_reason: str = ""          # human-readable reason for the halt
@@ -113,6 +114,7 @@ class ATLStraddleScanner:
 
     def _complete_for_day(self, reason: str) -> None:
         self._state.done_for_day = True
+        self._state.entry_in_progress = False
         self._state.halted = False
         self._state.halt_reason = ""
         self._state.phase = "IDLE"
@@ -288,8 +290,16 @@ class ATLStraddleScanner:
             entry_h, entry_m = 9, 20
             exit_h, exit_m = 15, 15
 
-        if now.time() >= datetime(now.year, now.month, now.day, exit_h, exit_m, tzinfo=IST).time() and self.is_in_trade():
-            await self.force_close(df_today, instrument)
+        session_exit_time = datetime(now.year, now.month, now.day, exit_h, exit_m, tzinfo=IST).time()
+        if now.time() >= session_exit_time:
+            if self.is_in_trade():
+                await self.force_close(df_today, instrument, reason="session_exit_time")
+                return
+            # No new entries after configured exit time.
+            if not self._state.done_for_day:
+                self._complete_for_day(
+                    f"Entry window ended at {exit_h:02d}:{exit_m:02d}; no new entries for today"
+                )
             return
 
         if self._state.done_for_day:
@@ -324,12 +334,14 @@ class ATLStraddleScanner:
                     f"Spot: {spot:.2f}\n"
                     f"SL Range: {sl_lower:.2f} - {sl_upper:.2f}"
                 )
-                await self.force_close(df_today, instrument)
-                self._state.done_for_day = True
+                await self.force_close(df_today, instrument, reason="spot_sl_breach")
                 return
 
         # Initial entry
         if not self._state.entered:
+            if self._state.entry_in_progress:
+                self._record_diag("entry_in_progress", "Entry already in progress; skipping duplicate cycle")
+                return
             if not self._force_entry and (
                 now.hour < entry_h or (now.hour == entry_h and now.minute < entry_m)
             ):
@@ -344,12 +356,14 @@ class ATLStraddleScanner:
                     f"Manual 'Place Now' bypassing entry-time gate at {now.strftime('%H:%M:%S')}",
                 )
                 self._force_entry = False
+            self._state.entry_in_progress = True
             rounded = round(spot / interval) * interval
             ce_strike = rounded + offset
             pe_strike = rounded - offset
             ce_q = await self._fetch_option_quote(instrument, ce_strike, "CE")
             pe_q = await self._fetch_option_quote(instrument, pe_strike, "PE")
             if not ce_q or not pe_q:
+                self._state.entry_in_progress = False
                 self._record_diag(
                     "no_option_quote",
                     f"Could not fetch option quotes (CE={int(ce_strike)} {'OK' if ce_q else 'MISS'}, "
@@ -359,6 +373,7 @@ class ATLStraddleScanner:
             ce_leg = await self._build_leg(instrument, ce_strike, "CE", fallback_quote=ce_q)
             pe_leg = await self._build_leg(instrument, pe_strike, "PE", fallback_quote=pe_q)
             if not ce_leg or not pe_leg:
+                self._state.entry_in_progress = False
                 self._record_diag(
                     "leg_build_fail",
                     f"Failed to build option legs (CE={'OK' if ce_leg else 'FAIL'}, "
@@ -386,6 +401,7 @@ class ATLStraddleScanner:
                     await self._close_hedges(instrument, "entry_fail_hedge")
                     self._state.hedge_ce = None
                     self._state.hedge_pe = None
+                    self._state.entry_in_progress = False
                     self._complete_for_day("Hedge leg placement failed; strategy completed for today")
                     return
 
@@ -398,6 +414,7 @@ class ATLStraddleScanner:
                     await self._close_hedges(instrument, "rollback_initial_entry")
                     self._state.hedge_ce = None
                     self._state.hedge_pe = None
+                self._state.entry_in_progress = False
                 self._complete_for_day("Entry leg placement failed; strategy completed for today")
                 return
 
@@ -426,6 +443,7 @@ class ATLStraddleScanner:
                 f"SELL CE {int(ce_strike)} @ ₹{self._state.ce.premium:.2f}\n"
                 f"SELL PE {int(pe_strike)} @ ₹{self._state.pe.premium:.2f}"
             )
+            self._state.entry_in_progress = False
             return
 
         # Update current premiums
@@ -578,7 +596,6 @@ class ATLStraddleScanner:
                 f"BUY hedges exit: CE {int(self._state.hedge_ce.strike) if self._state.hedge_ce else '-'} / "
                 f"PE {int(self._state.hedge_pe.strike) if self._state.hedge_pe else '-'}"
             )
-        self._state.done_for_day = True
         self._state.phase = "IDLE"
         self._state.hedge_ce = None
         self._state.hedge_pe = None
@@ -586,6 +603,7 @@ class ATLStraddleScanner:
             self._record_event("handoff", f"ATM closed due to {reason.replace('priority_handoff_', '').upper()} priority handoff @ spot {spot:.2f}")
         else:
             self._record_event("force_close", f"{reason} @ spot {spot:.2f}")
+        self._complete_for_day(f"Force close completed ({reason})")
         await self.alert_manager.telegram.send(
             f"🔔 ATL Force Close\nIndex: {instrument.symbol}\nSpot: {spot:.2f}\nReason: {reason}"
         )
