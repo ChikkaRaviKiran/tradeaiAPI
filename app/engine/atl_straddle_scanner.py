@@ -739,6 +739,15 @@ class ATLStraddleScanner:
             self._record_event("order_error", f"{side} {leg.symbol} rejected ({msg})")
             return False
 
+        # Fast-ack mode returns OPEN/PENDING once the broker accepts the order.
+        # Treat that as successful placement to avoid false strategy halts.
+        if resp.status in {OrderStatus.OPEN, OrderStatus.PENDING}:
+            self._record_event(
+                "order",
+                f"{side} {leg.symbol} qty={qty} id={resp.order_id} accepted ({reason})",
+            )
+            return True
+
         if resp.status == OrderStatus.COMPLETE or resp.filled_price > 0:
             if resp.filled_price > 0:
                 leg.premium = resp.filled_price
