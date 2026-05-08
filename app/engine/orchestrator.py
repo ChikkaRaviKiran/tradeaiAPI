@@ -18,6 +18,7 @@ Schedule:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import deque
 from datetime import datetime, time as dtime, timedelta
@@ -69,13 +70,9 @@ from app.backtest.scheduler import EvaluationScheduler
 from app.ai.pre_market_analyst import PreMarketAnalyst
 from app.ai.insight_manager import InsightManager
 from app.engine.ai_decision import set_ai_insight_manager
-from app.engine.config_p_scanner import ConfigPScanner
 from app.engine.move_detection_scanner import MoveDetectionScanner
-from app.engine.ai_gpt_scanner import AIGPTScanner
-from app.engine.nr5_breakout_scanner import NR5BreakoutScanner
 from app.engine.pdh_pdl_scanner import PDHPDLBreakoutScanner
 from app.engine.atl_straddle_scanner import ATLStraddleScanner
-from app.ai.ai_gpt_pipeline import AIGPTPipeline
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
 from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
@@ -113,7 +110,8 @@ _STRATEGY_WINDOWS: dict[str, dict[str, list[tuple]]] = {
     },
 }
 
-LOOP_INTERVAL_SECONDS = 60  # 1-minute analysis cycle
+LOOP_INTERVAL_SECONDS = max(5.0, float(getattr(settings, "orchestrator_loop_interval_seconds", 20.0) or 20.0))
+INSTRUMENT_GAP_SECONDS = max(0.0, float(getattr(settings, "orchestrator_instrument_gap_seconds", 0.5) or 0.5))
 
 # Regime compatibility — allow all proven strategies in all regimes
 # (they have internal condition checks: ADX, RSI, Donchian, EMA crossovers)
@@ -256,60 +254,21 @@ class Orchestrator:
         # Wire insight manager into AI decision engine
         set_ai_insight_manager(self.insight_manager)
 
-        # ── Config P Scanner (bearish momentum, detect_move based) ──
-        self.config_p_scanner = ConfigPScanner(
-            client=self.client,
-            feature_engine=self.feature_engine,
-            alert_manager=self.alert_manager,
-        )
-
         # ── Move Detection Scanner (Production v2 AGGRESSIVE, scan_all_moves based) ──
         self.move_detection_scanner = MoveDetectionScanner(
             client=self.client,
             feature_engine=self.feature_engine,
             alert_manager=self.alert_manager,
             broker=self._build_atl_broker(),
+            pre_entry_hook=self._pre_signal_handoff,
         )
-
-        # ── AI-GPT Scanner (3-stage GPT pipeline, 5-min cadence) ──
-        ai_pipeline: Optional[AIGPTPipeline] = None
-        if settings.ai_gpt_scanner_enabled and settings.openai_api_key:
-            try:
-                ai_pipeline = AIGPTPipeline(
-                    api_key=settings.openai_api_key,
-                    model=settings.ai_gpt_scanner_model,
-                )
-                logger.info(
-                    "[AI-GPT] Pipeline initialised (model=%s)",
-                    settings.ai_gpt_scanner_model,
-                )
-            except Exception:
-                logger.exception("[AI-GPT] Pipeline init failed — scanner disabled")
-                ai_pipeline = None
-        else:
-            logger.info("[AI-GPT] Scanner disabled (enabled=%s, key_set=%s)",
-                        settings.ai_gpt_scanner_enabled,
-                        bool(settings.openai_api_key))
-        self.ai_gpt_scanner = AIGPTScanner(
-            client=self.client,
-            feature_engine=self.feature_engine,
-            alert_manager=self.alert_manager,
-            pipeline=ai_pipeline,
-        )
-
-        # ── NR5 Breakout Scanner (volatility contraction, PAPER-ONLY) ──
-        self.nr5_scanner = NR5BreakoutScanner(
-            client=self.client,
-            alert_manager=self.alert_manager,
-        )
-        if not settings.nr5_scanner_enabled:
-            logger.info("[NR5] Scanner disabled via config (NR5_SCANNER_ENABLED=false)")
 
         # ── PDH/PDL Breakout Scanner (prev-day H/L breakout) ──
         self.pdh_pdl_scanner = PDHPDLBreakoutScanner(
             client=self.client,
             alert_manager=self.alert_manager,
             broker=self._build_atl_broker(),
+            pre_entry_hook=self._pre_signal_handoff,
         )
         if not settings.pdh_pdl_scanner_enabled:
             logger.info("[PDHPDL] Scanner disabled via config (PDH_PDL_SCANNER_ENABLED=false)")
@@ -402,6 +361,7 @@ class Orchestrator:
 
         # RSS news polling (every 30 min during market hours)
         self._last_rss_fetch: Optional[datetime] = None
+        self._last_eod_snapshot_date: Optional[str] = None
 
         # ── Pipeline Activity Log ────────────────────────────────────
         # Ring buffer of pipeline events for dashboard visibility
@@ -450,10 +410,10 @@ class Orchestrator:
         inst_names = [i.symbol for i in self._active_instruments]
 
         logger.info("=" * 60)
-        logger.info("TradeAI Orchestrator started — CONFIG P + MOVE DETECTION MODE")
+        logger.info("TradeAI Orchestrator started — MOVE DET + PDH/PDL + ATM MODE")
         logger.info("Mode: %s", "AUTO-SELECT" if settings.auto_select_instruments else "MANUAL")
         logger.info("Active instruments: %s", ", ".join(inst_names))
-        logger.info("Engine: CONFIG P + MOVE DETECTION (all V1/V2 strategies disabled)")
+        logger.info("Engine: MOVE DET + PDH/PDL + ATM (other scanners disabled)")
         logger.info("Paper trading: %s", settings.paper_trading)
         logger.info("Capital: ₹%s", f"{settings.initial_capital:,.0f}")
         logger.info("=" * 60)
@@ -535,14 +495,8 @@ class Orchestrator:
         self._gap_skip_today = False  # Reset gap skip flag for new day
         # V1 strategies disabled — Config P + Move Detection scanners are the active engines
         self.strategies = []
-        # Reset Config P scanner daily state
-        self.config_p_scanner.reset_daily()
         # Reset Move Detection scanner daily state
         self.move_detection_scanner.reset_daily()
-        # Reset AI-GPT scanner daily state
-        self.ai_gpt_scanner.reset_daily()
-        # Reset NR5 scanner daily state
-        self.nr5_scanner.reset_daily()
         # Reset PDH/PDL scanner daily state
         self.pdh_pdl_scanner.reset_daily()
         self.running = False
@@ -621,10 +575,7 @@ class Orchestrator:
             return
 
         # Reset scanner daily state (ensures _today_str is correct after weekends/holidays)
-        self.config_p_scanner.reset_daily()
         self.move_detection_scanner.reset_daily()
-        self.ai_gpt_scanner.reset_daily()
-        self.nr5_scanner.reset_daily()
         self.pdh_pdl_scanner.reset_daily()
 
         self.running = True
@@ -692,12 +643,9 @@ class Orchestrator:
             nifty_expiry = self._expiries.get("NIFTY")
             nifty_expiry_date = self._expiry_dates.get("NIFTY")
             if nifty_expiry:
-                self.config_p_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.move_detection_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                self.ai_gpt_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                self.nr5_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.pdh_pdl_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                logger.info("[ConfigP+MoveDet+AIGPT+NR5+PDHPDL] Expiry set: %s", nifty_expiry)
+                logger.info("[MoveDet+PDHPDL] Expiry set: %s", nifty_expiry)
 
             # Pass the ATL-configured index's expiry to the ATL scanner.
             # Strategy may be set to NIFTY or SENSEX in the UI; honour that.
@@ -736,21 +684,20 @@ class Orchestrator:
 
         inst_names = [i.symbol for i in self._active_instruments]
         await self.alert_manager.send_info(
-            "SYSTEM STARTED — CONFIG P MODE",
+            "SYSTEM STARTED — CORE SCANNERS",
             f"Mode: {'AUTO-SELECT' if settings.auto_select_instruments else 'MANUAL'}\n"
             f"Instruments: {', '.join(inst_names)}\n"
-            f"Engines: CONFIG P + MOVE-DET (bearish momentum)\n"
-            f"All V1/V2 strategies: DISABLED\n"
+            f"Engines: MOVE-DET + PDH/PDL + ATM\n"
             f"Paper trading: {settings.paper_trading}\nCapital: ₹{settings.initial_capital:,.0f}",
         )
         # Also push to Telegram (send_info is UI-only)
         await self.alert_manager.telegram.send(
-            f"🟢 SYSTEM STARTED — DUAL SCANNER MODE\n"
+            f"🟢 SYSTEM STARTED — CORE SCANNER MODE\n"
             f"Instruments: {', '.join(inst_names)}\n"
             f"Engines:\n"
-            f"  1. CONFIG P — detect_move (bear, conf≥70, EMA aligned)\n"
-            f"  2. MOVE-DET — scan_all_moves (bear, conf≥80, AGGRESSIVE)\n"
-            f"Each scanner runs independently with own weekly filter.\n"
+            f"  1. MOVE-DET\n"
+            f"  2. PDH/PDL\n"
+            f"  3. ATM Straddle\n"
             f"Observe mode: ON"
         )
         self._log_event("setup", f"System started: instruments={', '.join(inst_names)}")
@@ -899,6 +846,7 @@ class Orchestrator:
 
             # Post-market: generate daily report + run strategy evaluation
             if REPORT_TIME <= current_time <= dtime(16, 0):
+                await self._auto_capture_eod_snapshot(now_ist)
                 await self._generate_daily_report()
                 await self._run_post_market_evaluation()
                 await self._collect_daily_option_data()
@@ -926,7 +874,7 @@ class Orchestrator:
             # Analyze each active instrument (with small delay between to avoid API rate limits)
             for idx, instrument in enumerate(self._active_instruments):
                 if idx > 0:
-                    await asyncio.sleep(2)  # 2s gap to avoid AngelOne rate limiting
+                    await asyncio.sleep(INSTRUMENT_GAP_SECONDS)
                 await self._analyze_instrument(instrument, cycle, now)
 
             # Fetch basic price data for main indices not in active set
@@ -964,6 +912,44 @@ class Orchestrator:
 
         except Exception:
             logger.exception("Error in analysis cycle")
+
+    async def _pre_signal_handoff(
+        self,
+        source: str,
+        instrument: InstrumentConfig,
+        df_today: pd.DataFrame,
+    ) -> bool:
+        """Ensure ATM is flattened before MoveDet/PDH-PDL entries."""
+        atl = self.atl_straddle_scanner
+        if not atl or not atl.is_in_trade():
+            return True
+
+        # Resolve the instrument/frame for whichever index ATM is configured on.
+        atl_inst = instrument
+        atl_df = df_today
+        try:
+            from app.engine.atl_settings import load_atl_settings
+
+            atl_index = (load_atl_settings().get("index") or "NIFTY").upper()
+            for inst in self._active_instruments:
+                if inst.symbol == atl_index:
+                    atl_inst = inst
+                    break
+            atl_df = self._df_today_cache.get(atl_inst.symbol) or atl_df
+        except Exception:
+            logger.debug("Priority handoff: fallback to current instrument/frame", exc_info=True)
+
+        try:
+            await atl.force_close(atl_df, atl_inst, reason=f"priority_handoff_{source}")
+            logger.info(
+                "Priority handoff: force-closed ATM before %s entry (%s)",
+                source,
+                atl_inst.symbol,
+            )
+            return True
+        except Exception:
+            logger.exception("Priority handoff failed: could not force-close ATM before %s", source)
+            return False
 
     async def _maybe_fetch_rss_news(self) -> None:
         """Fetch RSS + Telegram news if 15+ minutes since last fetch."""
@@ -1502,36 +1488,20 @@ class Orchestrator:
                 except Exception:
                     logger.exception("10AM strategy re-selection failed")
 
-            # ── SIGNAL SCANNERS (Config P + Move Detection + NR5) ────
-            # All scanners run independently on NIFTY. Each has its own
-            # day assessment / setup detection and trade tracking.
-            # Mutex: only ONE of Config-P / Move-Det / NR5 may hold a live
-            # trade at any given time. Each is told whether ANY peer is
-            # currently in a trade so it can skip new entries.
+            # ── SIGNAL SCANNERS (Move Detection + PDH/PDL) ────
+            # Mutex: only one of the two can hold a live trade at a time.
             if symbol == "NIFTY":
-                cp_in_trade = self.config_p_scanner.is_in_trade()
                 md_in_trade = self.move_detection_scanner.is_in_trade()
-                nr5_in_trade = self.nr5_scanner.is_in_trade()
                 pdh_in_trade = self.pdh_pdl_scanner.is_in_trade()
-                await self.config_p_scanner.run_cycle(
-                    df_today, instrument, cycle,
-                    peer_in_trade=(md_in_trade or nr5_in_trade or pdh_in_trade),
-                )
                 await self.move_detection_scanner.run_cycle(
                     df_today, instrument, cycle,
-                    peer_in_trade=(cp_in_trade or nr5_in_trade or pdh_in_trade),
+                    peer_in_trade=pdh_in_trade,
                 )
-                if settings.nr5_scanner_enabled:
-                    await self.nr5_scanner.run_cycle(
-                        df_today, instrument, cycle,
-                        peer_in_trade=(cp_in_trade or md_in_trade or pdh_in_trade),
-                    )
                 if settings.pdh_pdl_scanner_enabled:
                     await self.pdh_pdl_scanner.run_cycle(
                         df_today, instrument, cycle,
-                        peer_in_trade=(cp_in_trade or md_in_trade or nr5_in_trade),
+                        peer_in_trade=md_in_trade,
                     )
-                await self.ai_gpt_scanner.run_cycle(df_today, instrument, cycle)
             # ATL Straddle scanner runs for whichever index it is configured
             # for (NIFTY or SENSEX) — internal symbol gate skips other instruments.
             try:
@@ -3146,13 +3116,8 @@ class Orchestrator:
         # Close Config P scanner trade first
         from app.core.instruments import NIFTY as _NIFTY_INST
         nifty_df = self._df_today_cache.get("NIFTY")
-        await self.config_p_scanner.force_close(nifty_df, _NIFTY_INST)
         # Close Move Detection scanner trade
         await self.move_detection_scanner.force_close(nifty_df, _NIFTY_INST)
-        # Close AI-GPT scanner trade
-        await self.ai_gpt_scanner.force_close(nifty_df, _NIFTY_INST)
-        # Close NR5 Breakout scanner trade
-        await self.nr5_scanner.force_close(nifty_df, _NIFTY_INST)
         # Close PDH/PDL Breakout scanner trade
         await self.pdh_pdl_scanner.force_close(nifty_df, _NIFTY_INST)
 
@@ -3215,6 +3180,127 @@ class Orchestrator:
 
         except Exception:
             logger.exception("Error generating daily report")
+
+    async def _auto_capture_eod_snapshot(self, now_ist: Optional[datetime] = None) -> None:
+        """Capture broker EOD snapshot automatically once per day at/after 15:30 IST."""
+        now_ist = now_ist or datetime.now(IST)
+        target_date = now_ist.strftime("%Y-%m-%d")
+        if self._last_eod_snapshot_date == target_date:
+            return
+
+        account = (settings.trading_account or "angel").strip().lower()
+        account_name = account.upper()
+        broker = self._build_atl_broker() or self.broker
+
+        realised = 0.0
+        unrealised = 0.0
+        positions_count = 0
+        payload: list[dict] = []
+
+        try:
+            cls_name = broker.__class__.__name__.lower()
+
+            # Kite adapter
+            if cls_name.startswith("kite") and hasattr(broker, "_client"):
+                raw = broker._client.get_positions() or {}
+                net = raw.get("net", []) or []
+                payload = net
+                positions_count = len(net)
+                for p in net:
+                    realised += float(p.get("realised", 0) or p.get("realized", 0) or 0)
+                    unrealised += float(p.get("unrealised", 0) or p.get("unrealized", 0) or p.get("m2m", 0) or 0)
+
+            # Dhan adapter
+            elif cls_name.startswith("dhan") and hasattr(broker, "_client"):
+                raw = broker._client.get_positions() or []
+                payload = raw
+                positions_count = len(raw)
+                for p in raw:
+                    realised += float(p.get("realizedProfit", 0) or p.get("realised", 0) or 0)
+                    unrealised += float(p.get("unrealizedProfit", 0) or p.get("unrealised", 0) or 0)
+
+            # Angel (or fallback)
+            else:
+                raw = []
+                try:
+                    resp = broker.client._smart_api.position()  # noqa: SLF001
+                    raw = (resp or {}).get("data") or []
+                except Exception:
+                    logger.exception("EOD snapshot: angel position fetch failed")
+                payload = raw
+                positions_count = len(raw)
+                for p in raw:
+                    pnl = float(p.get("pnl", 0) or 0)
+                    r = float(p.get("realised", 0) or p.get("realized", 0) or 0)
+                    realised += r
+                    unrealised += float(p.get("unrealised", 0) or p.get("unrealized", pnl - r) or 0)
+
+            # Fallback when raw payload isn't available
+            if not payload:
+                basic_positions = await asyncio.to_thread(broker.get_positions)
+                payload = [
+                    {
+                        "trading_symbol": p.trading_symbol,
+                        "exchange": p.exchange,
+                        "quantity": p.quantity,
+                        "average_price": p.average_price,
+                        "ltp": p.ltp,
+                        "pnl": p.pnl,
+                        "product_type": p.product_type,
+                    }
+                    for p in basic_positions
+                ]
+                positions_count = len(payload)
+                unrealised = float(sum(float(p.pnl or 0) for p in basic_positions))
+
+            broker_pnl = float(realised + unrealised)
+
+            from sqlalchemy import select
+            from app.db.models import AsyncSessionLocal, BrokerEODSnapshot
+
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    existing = (
+                        await session.execute(
+                            select(BrokerEODSnapshot)
+                            .where(
+                                BrokerEODSnapshot.date == target_date,
+                                BrokerEODSnapshot.account_name == account_name,
+                            )
+                            .order_by(BrokerEODSnapshot.id.desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+
+                    if existing:
+                        existing.broker_pnl = broker_pnl
+                        existing.realised = float(realised)
+                        existing.unrealised = float(unrealised)
+                        existing.positions_count = int(positions_count)
+                        existing.payload_json = json.dumps(payload)
+                    else:
+                        session.add(
+                            BrokerEODSnapshot(
+                                date=target_date,
+                                account_name=account_name,
+                                broker_pnl=broker_pnl,
+                                realised=float(realised),
+                                unrealised=float(unrealised),
+                                positions_count=int(positions_count),
+                                payload_json=json.dumps(payload),
+                            )
+                        )
+
+            self._last_eod_snapshot_date = target_date
+            logger.info(
+                "EOD snapshot captured automatically (%s, %s): pnl=%.2f positions=%d",
+                target_date,
+                account_name,
+                broker_pnl,
+                positions_count,
+            )
+        except Exception:
+            logger.exception("Automatic EOD snapshot capture failed for %s", target_date)
 
     async def _run_premarket_evaluation(self) -> None:
         """Run strategy evaluation before market open to auto-select instruments.

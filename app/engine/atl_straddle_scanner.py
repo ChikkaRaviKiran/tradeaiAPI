@@ -88,6 +88,7 @@ class ATLStraddleScanner:
         self._events: list[dict] = []
         self._diag_last: dict[str, datetime] = {}
         self._force_entry: bool = False
+        self._last_done_signature: str = ""
 
     def reset_daily(self) -> None:
         self._today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -96,6 +97,28 @@ class ATLStraddleScanner:
         self._events = []
         self._diag_last = {}
         self._force_entry = False
+        self._last_done_signature = ""
+
+    def _settings_signature(self) -> str:
+        """Minimal signature used to detect user intent to re-arm intraday."""
+        return "|".join(
+            [
+                str(self._settings.get("enabled", False)),
+                str(self._settings.get("index", "NIFTY")),
+                str(self._settings.get("entry_time", "09:20")),
+                str(self._settings.get("exit_time", "15:15")),
+                str(self._settings.get("execution_account", "Primary")),
+            ]
+        )
+
+    def _complete_for_day(self, reason: str) -> None:
+        self._state.done_for_day = True
+        self._state.halted = False
+        self._state.halt_reason = ""
+        self._state.phase = "IDLE"
+        self._state.entered = False
+        self._last_done_signature = self._settings_signature()
+        self._record_event("complete", reason)
 
     def _is_live(self) -> bool:
         """True only when global mode is LIVE AND the strategy's execution
@@ -173,6 +196,9 @@ class ATLStraddleScanner:
             "expiry": self._expiry,
             "entry_time": self._settings.get("entry_time", "09:20"),
             "exit_time": self._settings.get("exit_time", "15:15"),
+            "strike_interval": self._settings.get("strike_interval", 50),
+            "offset_points": self._settings.get("offset_points", 500),
+            "rolling_points": self._settings.get("rolling_points", 300),
             "sl_type": self._settings.get("sl_type", "premium_pct"),
             "sl_lower": self._settings.get("sl_lower", 0),
             "sl_upper": self._settings.get("sl_upper", 0),
@@ -208,8 +234,18 @@ class ATLStraddleScanner:
             self.reset_daily()
 
         # Refresh settings periodically so UI changes apply intraday.
-        if cycle % 5 == 0:
+        refresh_every = max(1, int(getattr(settings, "atl_settings_refresh_cycles", 1) or 1))
+        if cycle % refresh_every == 0:
             self._settings = load_atl_settings()
+            # User can re-arm intraday by changing strategy timing/settings.
+            if self._state.done_for_day and self._settings_signature() != self._last_done_signature:
+                self._state.done_for_day = False
+                self._state.halted = False
+                self._state.halt_reason = ""
+                self._state.phase = "IDLE"
+                self._state.entered = False
+                self._diag_last.clear()
+                self._record_event("rearm", "Settings changed by user — strategy re-armed")
 
         if not self._settings.get("enabled", False):
             self._record_diag(
@@ -258,13 +294,6 @@ class ATLStraddleScanner:
 
         if self._state.done_for_day:
             self._record_diag("done_for_day", "Strategy already completed for the day")
-            return
-
-        if self._state.halted:
-            self._record_diag(
-                "halted",
-                f"Halted for the day: {self._state.halt_reason}. Click 'Force Close ATM' or restart to retry.",
-            )
             return
 
         if peer_in_trade and not self.is_in_trade():
@@ -351,13 +380,13 @@ class ATLStraddleScanner:
             if self._settings.get("hedge_enabled", False):
                 hedges_required = True
                 await self._ensure_hedges(instrument, rounded)
-                hedges_placed = bool(self._state.hedge_ce or self._state.hedge_pe)
+                hedges_placed = bool(self._state.hedge_ce and self._state.hedge_pe)
                 if not hedges_placed:
-                    # Hedge orders all rejected — do NOT proceed to sell naked.
-                    self._trip_halt(
-                        "Hedge BUY orders rejected; refusing to sell naked. "
-                        "Fix the broker rejection reason and reset before retrying."
-                    )
+                    # Hedge failure: flatten whatever was placed and finish for the day.
+                    await self._close_hedges(instrument, "entry_fail_hedge")
+                    self._state.hedge_ce = None
+                    self._state.hedge_pe = None
+                    self._complete_for_day("Hedge leg placement failed; strategy completed for today")
                     return
 
             if not await self._execute_entry_legs(instrument, ce_leg, pe_leg, reason="initial_entry"):
@@ -369,14 +398,25 @@ class ATLStraddleScanner:
                     await self._close_hedges(instrument, "rollback_initial_entry")
                     self._state.hedge_ce = None
                     self._state.hedge_pe = None
-                # Trip the circuit breaker so we stop spamming the broker.
-                self._trip_halt("Short legs rejected by broker. Fix the rejection reason and reset before retrying.")
+                self._complete_for_day("Entry leg placement failed; strategy completed for today")
                 return
 
             self._state.ce = ce_leg
             self._state.pe = pe_leg
             self._state.entered = True
-            self._state.phase = "STRANGLE"
+            if ce_strike == pe_strike:
+                # Entry is already ATM straddle (offset=0). Avoid immediate
+                # close/reopen of identical strikes on the next touch check.
+                self._state.phase = "STRADDLE"
+                self._state.straddle_strike = ce_strike
+                prem_sum = self._state.ce.premium + self._state.pe.premium
+                self._state.straddle_sl_points = (
+                    prem_sum * (int(self._settings.get("first_straddle_sl_pct", 100)) / 100.0)
+                    if sl_type == "premium_pct"
+                    else 0.0
+                )
+            else:
+                self._state.phase = "STRANGLE"
             self._state.ref_spot = spot
             self._record_event("entry", f"STRANGLE CE {int(ce_strike)} PE {int(pe_strike)} @ spot {spot:.2f}")
             await self.alert_manager.telegram.send(
@@ -468,6 +508,23 @@ class ATLStraddleScanner:
                 await self._convert_to_straddle(instrument, new_strike, spot, reform=True)
 
     async def _convert_to_straddle(self, instrument: InstrumentConfig, strike: float, spot: float, reform: bool = False) -> None:
+        if (
+            self._state.ce
+            and self._state.pe
+            and self._state.ce.strike == strike
+            and self._state.pe.strike == strike
+        ):
+            # Already on the requested straddle strike — do not churn orders.
+            self._state.phase = "STRADDLE"
+            self._state.straddle_strike = strike
+            if str(self._settings.get("sl_type", "premium_pct")).lower() == "premium_pct":
+                pct = int(self._settings.get("first_straddle_sl_pct", 100)) if self._state.is_first_straddle else int(self._settings.get("reform_straddle_sl_pct", 60))
+                self._state.straddle_sl_points = (self._state.ce.premium + self._state.pe.premium) * (pct / 100.0)
+            else:
+                self._state.straddle_sl_points = 0.0
+            self._record_event("straddle", f"AT-STRIKE strike {int(strike)} spot {spot:.2f} sl {self._state.straddle_sl_points:.2f} (no switch)")
+            return
+
         ce_q = await self._fetch_option_quote(instrument, strike, "CE")
         pe_q = await self._fetch_option_quote(instrument, strike, "PE")
         if not ce_q or not pe_q:
@@ -503,14 +560,19 @@ class ATLStraddleScanner:
             f"SL points: {self._state.straddle_sl_points:.2f}"
         )
 
-    async def force_close(self, df_today: pd.DataFrame, instrument: InstrumentConfig) -> None:
+    async def force_close(
+        self,
+        df_today: pd.DataFrame,
+        instrument: InstrumentConfig,
+        reason: str = "eod_force_close",
+    ) -> None:
         if not self.is_in_trade():
             return
         spot = float(df_today.iloc[-1]["close"]) if df_today is not None and not df_today.empty else 0.0
         # Close active short legs first.
-        await self._close_current_shorts(instrument, reason="eod_force_close")
+        await self._close_current_shorts(instrument, reason=reason)
         if self._settings.get("hedge_mode", "none") != "none" and (self._state.hedge_ce or self._state.hedge_pe):
-            await self._close_hedges(instrument, reason="eod_force_close")
+            await self._close_hedges(instrument, reason=reason)
             await self.alert_manager.telegram.send(
                 f"🛡️ ATL Hedge Close ({self._mode_label()})\n"
                 f"BUY hedges exit: CE {int(self._state.hedge_ce.strike) if self._state.hedge_ce else '-'} / "
@@ -520,9 +582,12 @@ class ATLStraddleScanner:
         self._state.phase = "IDLE"
         self._state.hedge_ce = None
         self._state.hedge_pe = None
-        self._record_event("force_close", f"EOD close @ spot {spot:.2f}")
+        if "priority_handoff" in reason:
+            self._record_event("handoff", f"ATM closed due to {reason.replace('priority_handoff_', '').upper()} priority handoff @ spot {spot:.2f}")
+        else:
+            self._record_event("force_close", f"{reason} @ spot {spot:.2f}")
         await self.alert_manager.telegram.send(
-            f"🔔 ATL EOD Force Close\nIndex: {instrument.symbol}\nSpot: {spot:.2f}"
+            f"🔔 ATL Force Close\nIndex: {instrument.symbol}\nSpot: {spot:.2f}\nReason: {reason}"
         )
 
     async def _ensure_hedges(self, instrument: InstrumentConfig, ref_strike: float) -> None:
@@ -555,10 +620,24 @@ class ATLStraddleScanner:
             hedge_lots = int(self._settings.get("hedge_lots", 0) or 0)
             short_lots = int(self._settings.get("lots", 1) or 1)
             lots = hedge_lots if hedge_lots > 0 else short_lots
+            hedge_failed = False
             if self._state.hedge_ce and not await self._place_leg_order(instrument, self._state.hedge_ce, "BUY", lots, "hedge_entry"):
                 self._state.hedge_ce = None
+                hedge_failed = True
             if self._state.hedge_pe and not await self._place_leg_order(instrument, self._state.hedge_pe, "BUY", lots, "hedge_entry"):
                 self._state.hedge_pe = None
+                hedge_failed = True
+
+            if hedge_failed:
+                await self._close_current_shorts(instrument, "hedge_leg_fail")
+                await self._close_hedges(instrument, "hedge_leg_fail")
+                self._state.ce = None
+                self._state.pe = None
+                self._state.hedge_ce = None
+                self._state.hedge_pe = None
+                self._complete_for_day("Hedge leg failed at broker; flattened and completed for today")
+                return
+
             ce_strike = int(self._state.hedge_ce.strike) if self._state.hedge_ce else "-"
             ce_px = f"₹{self._state.hedge_ce.premium:.2f}" if self._state.hedge_ce else "-"
             pe_strike = int(self._state.hedge_pe.strike) if self._state.hedge_pe else "-"
@@ -931,6 +1010,14 @@ class ATLStraddleScanner:
             await self._place_leg_order(instrument, ce_leg, "BUY", lots, f"rollback_{reason}")
         if pe_ok and not ce_ok:
             await self._place_leg_order(instrument, pe_leg, "BUY", lots, f"rollback_{reason}")
+        # Ensure no residual exposure remains on leg mismatch.
+        await self._close_current_shorts(instrument, f"flatten_{reason}")
+        await self._close_hedges(instrument, f"flatten_{reason}")
+        self._state.ce = None
+        self._state.pe = None
+        self._state.hedge_ce = None
+        self._state.hedge_pe = None
+        self._complete_for_day("One or more legs failed at broker; flattened and completed for today")
         return False
 
     async def _close_current_shorts(self, instrument: InstrumentConfig, reason: str) -> bool:
@@ -958,6 +1045,7 @@ class ATLStraddleScanner:
         old_pe = self._state.pe
         if not await self._close_current_shorts(instrument, f"close_{reason}"):
             await self.alert_manager.telegram.send(f"⚠️ ATL {reason}: failed to close current short legs")
+            self._complete_for_day("Failed to close current legs during switch; completed for today")
             return False
         if await self._execute_entry_legs(instrument, new_ce, new_pe, f"open_{reason}"):
             return True
@@ -965,6 +1053,13 @@ class ATLStraddleScanner:
         await self.alert_manager.telegram.send(f"⚠️ ATL {reason}: failed opening new legs, attempting rollback")
         if old_ce and old_pe:
             await self._execute_entry_legs(instrument, old_ce, old_pe, f"rollback_{reason}")
+        await self._close_current_shorts(instrument, f"flatten_{reason}")
+        await self._close_hedges(instrument, f"flatten_{reason}")
+        self._state.ce = None
+        self._state.pe = None
+        self._state.hedge_ce = None
+        self._state.hedge_pe = None
+        self._complete_for_day("Switch leg placement failed; flattened and completed for today")
         return False
 
     async def _roll_strangle(self, instrument: InstrumentConfig, new_ce_strike: float, new_pe_strike: float, reason: str) -> bool:

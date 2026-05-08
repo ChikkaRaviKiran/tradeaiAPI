@@ -7,9 +7,11 @@ and ML predictions alongside existing trade/performance endpoints.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
+from typing import Any
 
 import pyotp
 import pytz
@@ -41,6 +43,242 @@ _state: dict = {
 
 def get_state() -> dict:
     return _state
+
+
+def _safe_num(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _map_product_type(product: str):
+    from app.execution.broker_base import ProductType
+
+    p = str(product or "").strip().upper()
+    if p in {"NRML", "CARRYFORWARD", "CARRY", "MARGIN"}:
+        return ProductType.CARRYFORWARD
+    if p in {"CNC", "DELIVERY"}:
+        return ProductType.DELIVERY
+    return ProductType.INTRADAY
+
+
+def _get_active_broker():
+    """Return broker adapter matching TRADING_ACCOUNT with safe fallback."""
+    account = (settings.trading_account or "angel").strip().lower()
+    try:
+        if account == "kite":
+            from app.execution.kite_broker import KiteBroker
+            return KiteBroker(), "kite"
+        if account == "dhan":
+            from app.execution.dhan_broker import DhanBroker
+            return DhanBroker(), "dhan"
+    except Exception:
+        logger.exception("Failed to build broker adapter for account=%s", account)
+
+    orch = _state.get("orchestrator")
+    broker = getattr(orch, "broker", None) if orch else None
+    if broker is not None:
+        return broker, "angel"
+
+    from app.execution.angelone_broker import AngelOneBroker
+    return AngelOneBroker(), "angel"
+
+
+def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict], dict]:
+    """Read raw broker positions and normalize shape used by PositionsPage."""
+    positions: list[dict] = []
+    realised_sum = 0.0
+    unrealised_sum = 0.0
+
+    # Kite
+    if hasattr(broker, "_client") and broker.__class__.__name__.lower().startswith("kite"):
+        raw = broker._client.get_positions() or {}
+        for p in (raw.get("net", []) or []):
+            buy_qty = _safe_int(p.get("buy_quantity") or p.get("buy_qty"), 0)
+            sell_qty = _safe_int(p.get("sell_quantity") or p.get("sell_qty"), 0)
+            net_qty = _safe_int(p.get("quantity") or p.get("net_quantity") or p.get("net_qty"), 0)
+            realised = _safe_num(p.get("realised") or p.get("realized"), 0.0)
+            unrealised = _safe_num(p.get("unrealised") or p.get("unrealized") or p.get("m2m"), 0.0)
+            pnl = _safe_num(p.get("pnl"), realised + unrealised)
+            item = {
+                "id": f"{account_name}:{p.get('exchange', '')}:{p.get('tradingsymbol', '')}",
+                "tradingsymbol": p.get("tradingsymbol", ""),
+                "symboltoken": str(p.get("instrument_token", "") or ""),
+                "exchange": p.get("exchange", "NFO"),
+                "product": p.get("product", ""),
+                "buy_qty": buy_qty,
+                "buy_avg": _safe_num(p.get("buy_price") or p.get("buy_average_price"), 0.0),
+                "sell_qty": sell_qty,
+                "sell_avg": _safe_num(p.get("sell_price") or p.get("sell_average_price"), 0.0),
+                "net_qty": net_qty,
+                "ltp": _safe_num(p.get("last_price"), 0.0),
+                "pnl": pnl,
+                "realised": realised,
+                "unrealised": unrealised,
+                "account_name": account_name,
+            }
+            positions.append(item)
+            realised_sum += realised
+            unrealised_sum += unrealised
+
+    # Dhan
+    elif hasattr(broker, "_client") and broker.__class__.__name__.lower().startswith("dhan"):
+        raw = broker._client.get_positions() or []
+        for p in raw:
+            buy_qty = _safe_int(p.get("buyQty") or p.get("buyQuantity"), 0)
+            sell_qty = _safe_int(p.get("sellQty") or p.get("sellQuantity"), 0)
+            net_qty = _safe_int(p.get("netQty") or p.get("quantity"), 0)
+            realised = _safe_num(p.get("realizedProfit") or p.get("realised"), 0.0)
+            unrealised = _safe_num(p.get("unrealizedProfit") or p.get("unrealised"), 0.0)
+            pnl = _safe_num(p.get("pnl"), realised + unrealised)
+            item = {
+                "id": f"{account_name}:{p.get('exchangeSegment', '')}:{p.get('tradingSymbol', '')}",
+                "tradingsymbol": p.get("tradingSymbol", ""),
+                "symboltoken": str(p.get("securityId", "") or ""),
+                "exchange": p.get("exchangeSegment", "NFO"),
+                "product": p.get("productType", ""),
+                "buy_qty": buy_qty,
+                "buy_avg": _safe_num(p.get("buyAvg") or p.get("buyAverage"), 0.0),
+                "sell_qty": sell_qty,
+                "sell_avg": _safe_num(p.get("sellAvg") or p.get("sellAverage"), 0.0),
+                "net_qty": net_qty,
+                "ltp": _safe_num(p.get("lastTradedPrice") or p.get("ltp"), 0.0),
+                "pnl": pnl,
+                "realised": realised,
+                "unrealised": unrealised,
+                "account_name": account_name,
+            }
+            positions.append(item)
+            realised_sum += realised
+            unrealised_sum += unrealised
+
+    # Angel (or generic fallback)
+    else:
+        raw = []
+        try:
+            resp = broker.client._smart_api.position()  # noqa: SLF001
+            raw = (resp or {}).get("data") or []
+        except Exception:
+            logger.exception("Failed to fetch Angel positions")
+        for p in raw:
+            buy_qty = _safe_int(p.get("buyqty") or p.get("buy_qty"), 0)
+            sell_qty = _safe_int(p.get("sellqty") or p.get("sell_qty"), 0)
+            net_qty = _safe_int(p.get("netqty") or p.get("quantity"), 0)
+            realised = _safe_num(p.get("realised") or p.get("realized"), 0.0)
+            pnl = _safe_num(p.get("pnl"), 0.0)
+            unrealised = _safe_num(p.get("unrealised") or p.get("unrealized"), pnl - realised)
+            item = {
+                "id": f"{account_name}:{p.get('exchange', '')}:{p.get('tradingsymbol', '')}",
+                "tradingsymbol": p.get("tradingsymbol", ""),
+                "symboltoken": str(p.get("symboltoken", "") or ""),
+                "exchange": p.get("exchange", "NFO"),
+                "product": p.get("producttype", ""),
+                "buy_qty": buy_qty,
+                "buy_avg": _safe_num(p.get("buyavgprice") or p.get("buyaverageprice") or p.get("averageprice"), 0.0),
+                "sell_qty": sell_qty,
+                "sell_avg": _safe_num(p.get("sellavgprice") or p.get("sellaverageprice"), 0.0),
+                "net_qty": net_qty,
+                "ltp": _safe_num(p.get("ltp"), 0.0),
+                "pnl": pnl,
+                "realised": realised,
+                "unrealised": unrealised,
+                "account_name": account_name,
+            }
+            positions.append(item)
+            realised_sum += realised
+            unrealised_sum += unrealised
+
+    broker_day = {
+        "realised": round(realised_sum, 2),
+        "unrealised": round(unrealised_sum, 2),
+        "total": round(realised_sum + unrealised_sum, 2),
+    }
+    return positions, broker_day
+
+
+def _mark_scanners_completed_for_today(reason: str = "manual_user_exit") -> None:
+    """Prevent immediate re-entry after manual position exit from UI."""
+    orch = _state.get("orchestrator")
+    if orch is None:
+        return
+
+    now_str = datetime.now(_IST).strftime("%H:%M")
+
+    md = getattr(orch, "move_detection_scanner", None)
+    if md is not None:
+        try:
+            md._signal_found_today = True  # noqa: SLF001
+            tr = getattr(md, "_active_trade", None)
+            if tr is not None and not getattr(tr, "exited", False):
+                tr.exited = True
+                tr.exit_reason = reason
+                tr.exit_time = now_str
+        except Exception:
+            logger.exception("Failed to mark MoveDet complete after manual exit")
+
+    pdh = getattr(orch, "pdh_pdl_scanner", None)
+    if pdh is not None:
+        try:
+            pdh._signal_found_today = True  # noqa: SLF001
+            tr = getattr(pdh, "_active_trade", None)
+            if tr is not None and not getattr(tr, "exited", False):
+                tr.exited = True
+                tr.exit_reason = reason
+                tr.exit_time = now_str
+        except Exception:
+            logger.exception("Failed to mark PDH/PDL complete after manual exit")
+
+    atl = getattr(orch, "atl_straddle_scanner", None)
+    if atl is not None:
+        try:
+            st = getattr(atl, "_state", None)  # noqa: SLF001
+            if st is not None:
+                st.done_for_day = True
+                st.halted = False
+                st.halt_reason = reason
+                st.last_event = f"manual_exit:{reason}"
+        except Exception:
+            logger.exception("Failed to mark ATM complete after manual exit")
+
+
+def _rearm_scanners_for_today() -> None:
+    """Allow scanner entries again after user explicitly re-arms."""
+    orch = _state.get("orchestrator")
+    if orch is None:
+        return
+
+    md = getattr(orch, "move_detection_scanner", None)
+    if md is not None:
+        try:
+            md._signal_found_today = False  # noqa: SLF001
+        except Exception:
+            logger.exception("Failed to re-arm MoveDet")
+
+    pdh = getattr(orch, "pdh_pdl_scanner", None)
+    if pdh is not None:
+        try:
+            pdh._signal_found_today = False  # noqa: SLF001
+        except Exception:
+            logger.exception("Failed to re-arm PDH/PDL")
+
+    atl = getattr(orch, "atl_straddle_scanner", None)
+    if atl is not None:
+        try:
+            atl.reset_halt()
+        except Exception:
+            logger.exception("Failed to re-arm ATM")
 
 
 @asynccontextmanager
@@ -302,20 +540,9 @@ async def get_system_status():
     # Scanner status
     scanner_info = {}
     if orch:
-        config_p = getattr(orch, "config_p_scanner", None)
         move_det = getattr(orch, "move_detection_scanner", None)
-        ai_gpt = getattr(orch, "ai_gpt_scanner", None)
-        nr5 = getattr(orch, "nr5_scanner", None)
         pdh_pdl = getattr(orch, "pdh_pdl_scanner", None)
-        if config_p:
-            cp_trade = config_p._active_trade
-            scanner_info["config_p"] = {
-                "active": True,
-                "day_tradeable": config_p._day_tradeable,
-                "signal_found": config_p._signal_found_today,
-                "in_trade": cp_trade is not None and not cp_trade.exited if cp_trade else False,
-                "last_trade_week": config_p._last_trade_week,
-            }
+        atm = getattr(orch, "atl_straddle_scanner", None)
         if move_det:
             md_trade = move_det._active_trade
             scanner_info["move_det"] = {
@@ -324,49 +551,6 @@ async def get_system_status():
                 "signal_found": move_det._signal_found_today,
                 "in_trade": md_trade is not None and not md_trade.exited if md_trade else False,
                 "last_trade_week": move_det._last_trade_week,
-            }
-        if ai_gpt:
-            ag_trade = ai_gpt._active_trade
-            scanner_info["ai_gpt"] = {
-                "active": ai_gpt.pipeline is not None,
-                "in_trade": ag_trade is not None and not ag_trade.exited if ag_trade else False,
-                "ai_failures_today": ai_gpt._ai_failure_count_today,
-                "ai_runs_today": getattr(ai_gpt, "_ai_runs_today", 0),
-                "last_run_at": getattr(ai_gpt, "_last_run_at", None),
-                "last_decision": getattr(ai_gpt, "_last_decision", None),
-                "last_decision_detail": getattr(ai_gpt, "_last_decision_detail", None),
-                "model": settings.ai_gpt_scanner_model if ai_gpt.pipeline is not None else None,
-            }
-        if nr5:
-            n_trade = nr5._active_trade
-            scanner_info["nr5"] = {
-                "active": settings.nr5_scanner_enabled,
-                "setup_checked": nr5._setup_checked,
-                "is_nr5_day": nr5._is_nr5_day,
-                "gap_skip": nr5._gap_skip,
-                "signal_found": nr5._signal_found_today,
-                "in_trade": n_trade is not None and not n_trade.exited if n_trade else False,
-                "prev_high": nr5._prev_high,
-                "prev_low": nr5._prev_low,
-                "prev_range": nr5._prev_range,
-                "gap_pct": nr5._gap_pct,
-                "trade": (
-                    {
-                        "side": n_trade.side,
-                        "entry_time": n_trade.entry_time,
-                        "entry_spot": n_trade.entry_spot,
-                        "stop_level": n_trade.stop_level,
-                        "target_level": n_trade.target_level,
-                        "option_symbol": n_trade.option_symbol,
-                        "option_entry_price": n_trade.option_entry_price,
-                        "exited": n_trade.exited,
-                        "exit_time": n_trade.exit_time,
-                        "exit_spot": n_trade.exit_spot,
-                        "exit_reason": n_trade.exit_reason,
-                        "option_exit_price": n_trade.option_exit_price,
-                    }
-                    if n_trade else None
-                ),
             }
         if pdh_pdl:
             p_trade = pdh_pdl._active_trade
@@ -395,6 +579,29 @@ async def get_system_status():
                     }
                     if p_trade else None
                 ),
+            }
+        if atm:
+            try:
+                rt = atm.get_runtime_state()
+            except Exception:
+                rt = {}
+            latest_event = ""
+            try:
+                ev = (rt.get("events") or [])
+                if ev:
+                    latest_event = str(ev[-1].get("message") or "")
+            except Exception:
+                latest_event = ""
+            scanner_info["atm"] = {
+                "active": bool(rt.get("enabled", False)),
+                "in_trade": bool(rt.get("in_trade", False)),
+                "phase": rt.get("phase", "IDLE"),
+                "halted": bool(rt.get("halted", False)),
+                "halt_reason": rt.get("halt_reason", ""),
+                "index": rt.get("index", "NIFTY"),
+                "expiry": rt.get("expiry", ""),
+                "live_mode": bool(rt.get("live_mode", False)),
+                "last_event": latest_event,
             }
 
     return {
@@ -669,6 +876,257 @@ async def get_full_day_data(target_date: str):
         "trades": [t.model_dump() for t in trades],
         "alerts": alerts,
         "performance": perf.model_dump(),
+    }
+
+
+# ── Broker Replica Positions + Trade History ─────────────────────────────
+
+@app.get("/api/positions")
+async def get_broker_positions():
+    """Return active broker positions in UI-friendly shape (replica-style)."""
+    broker, account = _get_active_broker()
+    try:
+        positions, broker_day = await asyncio.to_thread(_extract_positions_for_ui, broker, account.upper())
+    except Exception as exc:
+        logger.exception("Failed to fetch broker positions")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "status": "ok",
+        "account": account,
+        "positions": positions,
+        "broker_day_pnl": broker_day,
+    }
+
+
+@app.post("/api/positions/exit")
+async def exit_broker_positions(body: dict):
+    """Exit selected broker positions and mark strategy done for the day."""
+    from app.execution.broker_base import OrderRequest, OrderSide, OrderType
+
+    items = (body or {}).get("positions") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="No positions provided")
+
+    broker, account = _get_active_broker()
+    results: list[dict] = []
+
+    for p in items:
+        qty = abs(_safe_int(p.get("net_qty"), 0))
+        if qty <= 0:
+            continue
+        side = OrderSide.SELL if _safe_int(p.get("net_qty"), 0) > 0 else OrderSide.BUY
+        req = OrderRequest(
+            instrument=None,
+            trading_symbol=str(p.get("tradingsymbol", "") or ""),
+            symbol_token=str(p.get("symboltoken", "") or ""),
+            exchange=str(p.get("exchange", "NFO") or "NFO"),
+            side=side,
+            order_type=OrderType.MARKET,
+            product_type=_map_product_type(str(p.get("product", "") or "")),
+            quantity=qty,
+            price=0.0,
+            trigger_price=0.0,
+        )
+        try:
+            resp = await asyncio.to_thread(broker.place_order, req)
+            ok = bool(resp and str(getattr(resp, "status", "")).upper() != "REJECTED")
+            results.append(
+                {
+                    "tradingsymbol": req.trading_symbol,
+                    "quantity": qty,
+                    "side": side.value,
+                    "ok": ok,
+                    "order_id": getattr(resp, "order_id", "") if resp else "",
+                    "message": getattr(resp, "message", "") if resp else "",
+                }
+            )
+        except Exception as exc:
+            logger.exception("Manual exit failed for %s", req.trading_symbol)
+            results.append(
+                {
+                    "tradingsymbol": req.trading_symbol,
+                    "quantity": qty,
+                    "side": side.value,
+                    "ok": False,
+                    "order_id": "",
+                    "message": str(exc),
+                }
+            )
+
+    if any(r.get("ok") for r in results):
+        _mark_scanners_completed_for_today()
+
+    return {
+        "status": "ok",
+        "account": account,
+        "results": results,
+        "completed_for_today": any(r.get("ok") for r in results),
+    }
+
+
+@app.post("/api/positions/rearm")
+async def rearm_after_manual_exit():
+    """Clear manual completion flags so strategies can place entries again today."""
+    _rearm_scanners_for_today()
+    return {"status": "ok", "message": "Strategies re-armed for today"}
+
+
+@app.post("/api/eod/snapshot")
+async def capture_broker_eod_snapshot():
+    """Persist current broker PnL/positions snapshot for history calendar."""
+    from app.db.models import AsyncSessionLocal, BrokerEODSnapshot
+
+    broker, account = _get_active_broker()
+    positions, broker_day = await asyncio.to_thread(_extract_positions_for_ui, broker, account.upper())
+    today = datetime.now(_IST).strftime("%Y-%m-%d")
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            session.add(
+                BrokerEODSnapshot(
+                    date=today,
+                    account_name=account.upper(),
+                    broker_pnl=float(broker_day.get("total", 0.0) or 0.0),
+                    realised=float(broker_day.get("realised", 0.0) or 0.0),
+                    unrealised=float(broker_day.get("unrealised", 0.0) or 0.0),
+                    positions_count=len(positions),
+                    payload_json=json.dumps(positions),
+                )
+            )
+
+    return {
+        "status": "ok",
+        "date": today,
+        "account": account,
+        "positions_count": len(positions),
+        "broker_day_pnl": broker_day,
+    }
+
+
+@app.get("/api/trade-history")
+async def get_trade_history(date: str | None = None, month: str | None = None):
+    """Unified history API consumed by new HistoryPage.
+
+    Query params:
+      - date=YYYY-MM-DD  -> day detail
+      - month=YYYY-MM    -> month summary calendar
+    """
+    from sqlalchemy import func, select
+    from app.db.models import AsyncSessionLocal, BrokerEODSnapshot, TradeRecord
+
+    target_date = (date or "").strip()
+    target_month = (month or "").strip()
+
+    if target_date:
+        async with AsyncSessionLocal() as session:
+            trade_rows = (
+                await session.execute(
+                    select(TradeRecord).where(TradeRecord.date == target_date)
+                )
+            ).scalars().all()
+
+            snap_rows = (
+                await session.execute(
+                    select(BrokerEODSnapshot).where(BrokerEODSnapshot.date == target_date)
+                )
+            ).scalars().all()
+
+        trade_pnl = round(sum(_safe_num(t.pnl, 0.0) for t in trade_rows), 2)
+        broker_pnl = round(sum(_safe_num(s.broker_pnl, 0.0) for s in snap_rows), 2)
+
+        return {
+            "status": "ok",
+            "date": target_date,
+            "total_trades": len(trade_rows),
+            "month_pnl": trade_pnl,
+            "broker_pnl": broker_pnl if snap_rows else trade_pnl,
+            "broker_accounts": [
+                {
+                    "account_name": s.account_name or "Primary",
+                    "broker_pnl": _safe_num(s.broker_pnl, 0.0),
+                    "positions": _safe_int(s.positions_count, 0),
+                }
+                for s in snap_rows
+            ],
+        }
+
+    if not target_month:
+        target_month = datetime.now(_IST).strftime("%Y-%m")
+
+    try:
+        year, mon = target_month.split("-")
+        start_date = f"{int(year):04d}-{int(mon):02d}-01"
+        dt = datetime(int(year), int(mon), 1)
+        next_month_dt = datetime(dt.year + (1 if dt.month == 12 else 0), 1 if dt.month == 12 else dt.month + 1, 1)
+        end_date = next_month_dt.strftime("%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM")
+
+    async with AsyncSessionLocal() as session:
+        trade_rows = (
+            await session.execute(
+                select(
+                    TradeRecord.date,
+                    func.count(TradeRecord.id).label("trades"),
+                    func.coalesce(func.sum(TradeRecord.pnl), 0.0).label("trade_pnl"),
+                )
+                .where(TradeRecord.date >= start_date, TradeRecord.date < end_date)
+                .group_by(TradeRecord.date)
+                .order_by(TradeRecord.date)
+            )
+        ).all()
+
+        snap_rows = (
+            await session.execute(
+                select(
+                    BrokerEODSnapshot.date,
+                    func.coalesce(func.sum(BrokerEODSnapshot.broker_pnl), 0.0).label("broker_pnl"),
+                )
+                .where(BrokerEODSnapshot.date >= start_date, BrokerEODSnapshot.date < end_date)
+                .group_by(BrokerEODSnapshot.date)
+                .order_by(BrokerEODSnapshot.date)
+            )
+        ).all()
+
+    trade_map = {
+        r.date: {
+            "trades": int(r.trades or 0),
+            "trade_pnl": float(r.trade_pnl or 0.0),
+        }
+        for r in trade_rows
+    }
+    snap_map = {r.date: float(r.broker_pnl or 0.0) for r in snap_rows}
+
+    all_dates = sorted(set(trade_map.keys()) | set(snap_map.keys()))
+    days: list[dict] = []
+    for d in all_dates:
+        trades = trade_map.get(d, {}).get("trades", 0)
+        t_pnl = trade_map.get(d, {}).get("trade_pnl", 0.0)
+        b_pnl = snap_map.get(d)
+        days.append(
+            {
+                "date": d,
+                "trades": trades,
+                "pnl": round(t_pnl, 2),
+                "broker_pnl": round(b_pnl, 2) if b_pnl is not None else round(t_pnl, 2),
+                "source": "eod_snapshot" if b_pnl is not None else "trades",
+            }
+        )
+
+    month_pnl = round(sum((d.get("broker_pnl") if d.get("source") == "eod_snapshot" else d.get("pnl", 0.0)) for d in days), 2)
+    winning_days = len([d for d in days if (d.get("broker_pnl", d.get("pnl", 0.0)) or 0.0) > 0])
+    losing_days = len([d for d in days if (d.get("broker_pnl", d.get("pnl", 0.0)) or 0.0) < 0])
+
+    return {
+        "status": "ok",
+        "month": target_month,
+        "month_pnl": month_pnl,
+        "trading_days": len(days),
+        "winning_days": winning_days,
+        "losing_days": losing_days,
+        "month_trades": int(sum(d.get("trades", 0) for d in days)),
+        "days": days,
     }
 
 

@@ -27,7 +27,7 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, date, time as dtime, timedelta
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import pandas as pd
 import pytz
@@ -134,10 +134,12 @@ class PDHPDLBreakoutScanner:
         client: AngelOneClient,
         alert_manager: AlertManager,
         broker: Optional[object] = None,
+        pre_entry_hook: Optional[Callable[[str, InstrumentConfig, pd.DataFrame], Awaitable[bool]]] = None,
     ):
         self.client = client
         self.alert_manager = alert_manager
         self.broker = broker
+        self._pre_entry_hook = pre_entry_hook
 
         # Daily state
         self._today_str: str = ""
@@ -254,6 +256,17 @@ class PDHPDLBreakoutScanner:
             entry_spot = last_close
         if side is None:
             return
+
+        # Priority handoff: close ATM first, then place PDH/PDL order.
+        if self._pre_entry_hook is not None:
+            try:
+                ok = await self._pre_entry_hook("pdh_pdl", instrument, df_today)
+                if not ok:
+                    logger.warning("[PDHPDL] Pre-entry hook blocked entry")
+                    return
+            except Exception:
+                logger.exception("[PDHPDL] Pre-entry hook failed")
+                return
 
         # ── Build entry ─────────────────────────────────────────────
         entry_time = last_ts.strftime("%H:%M") if hasattr(last_ts, "strftime") else now.strftime("%H:%M")

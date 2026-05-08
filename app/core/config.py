@@ -94,6 +94,21 @@ class Settings(BaseSettings):
         default=0.25,
         alias="ORDER_STATUS_POLL_DELAY_SECONDS",
     )
+    # Orchestrator timing controls (lower = faster reaction, higher API load).
+    orchestrator_loop_interval_seconds: float = Field(
+        default=10.0,
+        alias="ORCHESTRATOR_LOOP_INTERVAL_SECONDS",
+    )
+    orchestrator_instrument_gap_seconds: float = Field(
+        default=0.0,
+        alias="ORCHESTRATOR_INSTRUMENT_GAP_SECONDS",
+    )
+    # ATM scanner settings reload cadence.
+    # 1 = reload every cycle, 5 = ~every 5 cycles.
+    atl_settings_refresh_cycles: int = Field(
+        default=1,
+        alias="ATL_SETTINGS_REFRESH_CYCLES",
+    )
 
     # Dual-Engine Control
     v1_enabled: bool = Field(default=True, alias="V1_ENABLED")
