@@ -112,11 +112,32 @@ jobs:
             sudo mkdir -p /root/.docker
             echo "{\"auths\":{\"ghcr.io\":{\"auth\":\"${DOCKER_AUTH}\"}}}" | sudo tee /root/.docker/config.json > /dev/null
 
-            # Pull backend image (clean stale state from interrupted pulls)
-            sudo docker system prune -f 2>/dev/null || true
-            sudo rm -rf /var/lib/docker/containerd/daemon/io.containerd.content.v1.content/ingest/* 2>/dev/null || true
+            # Pull backend image with retry + daemon restart fallback.
+            # Avoid manual containerd ingest-path deletion; it can worsen pull races.
+            pull_image() {
+              local image_ref="$1"
+              local attempts=3
+              local i=1
+              while [ "$i" -le "$attempts" ]; do
+                echo "Pull attempt ${i}/${attempts}: ${image_ref}"
+                if sudo docker pull "${image_ref}"; then
+                  return 0
+                fi
+                echo "Pull failed on attempt ${i}."
+                echo "Docker status:"; sudo systemctl --no-pager -l status docker | tail -n 30 || true
+                echo "Disk/inode status:"; df -h /var/lib/docker || true; df -i /var/lib/docker || true
+                if [ "$i" -lt "$attempts" ]; then
+                  echo "Restarting Docker daemon before retry..."
+                  sudo systemctl restart docker || true
+                  sleep 5
+                fi
+                i=$((i + 1))
+              done
+              return 1
+            }
+
             echo "Pulling ${BACKEND_IMAGE}:${BACKEND_TAG}"
-            sudo docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}"
+            pull_image "${BACKEND_IMAGE}:${BACKEND_TAG}"
 
             # Start backend + infrastructure only (frontend is deployed separately)
             sudo -E docker compose -f docker-compose.prod.yml up -d --no-deps postgres redis backend
