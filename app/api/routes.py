@@ -1589,7 +1589,12 @@ _VALID_TRADING_ACCOUNTS = {"angel", "kite", "dhan"}
 
 
 def _persist_env_vars(updates: dict[str, str]) -> None:
-    """Write/replace env vars in backend/.env and reload `settings` in-memory."""
+    """Write/replace env vars in backend/.env and reload `settings` in-memory.
+
+    Also pushes the values into ``os.environ`` so a subsequent
+    ``Settings()`` reload picks them up, and re-runs ``settings.__init__``
+    so any validators / aliasing logic re-applies the new values.
+    """
     import os
     import re
 
@@ -1608,10 +1613,28 @@ def _persist_env_vars(updates: dict[str, str]) -> None:
             content = content.rstrip() + f"\n{env_var}={value}\n"
     with open(env_path, "w", encoding="utf-8") as f:
         f.write(content)
+
+    # Push into the process environment so pydantic-settings sees the new
+    # values on re-init (env vars take precedence over the .env file).
     for env_var, value in updates.items():
+        os.environ[env_var] = value
         attr = env_var.lower()
         if hasattr(settings, attr):
-            object.__setattr__(settings, attr, value)
+            try:
+                object.__setattr__(settings, attr, value)
+            except Exception:
+                logger.exception("Failed to set settings.%s in-memory", attr)
+
+    # Re-instantiate broker credentials so the running adapter picks up
+    # rotated tokens without a process restart. Best-effort — failures are
+    # logged but don't block the credential save.
+    try:
+        orch = _state.get("orchestrator")
+        broker = getattr(orch, "broker", None) if orch else None
+        if broker is not None and hasattr(broker, "reload_credentials"):
+            broker.reload_credentials()
+    except Exception:
+        logger.exception("Failed to reload broker credentials after env update")
 
 
 @app.get("/api/broker/trading-account")
