@@ -1505,7 +1505,13 @@ class Orchestrator:
             # ATL Straddle scanner runs for whichever index it is configured
             # for (NIFTY or SENSEX) — internal symbol gate skips other instruments.
             try:
-                await self.atl_straddle_scanner.run_cycle(df_today, instrument, cycle)
+                atl_peer_in_trade = False
+                if symbol == "NIFTY":
+                    atl_peer_in_trade = md_in_trade or pdh_in_trade
+                await self.atl_straddle_scanner.run_cycle(
+                    df_today, instrument, cycle,
+                    peer_in_trade=atl_peer_in_trade,
+                )
             except Exception:
                 logger.exception("[ATL] scanner cycle failed for %s", symbol)
             return

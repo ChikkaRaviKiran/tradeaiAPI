@@ -2046,13 +2046,14 @@ async def force_close_atm():
 async def place_now_atm():
     """Force the ATL scanner to attempt entry on its next cycle.
 
-    Sets an internal flag the scanner checks before the entry-time gate.
+    Clears phantom in-memory position state (in case the user manually
+    exited at the broker) and bypasses the entry-time gate.
     """
     scanner = _get_atl_scanner()
     if scanner is None:
         raise HTTPException(status_code=503, detail="ATL scanner not initialised")
     try:
-        scanner._force_entry = True  # noqa: SLF001
+        scanner.request_force_entry()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"ok": True, "message": "ATL scanner will attempt entry on next cycle"}

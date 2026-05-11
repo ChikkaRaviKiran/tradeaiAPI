@@ -238,16 +238,57 @@ class ATLStraddleScanner:
         # Refresh settings periodically so UI changes apply intraday.
         refresh_every = max(1, int(getattr(settings, "atl_settings_refresh_cycles", 1) or 1))
         if cycle % refresh_every == 0:
+            prev_signature = self._settings_signature()
             self._settings = load_atl_settings()
-            # User can re-arm intraday by changing strategy timing/settings.
-            if self._state.done_for_day and self._settings_signature() != self._last_done_signature:
+            new_signature = self._settings_signature()
+            signature_changed = new_signature != prev_signature
+            # Determine if newly-configured entry_time is still in the future
+            # relative to now — that's a clear "user wants a fresh entry" signal.
+            entry_in_future = False
+            try:
+                eh, em = [int(x) for x in str(self._settings.get("entry_time", "09:20")).split(":")]
+                entry_dt = datetime(now.year, now.month, now.day, eh, em, tzinfo=IST)
+                entry_in_future = now < entry_dt
+            except Exception:
+                entry_in_future = False
+
+            # Re-arm intraday in two cases:
+            #   1. Strategy already completed for the day AND settings changed.
+            #   2. User pushed entry_time to a future moment (signature changed
+            #      and entry_time is now in the future). This covers the case
+            #      where the user manually exited at the broker and wants the
+            #      scanner to place fresh orders at the new entry_time —
+            #      previously this was ignored because `done_for_day` was False
+            #      and the scanner thought it was still holding legs.
+            done_rearm = (
+                self._state.done_for_day
+                and new_signature != self._last_done_signature
+            )
+            future_rearm = signature_changed and entry_in_future and self._state.entered
+            if done_rearm or future_rearm:
                 self._state.done_for_day = False
                 self._state.halted = False
                 self._state.halt_reason = ""
                 self._state.phase = "IDLE"
                 self._state.entered = False
+                self._state.entry_in_progress = False
+                self._state.ce = None
+                self._state.pe = None
+                self._state.hedge_ce = None
+                self._state.hedge_pe = None
+                self._state.straddle_strike = 0.0
+                self._state.straddle_sl_points = 0.0
+                self._state.is_first_straddle = True
+                self._state.roll_count = 0
+                self._state.reform_count = 0
                 self._diag_last.clear()
-                self._record_event("rearm", "Settings changed by user — strategy re-armed")
+                reason = (
+                    "Settings changed and entry_time moved to future — "
+                    "scanner state cleared for fresh entry"
+                    if future_rearm
+                    else "Settings changed by user — strategy re-armed"
+                )
+                self._record_event("rearm", reason)
 
         if not self._settings.get("enabled", False):
             self._record_diag(
@@ -733,16 +774,70 @@ class ATLStraddleScanner:
         logger.error("ATL[%s] HALTED: %s", self._settings.get("index", "?"), reason)
 
     def reset_halt(self) -> None:
-        """Clear the circuit breaker so the strategy can attempt entry again
-        (typically called from a UI 'Reset' button after the user fixed the
-        broker-side issue)."""
-        was = self._state.halted
+        """Clear the circuit breaker AND in-memory entry state so the
+        strategy can attempt entry again. Typically called from the UI
+        'Reset' button after the user fixed the broker-side issue or
+        manually exited orders at the broker. Without clearing the
+        entered/leg state, the scanner would keep tracking phantom legs
+        and never place new orders even when settings are updated."""
+        was_halted = self._state.halted
+        was_entered = self._state.entered
         self._state.halted = False
         self._state.halt_reason = ""
         self._state.done_for_day = False
+        # Wipe phantom position state — caller is asserting that nothing
+        # is open at the broker side.
+        self._state.phase = "IDLE"
+        self._state.entered = False
+        self._state.entry_in_progress = False
+        self._state.ce = None
+        self._state.pe = None
+        self._state.hedge_ce = None
+        self._state.hedge_pe = None
+        self._state.straddle_strike = 0.0
+        self._state.straddle_sl_points = 0.0
+        self._state.is_first_straddle = True
+        self._state.roll_count = 0
+        self._state.reform_count = 0
         self._diag_last.clear()
-        if was:
-            self._record_event("reset", "Halt cleared by user — strategy may retry entry")
+        if was_halted or was_entered:
+            self._record_event(
+                "reset",
+                "Reset by user — halt cleared and in-memory position state "
+                "wiped; scanner may retry entry",
+            )
+
+    def request_force_entry(self) -> None:
+        """Request a fresh entry on the next cycle (UI 'Place Now').
+
+        Bypasses the entry-time gate AND clears phantom in-memory position
+        state so that if the user previously exited at the broker manually,
+        the scanner doesn't think it's still holding legs and skip the
+        entry block entirely. Also clears halt/done flags so a single
+        broker rejection doesn't permanently block manual retries.
+        """
+        self._state.halted = False
+        self._state.halt_reason = ""
+        self._state.done_for_day = False
+        # Clear phantom legs/state so the entry block actually runs.
+        self._state.phase = "IDLE"
+        self._state.entered = False
+        self._state.entry_in_progress = False
+        self._state.ce = None
+        self._state.pe = None
+        self._state.hedge_ce = None
+        self._state.hedge_pe = None
+        self._state.straddle_strike = 0.0
+        self._state.straddle_sl_points = 0.0
+        self._state.is_first_straddle = True
+        self._state.roll_count = 0
+        self._state.reform_count = 0
+        self._diag_last.clear()
+        self._force_entry = True
+        self._record_event(
+            "force_entry_requested",
+            "Place Now requested — phantom state cleared, entry-time gate bypassed",
+        )
 
     def _leg_dict(self, leg: Optional[ATLLeg]) -> Optional[dict]:
         if not leg:
