@@ -492,7 +492,6 @@ class MoveDetectionScanner:
 
         live_exec = (
             settings.move_det_live_execution
-            and not settings.paper_trading
             and self.broker is not None
             and option_ltp > 0
             and symboltoken
@@ -536,7 +535,6 @@ class MoveDetectionScanner:
             # Settings override the global config flag
             live_exec = (
                 bool(cfg.get("live_execution"))
-                and not settings.paper_trading
                 and option_ltp > 0
                 and bool(symboltoken)
                 and lots > 0
@@ -550,7 +548,7 @@ class MoveDetectionScanner:
             order_status = (
                 f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
             )
-        elif settings.move_det_live_execution and not settings.paper_trading:
+        elif settings.move_det_live_execution:
             if self._active_trade.lots == 0:
                 order_status = "LIVE skipped — insufficient funds for 1 lot"
 
@@ -859,6 +857,7 @@ class MoveDetectionScanner:
             expiry_date=self._expiry_date,
             strike=float(trade.strike_price or 0),
             option_type="PE",
+            force_live=True,
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)

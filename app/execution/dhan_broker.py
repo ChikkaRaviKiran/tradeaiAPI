@@ -104,7 +104,7 @@ class DhanBroker(BaseBroker):
     # ── Orders ───────────────────────────────────────────────────────
 
     def place_order(self, request: OrderRequest) -> OrderResponse:
-        if settings.paper_trading:
+        if settings.paper_trading and not getattr(request, "force_live", False):
             return self._simulate_order(request)
         if not self._client:
             return OrderResponse(

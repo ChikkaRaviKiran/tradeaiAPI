@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "live_execution": true,
+  "lots_mode": "manual",
+  "manual_lots": 25,
+  "max_funds": 0.0,
+  "buffer_pct": 0.0,
+  "max_lots": 25
+}

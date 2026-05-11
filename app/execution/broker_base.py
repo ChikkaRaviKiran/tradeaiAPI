@@ -67,6 +67,12 @@ class OrderRequest:
     expiry_date: Optional[datetime] = None  # exchange-published expiry (date or datetime)
     strike: Optional[float] = None
     option_type: Optional[str] = None      # "CE" or "PE"
+    # ── Per-request execution override ───────────────────────────────
+    # When True, the broker MUST place a real order regardless of the
+    # global ``settings.paper_trading`` flag. Used by scanners whose own
+    # per-strategy "Live Orders" toggle takes precedence over the global
+    # PAPER/LIVE badge (e.g. MoveDet, PDH/PDL).
+    force_live: bool = False
 
 
 @dataclass

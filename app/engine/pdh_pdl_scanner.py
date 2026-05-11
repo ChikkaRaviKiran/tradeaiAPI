@@ -347,11 +347,11 @@ class PDHPDLBreakoutScanner:
         self._active_trade.exchange = exchange
         self._active_trade.lot_size = int(instrument.lot_size)
 
-        # Decide whether to place a live order
+        # Decide whether to place a live order.
+        # Per-scanner setting overrides the global PAPER/LIVE flag.
         cfg = exec_settings.load("pdh_pdl")
         live_exec = (
             bool(cfg.get("live_execution"))
-            and not settings.paper_trading
             and self.broker is not None
             and option_ltp > 0
             and bool(symboltoken)
@@ -373,7 +373,6 @@ class PDHPDLBreakoutScanner:
             self._active_trade.lots = lots
             live_exec = (
                 bool(cfg.get("live_execution"))
-                and not settings.paper_trading
                 and option_ltp > 0
                 and bool(symboltoken)
                 and lots > 0
@@ -391,7 +390,7 @@ class PDHPDLBreakoutScanner:
             order_status = (
                 f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
             )
-        elif bool(cfg.get("live_execution")) and not settings.paper_trading:
+        elif bool(cfg.get("live_execution")):
             if int(self._active_trade.lots or 0) == 0:
                 order_status = "LIVE skipped — insufficient funds for 1 lot"
 
@@ -667,6 +666,7 @@ class PDHPDLBreakoutScanner:
             expiry_date=self._expiry_date,
             strike=float(trade.strike_price or 0),
             option_type=trade.side,
+            force_live=True,
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)

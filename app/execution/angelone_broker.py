@@ -54,7 +54,7 @@ class AngelOneBroker(BaseBroker):
 
     def place_order(self, request: OrderRequest) -> OrderResponse:
         """Place order via SmartAPI."""
-        if settings.paper_trading:
+        if settings.paper_trading and not getattr(request, "force_live", False):
             return self._simulate_order(request)
 
         # Global execution policy: all live orders must be MARKET + CARRYFORWARD.
