@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.core import cache
 from app.core.instruments import get_all_instruments, get_instrument
 from app.core.models import AlertItem, MarketSnapshot, PerformanceMetrics, Trade
 from app.db.models import init_db
@@ -504,18 +505,28 @@ async def get_system_status():
     orch = _state.get("orchestrator")
     snapshot = _state.get("snapshot")
 
-    # Quick DB connectivity check
+    # Quick DB connectivity check (cached briefly to avoid DB hit per dashboard tick)
     db_ok = False
     db_error: str | None = None
-    try:
-        from sqlalchemy import text
-        from app.db.models import AsyncSessionLocal
-        async with AsyncSessionLocal() as session:
-            await session.execute(text("SELECT 1"))
-        db_ok = True
-    except Exception as e:
-        db_error = str(e)[:300]
-        logger.warning("DB health check failed: %s", e)
+    cached_db = await cache.get_json("system:db_ping")
+    if cached_db is not None:
+        db_ok = bool(cached_db.get("ok"))
+        db_error = cached_db.get("error")
+    else:
+        try:
+            from sqlalchemy import text
+            from app.db.models import AsyncSessionLocal
+            async with AsyncSessionLocal() as session:
+                await session.execute(text("SELECT 1"))
+            db_ok = True
+        except Exception as e:
+            db_error = str(e)[:300]
+            logger.warning("DB health check failed: %s", e)
+        await cache.set_json(
+            "system:db_ping",
+            {"ok": db_ok, "error": db_error},
+            ttl_seconds=5,
+        )
 
     # WebSocket status
     ws_status = "not_started"
@@ -1243,6 +1254,8 @@ async def trigger_evaluation():
             await scheduler.run_evaluation(instruments)
         except Exception:
             logger.exception("Background evaluation task crashed")
+        finally:
+            await cache.delete_prefix("strategy_analytics:db:")
     asyncio.create_task(_run())
 
     return {"message": "Evaluation started", "instruments": [i.symbol for i in instruments]}
@@ -1310,42 +1323,48 @@ async def get_intelligence_history(limit: int = 7):
     """Get historical AI insights."""
     if limit < 1 or limit > 90:
         limit = 7
-    from app.db.models import DailyAIInsight, AsyncSessionLocal
-    from sqlalchemy import select
-    import json as _json
 
-    try:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(DailyAIInsight)
-                .order_by(DailyAIInsight.created_at.desc())
-                .limit(limit)
-            )
-            records = result.scalars().all()
-            return [
-                {
-                    "date": r.date,
-                    "insight_type": r.insight_type,
-                    "market_bias": r.market_bias,
-                    "confidence": r.confidence,
-                    "fii_dii_signal": r.fii_dii_signal,
-                    "fii_net": r.fii_net,
-                    "dii_net": r.dii_net,
-                    "breadth_signal": r.breadth_signal,
-                    "advance_decline_ratio": r.advance_decline_ratio,
-                    "news_sentiment": r.news_sentiment,
-                    "strong_sectors": r.strong_sectors,
-                    "weak_sectors": r.weak_sectors,
-                    "ai_summary": r.ai_summary,
-                    "trading_plan": r.trading_plan,
-                    "key_levels": _json.loads(r.key_levels) if r.key_levels else {},
-                    "created_at": r.created_at.isoformat() if r.created_at else None,
-                }
-                for r in records
-            ]
-    except Exception:
-        logger.exception("Error fetching intelligence history")
-        return []
+    async def _load() -> list:
+        from app.db.models import DailyAIInsight, AsyncSessionLocal
+        from sqlalchemy import select
+        import json as _json
+
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(DailyAIInsight)
+                    .order_by(DailyAIInsight.created_at.desc())
+                    .limit(limit)
+                )
+                records = result.scalars().all()
+                return [
+                    {
+                        "date": r.date,
+                        "insight_type": r.insight_type,
+                        "market_bias": r.market_bias,
+                        "confidence": r.confidence,
+                        "fii_dii_signal": r.fii_dii_signal,
+                        "fii_net": r.fii_net,
+                        "dii_net": r.dii_net,
+                        "breadth_signal": r.breadth_signal,
+                        "advance_decline_ratio": r.advance_decline_ratio,
+                        "news_sentiment": r.news_sentiment,
+                        "strong_sectors": r.strong_sectors,
+                        "weak_sectors": r.weak_sectors,
+                        "ai_summary": r.ai_summary,
+                        "trading_plan": r.trading_plan,
+                        "key_levels": _json.loads(r.key_levels) if r.key_levels else {},
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                    }
+                    for r in records
+                ]
+        except Exception:
+            logger.exception("Error fetching intelligence history")
+            return []
+
+    return await cache.cached(
+        f"intel:history:{limit}", ttl_seconds=60, loader=_load,
+    ) or []
 
 
 @app.post("/api/intelligence/refresh")
@@ -1363,6 +1382,8 @@ async def refresh_intelligence():
                 _state["intelligence"] = insight
         except Exception:
             logger.exception("Intelligence refresh failed")
+        finally:
+            await cache.delete_prefix("intel:history:")
 
     asyncio.create_task(_run())
     return {"message": "Intelligence refresh started"}
@@ -1628,11 +1649,39 @@ def _persist_env_vars(updates: dict[str, str]) -> None:
     # Re-instantiate broker credentials so the running adapter picks up
     # rotated tokens without a process restart. Best-effort — failures are
     # logged but don't block the credential save.
+    #
+    # NOTE: orch.broker is always AngelOneBroker. The Dhan/Kite brokers used
+    # for live order routing live on the scanners (built by `_build_atl_broker`
+    # at orchestrator init). We must reload all of them so a freshly-rotated
+    # DHAN_ACCESS_TOKEN / KITE_ACCESS_TOKEN actually takes effect mid-session.
     try:
         orch = _state.get("orchestrator")
-        broker = getattr(orch, "broker", None) if orch else None
-        if broker is not None and hasattr(broker, "reload_credentials"):
-            broker.reload_credentials()
+        if orch is not None:
+            seen_brokers: set[int] = set()
+            broker_holders = [
+                orch,
+                getattr(orch, "move_detection_scanner", None),
+                getattr(orch, "pdh_pdl_scanner", None),
+                getattr(orch, "atl_straddle_scanner", None),
+            ]
+            for holder in broker_holders:
+                if holder is None:
+                    continue
+                broker = getattr(holder, "broker", None)
+                if broker is None or id(broker) in seen_brokers:
+                    continue
+                seen_brokers.add(id(broker))
+                if hasattr(broker, "reload_credentials"):
+                    try:
+                        broker.reload_credentials()
+                        logger.info(
+                            "Reloaded credentials on %s (held by %s)",
+                            type(broker).__name__, type(holder).__name__,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "reload_credentials failed on %s", type(broker).__name__,
+                        )
     except Exception:
         logger.exception("Failed to reload broker credentials after env update")
 
@@ -2079,37 +2128,22 @@ async def reset_atm():
 
 # ── Strategy Analytics & Today's Plan ─────────────────────────────────────
 
-@app.get("/api/strategy-analytics")
-async def get_strategy_analytics():
-    """Comprehensive strategy performance data for the dashboard.
-
-    Returns:
-        - Per-strategy per-instrument historical backtest metrics
-        - Evaluation history (last 30 days)
-        - Today's trading plan (strategies, capital allocation)
-        - Overall system stats
-    """
+async def _load_strategy_analytics_db(today: str) -> dict:
+    """Heavy DB-only portion of /api/strategy-analytics — cached separately."""
     from app.db.models import AsyncSessionLocal
     from sqlalchemy import text as _sql_text
 
-    orch = _state.get("orchestrator")
-    today = datetime.now(_IST).strftime("%Y-%m-%d")
-
-    result = {
-        "today": today,
-        "today_plan": {},
+    db_result: dict = {
         "strategy_rankings": [],
         "condition_performance": [],
         "eval_history": [],
-        "trade_stats": {},
+        "trade_stats": [],
         "data_coverage": {},
     }
 
     try:
-        # Determine active instruments to filter results
         active_syms = settings.get_active_instrument_list()
         if not active_syms:
-            # Fallback: use enabled instruments from registry
             from app.core.instruments import get_enabled_instruments
             active_syms = [i.symbol for i in get_enabled_instruments()]
 
@@ -2128,7 +2162,7 @@ async def get_strategy_analytics():
                 {"instruments": active_syms},
             )
             for r in rows:
-                result["strategy_rankings"].append({
+                db_result["strategy_rankings"].append({
                     "eval_date": r[0],
                     "instrument": r[1],
                     "strategy": r[2],
@@ -2162,7 +2196,7 @@ async def get_strategy_analytics():
                 {"instruments": active_syms},
             )
             for r in rows:
-                result["condition_performance"].append({
+                db_result["condition_performance"].append({
                     "instrument": r[0],
                     "strategy": r[1],
                     "condition_key": r[2],
@@ -2192,7 +2226,7 @@ async def get_strategy_analytics():
                 {"cutoff": (datetime.now(_IST) - timedelta(days=30)).strftime("%Y-%m-%d"), "instruments": active_syms},
             )
             for r in rows:
-                result["eval_history"].append({
+                db_result["eval_history"].append({
                     "eval_date": r[0],
                     "instrument": r[1],
                     "strategy": r[2],
@@ -2231,7 +2265,7 @@ async def get_strategy_analytics():
                     "first_trade": r[6],
                     "last_trade": r[7],
                 })
-            result["trade_stats"] = trade_stats
+            db_result["trade_stats"] = trade_stats
 
             # 5. Data coverage — how many days of index/option candles
             rows = await session.execute(
@@ -2242,7 +2276,7 @@ async def get_strategy_analytics():
                 )
             )
             for r in rows:
-                result["data_coverage"][r[0]] = {
+                db_result["data_coverage"][r[0]] = {
                     "index_candle_days": r[1],
                     "from": r[2],
                     "to": r[3],
@@ -2257,16 +2291,50 @@ async def get_strategy_analytics():
             )
             for r in rows:
                 sym = r[0]
-                if sym not in result["data_coverage"]:
-                    result["data_coverage"][sym] = {}
-                result["data_coverage"][sym]["option_candle_days"] = r[1]
-                result["data_coverage"][sym]["option_from"] = r[2]
-                result["data_coverage"][sym]["option_to"] = r[3]
+                if sym not in db_result["data_coverage"]:
+                    db_result["data_coverage"][sym] = {}
+                db_result["data_coverage"][sym]["option_candle_days"] = r[1]
+                db_result["data_coverage"][sym]["option_from"] = r[2]
+                db_result["data_coverage"][sym]["option_to"] = r[3]
 
     except Exception:
         logger.exception("Error fetching strategy analytics")
 
-    # 6. Today's plan from orchestrator
+    return db_result
+
+
+@app.get("/api/strategy-analytics")
+async def get_strategy_analytics():
+    """Comprehensive strategy performance data for the dashboard.
+
+    Returns:
+        - Per-strategy per-instrument historical backtest metrics
+        - Evaluation history (last 30 days)
+        - Today's trading plan (strategies, capital allocation)
+        - Overall system stats
+    """
+    orch = _state.get("orchestrator")
+    today = datetime.now(_IST).strftime("%Y-%m-%d")
+
+    # DB-heavy portion: cache 60s. Live `today_plan` always merged below.
+    cache_key = f"strategy_analytics:db:{today}"
+    db_part = await cache.cached(
+        cache_key,
+        ttl_seconds=60,
+        loader=lambda: _load_strategy_analytics_db(today),
+    ) or {}
+
+    result = {
+        "today": today,
+        "today_plan": {},
+        "strategy_rankings": db_part.get("strategy_rankings", []),
+        "condition_performance": db_part.get("condition_performance", []),
+        "eval_history": db_part.get("eval_history", []),
+        "trade_stats": db_part.get("trade_stats", []),
+        "data_coverage": db_part.get("data_coverage", {}),
+    }
+
+    # 6. Today's plan from orchestrator (always live, never cached)
     if orch:
         plan = {}
         for inst in getattr(orch, "_active_instruments", []):
