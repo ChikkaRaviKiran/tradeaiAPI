@@ -422,11 +422,24 @@ class ATLStraddleScanner:
             if not self._force_entry and (
                 now.hour < entry_h or (now.hour == entry_h and now.minute < entry_m)
             ):
-                self._record_diag(
-                    "before_entry_time",
-                    f"Waiting for entry time {entry_h:02d}:{entry_m:02d} (now {now.strftime('%H:%M:%S')})",
-                )
-                return
+                # Precise wake-up: if entry_time is within the next loop tick,
+                # sleep exactly until then so the order fires within ~1s of
+                # the configured time instead of waiting for the next 10s tick.
+                entry_dt_local = datetime(now.year, now.month, now.day, entry_h, entry_m, tzinfo=IST)
+                wait_s = (entry_dt_local - now).total_seconds()
+                if 0 < wait_s <= 12.0:
+                    self._record_diag(
+                        "precise_wait",
+                        f"Sleeping {wait_s:.1f}s for precise entry at {entry_h:02d}:{entry_m:02d}",
+                    )
+                    await asyncio.sleep(wait_s)
+                    now = datetime.now(IST)
+                else:
+                    self._record_diag(
+                        "before_entry_time",
+                        f"Waiting for entry time {entry_h:02d}:{entry_m:02d} (now {now.strftime('%H:%M:%S')})",
+                    )
+                    return
             if self._force_entry:
                 self._record_event(
                     "force_entry",
@@ -437,8 +450,11 @@ class ATLStraddleScanner:
             rounded = round(spot / interval) * interval
             ce_strike = rounded + offset
             pe_strike = rounded - offset
-            ce_q = await self._fetch_option_quote(instrument, ce_strike, "CE")
-            pe_q = await self._fetch_option_quote(instrument, pe_strike, "PE")
+            # Parallelize CE+PE quote fetches (independent broker calls).
+            ce_q, pe_q = await asyncio.gather(
+                self._fetch_option_quote(instrument, ce_strike, "CE"),
+                self._fetch_option_quote(instrument, pe_strike, "PE"),
+            )
             if not ce_q or not pe_q:
                 self._state.entry_in_progress = False
                 self._record_diag(
@@ -447,8 +463,11 @@ class ATLStraddleScanner:
                     f"PE={int(pe_strike)} {'OK' if pe_q else 'MISS'}); will retry",
                 )
                 return
-            ce_leg = await self._build_leg(instrument, ce_strike, "CE", fallback_quote=ce_q)
-            pe_leg = await self._build_leg(instrument, pe_strike, "PE", fallback_quote=pe_q)
+            # Parallelize leg builds (each may resolve symbol via broker).
+            ce_leg, pe_leg = await asyncio.gather(
+                self._build_leg(instrument, ce_strike, "CE", fallback_quote=ce_q),
+                self._build_leg(instrument, pe_strike, "PE", fallback_quote=pe_q),
+            )
             if not ce_leg or not pe_leg:
                 self._state.entry_in_progress = False
                 self._record_diag(
@@ -709,14 +728,21 @@ class ATLStraddleScanner:
             otm_points = max(1, int(self._settings.get("hedge_otm_points", 500) or 500))
             ce_strike = round((ref_strike + otm_points) / interval) * interval
             pe_strike = round((ref_strike - otm_points) / interval) * interval
-            ce_q = await self._fetch_option_quote(instrument, ce_strike, "CE")
-            pe_q = await self._fetch_option_quote(instrument, pe_strike, "PE")
-            ce_leg = await self._build_leg(instrument, ce_strike, "CE", fallback_quote=ce_q)
-            pe_leg = await self._build_leg(instrument, pe_strike, "PE", fallback_quote=pe_q)
+            # Parallel quote fetch for the two hedge strikes.
+            ce_q, pe_q = await asyncio.gather(
+                self._fetch_option_quote(instrument, ce_strike, "CE"),
+                self._fetch_option_quote(instrument, pe_strike, "PE"),
+            )
+            ce_leg, pe_leg = await asyncio.gather(
+                self._build_leg(instrument, ce_strike, "CE", fallback_quote=ce_q),
+                self._build_leg(instrument, pe_strike, "PE", fallback_quote=pe_q),
+            )
         else:
             target_premium = max(1.0, float(self._settings.get("hedge_premium", 3) or 3))
-            ce_leg = await self._find_hedge_leg(instrument, ref_strike, "CE", target_premium, interval)
-            pe_leg = await self._find_hedge_leg(instrument, ref_strike, "PE", target_premium, interval)
+            ce_leg, pe_leg = await asyncio.gather(
+                self._find_hedge_leg(instrument, ref_strike, "CE", target_premium, interval),
+                self._find_hedge_leg(instrument, ref_strike, "PE", target_premium, interval),
+            )
 
         if ce_leg:
             self._state.hedge_ce = ce_leg
@@ -726,11 +752,21 @@ class ATLStraddleScanner:
             hedge_lots = int(self._settings.get("hedge_lots", 0) or 0)
             short_lots = int(self._settings.get("lots", 1) or 1)
             lots = hedge_lots if hedge_lots > 0 else short_lots
+            # Place hedge BUY orders in parallel — both must succeed.
+            ce_task = (
+                self._place_leg_order(instrument, self._state.hedge_ce, "BUY", lots, "hedge_entry")
+                if self._state.hedge_ce else asyncio.sleep(0, result=True)
+            )
+            pe_task = (
+                self._place_leg_order(instrument, self._state.hedge_pe, "BUY", lots, "hedge_entry")
+                if self._state.hedge_pe else asyncio.sleep(0, result=True)
+            )
+            ce_hedge_ok, pe_hedge_ok = await asyncio.gather(ce_task, pe_task)
             hedge_failed = False
-            if self._state.hedge_ce and not await self._place_leg_order(instrument, self._state.hedge_ce, "BUY", lots, "hedge_entry"):
+            if self._state.hedge_ce and not ce_hedge_ok:
                 self._state.hedge_ce = None
                 hedge_failed = True
-            if self._state.hedge_pe and not await self._place_leg_order(instrument, self._state.hedge_pe, "BUY", lots, "hedge_entry"):
+            if self._state.hedge_pe and not pe_hedge_ok:
                 self._state.hedge_pe = None
                 hedge_failed = True
 
@@ -1161,8 +1197,12 @@ class ATLStraddleScanner:
 
     async def _execute_entry_legs(self, instrument: InstrumentConfig, ce_leg: ATLLeg, pe_leg: ATLLeg, reason: str) -> bool:
         lots = int(self._settings.get("lots", 1) or 1)
-        ce_ok = await self._place_leg_order(instrument, ce_leg, "SELL", lots, reason)
-        pe_ok = await self._place_leg_order(instrument, pe_leg, "SELL", lots, reason)
+        # Place both SELL legs in parallel — they're independent broker calls.
+        # Order-tier sequencing (hedges before shorts) is preserved by callers.
+        ce_ok, pe_ok = await asyncio.gather(
+            self._place_leg_order(instrument, ce_leg, "SELL", lots, reason),
+            self._place_leg_order(instrument, pe_leg, "SELL", lots, reason),
+        )
         if ce_ok and pe_ok:
             return True
         # Best-effort rollback if one leg entered but the other failed.

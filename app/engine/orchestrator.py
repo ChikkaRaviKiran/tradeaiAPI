@@ -1454,7 +1454,10 @@ class Orchestrator:
                 htf_trend=self._htf_biases.get(symbol),
             )
             self.snapshots[symbol] = snap
-            await self.history_logger.save_snapshot(snap)
+            # Fire-and-forget DB write so the next instrument analysis isn't
+            # blocked by a 30-100ms INSERT round-trip. The snapshots table is
+            # append-only and per-row independent, so ordering doesn't matter.
+            asyncio.create_task(self.history_logger.save_snapshot(snap))
 
             # Update shared API state incrementally (so dashboard shows data ASAP)
             from app.api.routes import get_state

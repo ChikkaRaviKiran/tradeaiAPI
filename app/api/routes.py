@@ -913,18 +913,29 @@ async def get_full_day_data(target_date: str):
 async def get_broker_positions():
     """Return active broker positions in UI-friendly shape (replica-style)."""
     broker, account = _get_active_broker()
+    cache_key = f"positions:{account}"
+
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
     try:
         positions, broker_day = await asyncio.to_thread(_extract_positions_for_ui, broker, account.upper())
     except Exception as exc:
         logger.exception("Failed to fetch broker positions")
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {
+    payload = {
         "status": "ok",
         "account": account,
         "positions": positions,
         "broker_day_pnl": broker_day,
     }
+    # Short TTL: dashboard polls every 10s, broker call typically 200-500ms.
+    # 3s cap keeps positions essentially live while collapsing duplicate hits
+    # from multiple tabs/users.
+    await cache.set_json(cache_key, payload, ttl_seconds=3)
+    return payload
 
 
 @app.post("/api/positions/exit")
@@ -985,6 +996,9 @@ async def exit_broker_positions(body: dict):
     if any(r.get("ok") for r in results):
         _mark_scanners_completed_for_today()
 
+    # Bust positions cache so the next poll reflects the exit immediately.
+    await cache.delete_prefix("positions:")
+
     return {
         "status": "ok",
         "account": account,
@@ -997,6 +1011,7 @@ async def exit_broker_positions(body: dict):
 async def rearm_after_manual_exit():
     """Clear manual completion flags so strategies can place entries again today."""
     _rearm_scanners_for_today()
+    await cache.delete_prefix("positions:")
     return {"status": "ok", "message": "Strategies re-armed for today"}
 
 
