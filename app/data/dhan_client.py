@@ -134,19 +134,48 @@ class DhanClient:
         """Place an order. Returns the raw Dhan response dict.
 
         Dhan expects string constants for transaction/order/product types.
+        Both the order_type and price are normalised here as a safety
+        net so a bad caller can never accidentally place a LIMIT order
+        when MARKET was intended (Dhan treats any non-zero price on a
+        MARKET payload as a LIMIT order in some account configs, leaving
+        the order pending in the order book).
         """
+        order_type_norm = (order_type or "MARKET").upper().strip()
+        if order_type_norm not in {"LIMIT", "MARKET", "STOP_LOSS", "STOP_LOSS_MARKET"}:
+            order_type_norm = "MARKET"
+        # MARKET / SL-MARKET must have price=0 and trigger_price=0 (for MARKET)
+        if order_type_norm == "MARKET":
+            price = 0.0
+            trigger_price = 0.0
+        elif order_type_norm == "STOP_LOSS_MARKET":
+            price = 0.0
+
+        payload_log = {
+            "security_id": str(security_id),
+            "exchange_segment": exchange_segment,
+            "transaction_type": transaction_type,
+            "quantity": int(quantity),
+            "order_type": order_type_norm,
+            "product_type": product_type,
+            "price": float(price or 0),
+            "trigger_price": float(trigger_price or 0),
+            "validity": validity,
+        }
+        logger.info("DHAN PLACE_ORDER payload: %s", payload_log)
+
         try:
             resp = self._dhan.place_order(
                 security_id=str(security_id),
                 exchange_segment=exchange_segment,
                 transaction_type=transaction_type,
                 quantity=int(quantity),
-                order_type=order_type,
+                order_type=order_type_norm,
                 product_type=product_type,
                 price=float(price or 0),
                 trigger_price=float(trigger_price or 0),
                 validity=validity,
             )
+            logger.info("DHAN PLACE_ORDER response: %s", resp)
             return resp if isinstance(resp, dict) else {"status": "failure", "raw": str(resp)}
         except Exception as exc:
             logger.exception("Dhan place_order failed")

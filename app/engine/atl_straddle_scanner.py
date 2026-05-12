@@ -264,7 +264,38 @@ class ATLStraddleScanner:
                 self._state.done_for_day
                 and new_signature != self._last_done_signature
             )
-            future_rearm = signature_changed and entry_in_future and self._state.entered
+            # SAFETY: previously `future_rearm` would silently wipe engine
+            # state (legs, phase, entered flag) whenever the user moved the
+            # entry_time to a future moment AND we were already in a trade.
+            # That wipe did NOT close broker positions, so the broker held
+            # orphan legs while the engine immediately placed a fresh
+            # straddle on the next tick — visible to the user as an
+            # "exit + restraddle" right after entry. Refuse to wipe state
+            # while we are actually in a position; require an explicit
+            # Force Close from the UI first.
+            future_rearm = (
+                signature_changed
+                and entry_in_future
+                and self._state.entered
+                and not self.is_in_trade()
+            )
+            future_rearm_blocked = (
+                signature_changed
+                and entry_in_future
+                and self._state.entered
+                and self.is_in_trade()
+            )
+            if future_rearm_blocked:
+                logger.warning(
+                    "[ATL] Refusing auto-rearm: in-trade and entry_time moved "
+                    "to future. Use 'Force Close ATM' first. sig_old=%s sig_new=%s",
+                    prev_signature, new_signature,
+                )
+                self._record_event(
+                    "rearm_blocked",
+                    "Settings changed mid-trade — refused to wipe legs. "
+                    "Click 'Force Close ATM' to exit broker positions first.",
+                )
             if done_rearm or future_rearm:
                 self._state.done_for_day = False
                 self._state.halted = False
@@ -283,11 +314,16 @@ class ATLStraddleScanner:
                 self._state.reform_count = 0
                 self._diag_last.clear()
                 reason = (
-                    "Settings changed and entry_time moved to future — "
-                    "scanner state cleared for fresh entry"
+                    f"Settings changed and entry_time moved to future — "
+                    f"scanner state cleared for fresh entry "
+                    f"(sig: {prev_signature} -> {new_signature})"
                     if future_rearm
-                    else "Settings changed by user — strategy re-armed"
+                    else (
+                        f"Settings changed by user — strategy re-armed "
+                        f"(sig: {prev_signature} -> {new_signature})"
+                    )
                 )
+                logger.info("[ATL] Re-armed: %s", reason)
                 self._record_event("rearm", reason)
 
         if not self._settings.get("enabled", False):
@@ -564,6 +600,17 @@ class ATLStraddleScanner:
                 new_strike = round(spot / interval) * interval
                 self._state.reform_count += 1
                 self._state.is_first_straddle = False
+                logger.info(
+                    "[ATL] Reform triggered: spot=%.2f outside [%.2f, %.2f] "
+                    "(strike=%.2f sl_points=%.2f) -> new_strike=%.2f",
+                    spot, lower, upper, self._state.straddle_strike,
+                    self._state.straddle_sl_points, new_strike,
+                )
+                self._record_event(
+                    "reform_trigger",
+                    f"spot={spot:.2f} outside [{lower:.2f}, {upper:.2f}] "
+                    f"-> new strike {int(new_strike)}",
+                )
                 await self._convert_to_straddle(instrument, new_strike, spot, reform=True)
 
     async def _convert_to_straddle(self, instrument: InstrumentConfig, strike: float, spot: float, reform: bool = False) -> None:
@@ -1133,13 +1180,85 @@ class ATLStraddleScanner:
         self._complete_for_day("One or more legs failed at broker; flattened and completed for today")
         return False
 
+    async def _broker_open_symbols(self) -> Optional[set[str]]:
+        """Return the set of trading symbols currently open at the broker.
+
+        Used to skip exit orders for legs the user has already closed
+        manually at the broker (otherwise the scanner would place
+        orphan SELL/BUY exit orders that have no underlying position
+        and end up sitting in the order book or hitting position limits).
+
+        Returns ``None`` when the broker can't be queried \u2014 the caller
+        should then fall back to the engine-state behaviour (i.e. attempt
+        the close, since we don't actually know).
+        """
+        broker = self._resolve_broker()
+        if broker is None:
+            return None
+        get_positions = getattr(broker, "get_positions", None)
+        if not callable(get_positions):
+            return None
+        try:
+            positions = await asyncio.to_thread(get_positions)
+        except Exception:
+            logger.exception("[ATL] Could not query broker positions for exit gating")
+            return None
+        symbols: set[str] = set()
+        for p in positions or []:
+            sym = ""
+            qty = 0
+            if hasattr(p, "trading_symbol"):
+                sym = (p.trading_symbol or "").strip()
+                qty = int(getattr(p, "quantity", 0) or 0)
+            elif isinstance(p, dict):
+                sym = str(
+                    p.get("trading_symbol")
+                    or p.get("tradingsymbol")
+                    or p.get("tradingSymbol")
+                    or ""
+                ).strip()
+                qty = int(
+                    p.get("quantity")
+                    or p.get("netqty")
+                    or p.get("netQty")
+                    or 0
+                )
+            if sym and qty != 0:
+                symbols.add(sym.upper())
+        return symbols
+
     async def _close_current_shorts(self, instrument: InstrumentConfig, reason: str) -> bool:
         lots = int(self._settings.get("lots", 1) or 1)
         ok = True
+        # Skip legs the user has already closed manually at the broker so we
+        # don't fire orphan exit orders against zero positions.
+        open_syms = await self._broker_open_symbols()
         if self._state.ce:
-            ok = await self._place_leg_order(instrument, self._state.ce, "BUY", lots, reason) and ok
+            sym = (self._state.ce.symbol or "").upper()
+            if open_syms is not None and sym and sym not in open_syms:
+                logger.info(
+                    "[ATL] Skipping CE close (%s): broker shows no open position. reason=%s",
+                    self._state.ce.symbol, reason,
+                )
+                self._record_event(
+                    "exit_skipped",
+                    f"CE {self._state.ce.symbol} not held at broker (already closed manually)",
+                )
+            else:
+                ok = await self._place_leg_order(instrument, self._state.ce, "BUY", lots, reason) and ok
         if self._state.pe:
-            ok = await self._place_leg_order(instrument, self._state.pe, "BUY", lots, reason) and ok
+            sym = (self._state.pe.symbol or "").upper()
+            if open_syms is not None and sym and sym not in open_syms:
+                logger.info(
+                    "[ATL] Skipping PE close (%s): broker shows no open position. reason=%s",
+                    self._state.pe.symbol, reason,
+                )
+                self._record_event(
+                    "exit_skipped",
+                    f"PE {self._state.pe.symbol} not held at broker (already closed manually)",
+                )
+            else:
+                ok = await self._place_leg_order(instrument, self._state.pe, "BUY", lots, reason) and ok
         return ok
 
     async def _close_hedges(self, instrument: InstrumentConfig, reason: str) -> bool:
@@ -1147,15 +1266,44 @@ class ATLStraddleScanner:
         short_lots = int(self._settings.get("lots", 1) or 1)
         lots = hedge_lots if hedge_lots > 0 else short_lots
         ok = True
+        open_syms = await self._broker_open_symbols()
         if self._state.hedge_ce:
-            ok = await self._place_leg_order(instrument, self._state.hedge_ce, "SELL", lots, reason) and ok
+            sym = (self._state.hedge_ce.symbol or "").upper()
+            if open_syms is not None and sym and sym not in open_syms:
+                logger.info(
+                    "[ATL] Skipping HEDGE CE close (%s): broker shows no open position. reason=%s",
+                    self._state.hedge_ce.symbol, reason,
+                )
+                self._record_event(
+                    "exit_skipped",
+                    f"HEDGE CE {self._state.hedge_ce.symbol} not held at broker",
+                )
+            else:
+                ok = await self._place_leg_order(instrument, self._state.hedge_ce, "SELL", lots, reason) and ok
         if self._state.hedge_pe:
-            ok = await self._place_leg_order(instrument, self._state.hedge_pe, "SELL", lots, reason) and ok
+            sym = (self._state.hedge_pe.symbol or "").upper()
+            if open_syms is not None and sym and sym not in open_syms:
+                logger.info(
+                    "[ATL] Skipping HEDGE PE close (%s): broker shows no open position. reason=%s",
+                    self._state.hedge_pe.symbol, reason,
+                )
+                self._record_event(
+                    "exit_skipped",
+                    f"HEDGE PE {self._state.hedge_pe.symbol} not held at broker",
+                )
+            else:
+                ok = await self._place_leg_order(instrument, self._state.hedge_pe, "SELL", lots, reason) and ok
         return ok
 
     async def _switch_shorts(self, instrument: InstrumentConfig, new_ce: ATLLeg, new_pe: ATLLeg, reason: str) -> bool:
         old_ce = self._state.ce
         old_pe = self._state.pe
+        logger.info(
+            "[ATL] _switch_shorts: %s | old CE=%s PE=%s -> new CE=%s PE=%s",
+            reason,
+            old_ce.strike if old_ce else "-", old_pe.strike if old_pe else "-",
+            new_ce.strike, new_pe.strike,
+        )
         if not await self._close_current_shorts(instrument, f"close_{reason}"):
             await self.alert_manager.telegram.send(f"⚠️ ATL {reason}: failed to close current short legs")
             self._complete_for_day("Failed to close current legs during switch; completed for today")
