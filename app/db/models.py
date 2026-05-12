@@ -330,6 +330,24 @@ class StrategyConditionPerformance(Base):
     created_at = Column(DateTime, default=_now_ist)
 
 
+class BrokerCredential(Base):
+    """Per-broker credentials stored in DB so they can be updated at runtime
+    from the UI without editing ``.env`` or restarting the container.
+
+    One row per (broker, key). Values are stored as plain text — the DB is
+    not exposed publicly. Secrets-at-rest encryption can be added later if
+    required.
+    """
+
+    __tablename__ = "broker_credentials"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    broker = Column(String(20), nullable=False, index=True)  # "dhan" | "kite" | "angel"
+    key = Column(String(50), nullable=False)                 # e.g. "client_id", "access_token"
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=_now_ist, onupdate=_now_ist)
+
+
 class BrokerEODSnapshot(Base):
     """End-of-day broker PnL snapshot (OptionSelling-style history support)."""
 
@@ -423,6 +441,8 @@ async def init_db() -> None:
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS partial_exit_done BOOLEAN DEFAULT FALSE",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS partial_pnl FLOAT DEFAULT 0",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS original_lot_size INTEGER DEFAULT 0",
+            # Broker credentials store
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_broker_credentials_broker_key ON broker_credentials (broker, key)",
         ]
         for sql in migrations:
             try:

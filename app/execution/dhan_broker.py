@@ -48,6 +48,7 @@ class DhanBroker(BaseBroker):
     def __init__(self) -> None:
         self._client: Optional[DhanClient] = None
         self._authenticated = False
+        self._client_id: str = ""
         self._init_client()
 
     @property
@@ -59,22 +60,35 @@ class DhanBroker(BaseBroker):
         return self._client
 
     def _init_client(self) -> None:
-        if not settings.dhan_client_id or not settings.dhan_access_token:
+        from app.db.broker_credentials import get_dhan_credentials
+
+        creds = get_dhan_credentials()
+        client_id = creds.get("client_id") or ""
+        access_token = creds.get("access_token") or ""
+        if not client_id or not access_token:
             logger.warning(
-                "DhanBroker: DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not configured"
+                "DhanBroker: client_id / access_token not configured "
+                "(checked DB and DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN env)"
             )
+            self._client = None
+            self._client_id = ""
             return
         try:
             self._client = DhanClient(
-                client_id=settings.dhan_client_id,
-                access_token=settings.dhan_access_token,
+                client_id=client_id,
+                access_token=access_token,
             )
+            self._client_id = client_id
         except Exception:
             logger.exception("DhanBroker: failed to initialise DhanClient")
             self._client = None
+            self._client_id = ""
 
     def reload_credentials(self) -> None:
-        """Re-create the Dhan client after settings change at runtime."""
+        """Re-create the Dhan client after credentials change at runtime."""
+        from app.db.broker_credentials import invalidate
+
+        invalidate("dhan")
         self._authenticated = False
         self._init_client()
 
@@ -90,7 +104,7 @@ class DhanBroker(BaseBroker):
             if self._authenticated:
                 logger.info(
                     "DhanBroker: authenticated (client_id=%s, available=%s)",
-                    settings.dhan_client_id[:4] + "***",
+                    (self._client_id[:4] + "***") if self._client_id else "***",
                     data.get("availabelBalance") or data.get("availableBalance"),
                 )
             else:
@@ -325,9 +339,13 @@ class DhanBroker(BaseBroker):
             except Exception:
                 logger.exception("Dhan structured lookup failed")
 
-        # Fallback: parse Angel symbol
-        if request.symbol_token and request.symbol_token.isdigit():
-            return request.symbol_token  # caller may have passed Dhan securityId
+        # Fallback: parse the broker-agnostic trading symbol via the Dhan
+        # scrip master. The previous implementation also returned
+        # ``request.symbol_token`` directly when it was numeric, but that
+        # token comes from AngelOne in some exit paths and IS NOT a valid
+        # Dhan securityId — using it would route the order to a random
+        # contract or get it rejected. So we always resolve through the
+        # scrip master when structured lookup misses.
         return self._client.resolve_from_angel_symbol(
             request.trading_symbol, exchange
         ) or ""

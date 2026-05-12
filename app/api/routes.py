@@ -136,7 +136,15 @@ def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict
 
     # Dhan
     elif hasattr(broker, "_client") and broker.__class__.__name__.lower().startswith("dhan"):
-        raw = broker._client.get_positions() or []
+        if broker._client is None:
+            logger.warning(
+                "Positions: Dhan client not initialised \u2014 check credentials in DB "
+                "(broker_credentials table) or DHAN_CLIENT_ID/DHAN_ACCESS_TOKEN env"
+            )
+            raw = []
+        else:
+            raw = broker._client.get_positions() or []
+            logger.info("Positions: Dhan returned %d raw position rows", len(raw))
         for p in raw:
             buy_qty = _safe_int(p.get("buyQty") or p.get("buyQuantity"), 0)
             sell_qty = _safe_int(p.get("sellQty") or p.get("sellQuantity"), 0)
@@ -1891,8 +1899,11 @@ async def kite_oauth_callback(
 
 @app.get("/api/broker/dhan/status")
 async def get_dhan_status():
-    client_id = settings.dhan_client_id
-    access_token = settings.dhan_access_token
+    from app.db.broker_credentials import get_dhan_credentials
+
+    creds = get_dhan_credentials()
+    client_id = creds.get("client_id") or ""
+    access_token = creds.get("access_token") or ""
     return {
         "configured": bool(client_id and access_token),
         "client_id_set": bool(client_id),
@@ -1903,16 +1914,79 @@ async def get_dhan_status():
 
 @app.post("/api/broker/dhan/test")
 async def test_dhan_connection():
-    if not (settings.dhan_client_id and settings.dhan_access_token):
+    from app.db.broker_credentials import get_dhan_credentials
+
+    creds = get_dhan_credentials()
+    client_id = creds.get("client_id") or ""
+    access_token = creds.get("access_token") or ""
+    if not (client_id and access_token):
         return {"success": False, "error": "Dhan client_id or access_token not configured"}
     try:
         from app.data.dhan_client import DhanClient
 
-        client = DhanClient(settings.dhan_client_id, settings.dhan_access_token)
-        funds = client.get_fund_limits()
-        if funds:
-            return {"success": True, "message": "Dhan authentication successful", "funds": funds}
-        return {"success": False, "error": "Empty response from Dhan get_fund_limits"}
+        client = DhanClient(client_id, access_token)
+        # Hit the SDK directly so we can see the raw status / remarks /
+        # errorCode envelope. The DhanClient.get_fund_limits() wrapper
+        # collapses failures into an empty dict, which used to hide
+        # invalid / expired token errors and made every test "succeed".
+        try:
+            resp = await asyncio.to_thread(client._dhan.get_fund_limits)
+        except Exception as exc:
+            return {"success": False, "error": f"Dhan API call failed: {exc}"}
+
+        if not isinstance(resp, dict):
+            return {
+                "success": False,
+                "error": f"Unexpected Dhan response type: {type(resp).__name__}",
+            }
+
+        status = str(resp.get("status") or "").lower()
+        data = resp.get("data") or {}
+        remarks = resp.get("remarks") or {}
+        # Dhan returns remarks as either a string or a dict {error_code, error_message, ...}
+        if isinstance(remarks, dict):
+            err_code = remarks.get("error_code") or remarks.get("errorCode") or ""
+            err_msg = (
+                remarks.get("error_message")
+                or remarks.get("errorMessage")
+                or remarks.get("message")
+                or ""
+            )
+        else:
+            err_code = ""
+            err_msg = str(remarks)
+
+        if status != "success":
+            detail = " | ".join(filter(None, [err_code, err_msg])) or str(resp)[:200]
+            return {
+                "success": False,
+                "error": f"Dhan auth rejected: {detail}",
+                "raw": resp,
+            }
+
+        # status=success but no actual fund fields → token may be valid
+        # but account is restricted; surface that instead of pretending
+        # everything is fine.
+        balance_keys = (
+            "availabelBalance",
+            "availableBalance",
+            "sodLimit",
+            "collateralAmount",
+            "withdrawableBalance",
+        )
+        if not any(k in data for k in balance_keys):
+            return {
+                "success": False,
+                "error": "Dhan returned success but no fund fields — account may be restricted",
+                "raw": resp,
+            }
+
+        return {
+            "success": True,
+            "message": "Dhan authentication successful",
+            "client_id": (client_id[:2] + "***"),
+            "funds": data,
+        }
     except Exception as exc:
         logger.exception("Dhan test connection failed")
         return {"success": False, "error": str(exc)}
@@ -1920,36 +1994,54 @@ async def test_dhan_connection():
 
 @app.post("/api/broker/dhan/update-credentials")
 async def update_dhan_credentials(body: dict):
-    orch = _state.get("orchestrator")
-    if orch and getattr(orch, "running", False):
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot update credentials while system is running. Stop the system first.",
-        )
-    field_map = {
-        "client_id": "DHAN_CLIENT_ID",
-        "access_token": "DHAN_ACCESS_TOKEN",
-    }
-    updates: dict[str, str] = {}
-    for field, env_var in field_map.items():
-        value = (body.get(field) or "").strip()
-        if value:
-            updates[env_var] = value
-    if not updates:
+    """Persist Dhan credentials to the DB and hot-reload the broker.
+
+    Stored in the ``broker_credentials`` table — survives container
+    restarts and does not require editing ``.env``. The active broker
+    adapter (if any) is reloaded immediately so the new token takes
+    effect for the next order without restarting the system.
+    """
+    from app.db.broker_credentials import set_dhan_credentials
+
+    client_id = (body.get("client_id") or "").strip()
+    access_token = (body.get("access_token") or "").strip()
+    if not client_id and not access_token:
         raise HTTPException(status_code=400, detail="No Dhan credentials provided")
-    _persist_env_vars(updates)
-    logger.info("Dhan credentials updated: %s", list(updates.keys()))
-    return {"success": True, "updated_fields": list(updates.keys())}
+    try:
+        set_dhan_credentials(client_id=client_id or None,
+                             access_token=access_token or None)
+    except Exception as exc:
+        logger.exception("Failed to persist Dhan credentials to DB")
+        raise HTTPException(status_code=500, detail=f"DB write failed: {exc}")
+
+    updated = [k for k, v in (("client_id", client_id), ("access_token", access_token)) if v]
+
+    # Hot-reload the active broker so the new token is picked up immediately.
+    try:
+        orch = _state.get("orchestrator")
+        broker = getattr(orch, "broker", None) if orch else None
+        if broker is not None and hasattr(broker, "reload_credentials"):
+            broker.reload_credentials()
+    except Exception:
+        logger.exception("Failed to reload broker credentials after Dhan update")
+
+    logger.info("Dhan credentials updated in DB: %s", updated)
+    return {"success": True, "updated_fields": updated}
 
 
 @app.post("/api/broker/dhan/refresh-instruments")
 async def refresh_dhan_instruments():
-    if not (settings.dhan_client_id and settings.dhan_access_token):
+    from app.db.broker_credentials import get_dhan_credentials
+
+    creds = get_dhan_credentials()
+    client_id = creds.get("client_id") or ""
+    access_token = creds.get("access_token") or ""
+    if not (client_id and access_token):
         return {"ok": False, "error": "Dhan client_id or access_token not configured"}
     try:
         from app.data.dhan_client import DhanClient
 
-        client = DhanClient(settings.dhan_client_id, settings.dhan_access_token)
+        client = DhanClient(client_id, access_token)
         n = await asyncio.to_thread(client.refresh_scrip_master, True)
         return {"ok": True, "instruments_loaded": n}
     except Exception as exc:
