@@ -13,7 +13,9 @@ This scanner is alert-first and does not place broker orders directly.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Optional
@@ -39,6 +41,19 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 ORDER_POLL_RETRIES = 8
 ORDER_POLL_DELAY_SECONDS = 1.0
+
+
+def _atl_state_path() -> str:
+    """On-disk location for persisted ATL runtime state + events.
+
+    Lives next to atl_straddle_settings.json so restarts within the
+    same trading day can recover ref_spot, current legs, hedge legs,
+    roll/reform counters, and the event timeline. Without this the
+    scanner forgets where it entered the moment the backend restarts
+    and cannot compute roll/reform triggers correctly.
+    """
+    backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(backend_root, "data", "atl_straddle_state.json")
 
 
 @dataclass
@@ -90,6 +105,8 @@ class ATLStraddleScanner:
         self._diag_last: dict[str, datetime] = {}
         self._force_entry: bool = False
         self._last_done_signature: str = ""
+        # Recover prior intraday state from disk if it's from today.
+        self._load_state_from_disk()
 
     def reset_daily(self) -> None:
         self._today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -99,6 +116,119 @@ class ATLStraddleScanner:
         self._diag_last = {}
         self._force_entry = False
         self._last_done_signature = ""
+        self._save_state_to_disk()
+
+    # ── State persistence ────────────────────────────────────────────
+    def _leg_to_dict(self, leg: Optional[ATLLeg]) -> Optional[dict]:
+        if leg is None:
+            return None
+        return {
+            "option_type": leg.option_type,
+            "strike": leg.strike,
+            "symbol": leg.symbol,
+            "symboltoken": leg.symboltoken,
+            "exchange": leg.exchange,
+            "premium": leg.premium,
+        }
+
+    def _dict_to_leg(self, d: Optional[dict]) -> Optional[ATLLeg]:
+        if not isinstance(d, dict):
+            return None
+        try:
+            return ATLLeg(
+                option_type=str(d.get("option_type", "")),
+                strike=float(d.get("strike", 0) or 0),
+                symbol=str(d.get("symbol", "")),
+                symboltoken=str(d.get("symboltoken", "")),
+                exchange=str(d.get("exchange", "NFO")),
+                premium=float(d.get("premium", 0) or 0),
+            )
+        except Exception:
+            return None
+
+    def _save_state_to_disk(self) -> None:
+        path = _atl_state_path()
+        try:
+            payload = {
+                "today": self._today_str,
+                "state": {
+                    "phase": self._state.phase,
+                    "ref_spot": self._state.ref_spot,
+                    "straddle_strike": self._state.straddle_strike,
+                    "straddle_sl_points": self._state.straddle_sl_points,
+                    "is_first_straddle": self._state.is_first_straddle,
+                    "roll_count": self._state.roll_count,
+                    "reform_count": self._state.reform_count,
+                    "ce": self._leg_to_dict(self._state.ce),
+                    "pe": self._leg_to_dict(self._state.pe),
+                    "hedge_ce": self._leg_to_dict(self._state.hedge_ce),
+                    "hedge_pe": self._leg_to_dict(self._state.hedge_pe),
+                    "entered": self._state.entered,
+                    "entry_in_progress": False,  # never resume mid-placement
+                    "done_for_day": self._state.done_for_day,
+                    "halted": self._state.halted,
+                    "halt_reason": self._state.halt_reason,
+                },
+                "events": self._events[-200:],
+                "last_done_signature": self._last_done_signature,
+            }
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, default=str)
+            os.replace(tmp, path)
+        except Exception:
+            logger.exception("[ATL] Failed to persist state to %s", path)
+
+    def _load_state_from_disk(self) -> None:
+        path = _atl_state_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            logger.exception("[ATL] Failed to load persisted state from %s", path)
+            return
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        saved_today = str(payload.get("today") or "")
+        if saved_today != today:
+            # Stale (different trading day) — ignore, reset_daily will
+            # clear the file on next cycle.
+            logger.info("[ATL] Persisted state is from %s (today=%s); ignoring", saved_today, today)
+            return
+        st = payload.get("state") or {}
+        try:
+            self._today_str = saved_today
+            self._state = ATLState(
+                phase=str(st.get("phase", "IDLE")),
+                ref_spot=float(st.get("ref_spot", 0) or 0),
+                straddle_strike=float(st.get("straddle_strike", 0) or 0),
+                straddle_sl_points=float(st.get("straddle_sl_points", 0) or 0),
+                is_first_straddle=bool(st.get("is_first_straddle", True)),
+                roll_count=int(st.get("roll_count", 0) or 0),
+                reform_count=int(st.get("reform_count", 0) or 0),
+                ce=self._dict_to_leg(st.get("ce")),
+                pe=self._dict_to_leg(st.get("pe")),
+                hedge_ce=self._dict_to_leg(st.get("hedge_ce")),
+                hedge_pe=self._dict_to_leg(st.get("hedge_pe")),
+                entered=bool(st.get("entered", False)),
+                entry_in_progress=False,
+                done_for_day=bool(st.get("done_for_day", False)),
+                halted=bool(st.get("halted", False)),
+                halt_reason=str(st.get("halt_reason", "")),
+            )
+            self._events = list(payload.get("events") or [])
+            self._last_done_signature = str(payload.get("last_done_signature") or "")
+            logger.info(
+                "[ATL] Recovered state for %s: phase=%s entered=%s ref_spot=%.2f straddle_strike=%.0f events=%d",
+                today, self._state.phase, self._state.entered,
+                self._state.ref_spot, self._state.straddle_strike, len(self._events),
+            )
+        except Exception:
+            logger.exception("[ATL] Failed to apply persisted state; starting fresh")
+            self._state = ATLState()
+            self._events = []
 
     def _settings_signature(self) -> str:
         """Minimal signature used to detect user intent to re-arm intraday."""
@@ -847,6 +977,11 @@ class ATLStraddleScanner:
         })
         if len(self._events) > 200:
             self._events = self._events[-200:]
+        # Persist immediately so a backend restart preserves both the
+        # event log and the strategy state (legs, ref_spot, roll/reform
+        # counters). Without this the scanner forgets where it entered
+        # and cannot compute roll/reform triggers after a restart.
+        self._save_state_to_disk()
 
     def _record_diag(self, key: str, message: str) -> None:
         """Record a diagnostic gate-skip event without spamming the timeline.
