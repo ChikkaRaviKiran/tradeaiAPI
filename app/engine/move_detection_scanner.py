@@ -545,12 +545,13 @@ class MoveDetectionScanner:
 
         order_status = "OBSERVE ONLY — No auto-execution"
         if live_exec and self._active_trade.lots > 0:
-            ok, oid = await self._place_entry_order(instrument, self._active_trade)
+            ok, oid, err = await self._place_entry_order(instrument, self._active_trade)
             self._active_trade.entry_order_id = oid
             self._active_trade.live_executed = bool(ok)
-            order_status = (
-                f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
-            )
+            if ok:
+                order_status = f"LIVE ORDER PLACED — id={oid}"
+            else:
+                order_status = f"LIVE ORDER FAILED — {err}" if err else "LIVE ORDER FAILED"
         elif settings.move_det_live_execution:
             if self._active_trade.lots == 0:
                 order_status = "LIVE skipped — insufficient funds for 1 lot"
@@ -704,10 +705,13 @@ class MoveDetectionScanner:
 
         # ── LIVE EXIT ORDER (sell back the long PE) ──────────────────
         if trade.live_executed and trade.lots > 0 and trade.symboltoken:
-            ok, oid = await self._place_exit_order(instrument, trade, reason=exit_reason)
+            ok, oid, err = await self._place_exit_order(instrument, trade, reason=exit_reason)
             trade.exit_order_id = oid
             if not ok:
-                logger.error("[MoveDet] Exit order failed for %s reason=%s", trade.option_symbol, exit_reason)
+                logger.error(
+                    "[MoveDet] Exit order failed for %s reason=%s err=%s",
+                    trade.option_symbol, exit_reason, err,
+                )
 
         # Calculate PnL (bearish: profit when price drops)
         index_pnl_pct = (trade.entry_price - exit_price) / trade.entry_price * 100
@@ -784,7 +788,7 @@ class MoveDetectionScanner:
             if not self._active_trade.exited:
                 # Live exit if needed
                 if self._active_trade.live_executed and self._active_trade.lots > 0 and self._active_trade.symboltoken:
-                    ok, oid = await self._place_exit_order(instrument, self._active_trade, reason="eod_force")
+                    ok, oid, _err = await self._place_exit_order(instrument, self._active_trade, reason="eod_force")
                     self._active_trade.exit_order_id = oid
                 self._active_trade.exited = True
                 self._active_trade.exit_reason = "eod_force"
@@ -800,7 +804,7 @@ class MoveDetectionScanner:
     # ── Live order helpers ───────────────────────────────────────────
     async def _place_entry_order(
         self, instrument: InstrumentConfig, trade: ActiveTrade,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, str]:
         """Place a BUY market order for the long PE leg."""
         qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
         return await self._place_order(
@@ -813,7 +817,7 @@ class MoveDetectionScanner:
 
     async def _place_exit_order(
         self, instrument: InstrumentConfig, trade: ActiveTrade, reason: str,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, str]:
         """Place a SELL market order to close the long PE leg."""
         qty = max(1, int(trade.lots)) * max(1, int(trade.lot_size))
         return await self._place_order(
@@ -832,19 +836,22 @@ class MoveDetectionScanner:
         side: str,
         quantity: int,
         tag: str,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, str]:
         """Route order through the configured broker abstraction.
 
         Works for both AngelOne and Kite. The Kite adapter resolves the
         broker-native tradingsymbol from the structured option fields
         (underlying / expiry_date / strike / option_type), so MoveDet does
         not need to know which broker is active.
+
+        Returns ``(ok, order_id, error_message)`` so callers can surface
+        the broker rejection reason in alerts.
         """
         if not trade.option_symbol or quantity <= 0:
-            return False, ""
+            return False, "", "invalid symbol/quantity"
         if self.broker is None:
             logger.error("[MoveDet] No broker configured — cannot place %s order", side)
-            return False, ""
+            return False, "", "no broker configured"
         request = OrderRequest(
             instrument=instrument,
             trading_symbol=trade.option_symbol,
@@ -864,25 +871,25 @@ class MoveDetectionScanner:
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[MoveDet] Broker order exception side=%s symbol=%s tag=%s",
                 side, trade.option_symbol, tag,
             )
-            return False, ""
+            return False, "", f"exception: {exc}"
         if not resp or resp.status == OrderStatus.REJECTED:
             msg = (resp.message if resp else "no response") or "rejected"
             logger.error(
                 "[MoveDet] Order rejected side=%s symbol=%s tag=%s msg=%s",
                 side, trade.option_symbol, tag, msg,
             )
-            return False, getattr(resp, "order_id", "") or ""
+            return False, getattr(resp, "order_id", "") or "", str(msg)
         order_id = resp.order_id or ""
         logger.info(
             "[MoveDet] %s order placed via %s: %s qty=%d id=%s tag=%s",
             side, self.broker.name, trade.option_symbol, quantity, order_id, tag,
         )
-        return True, order_id
+        return True, order_id, ""
 
     async def _fetch_option_quote(
         self,

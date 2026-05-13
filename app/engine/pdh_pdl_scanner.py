@@ -385,14 +385,15 @@ class PDHPDLBreakoutScanner:
             lots = int(self._active_trade.lots)
             self._active_trade.lots = lots
             qty = lots * int(instrument.lot_size)
-            ok, oid = await self._place_option_order(
+            ok, oid, err = await self._place_option_order(
                 instrument, self._active_trade, "BUY", qty, tag="entry",
             )
             self._active_trade.entry_order_id = oid
             self._active_trade.live_executed = bool(ok)
-            order_status = (
-                f"LIVE ORDER PLACED — id={oid}" if ok else "LIVE ORDER FAILED"
-            )
+            if ok:
+                order_status = f"LIVE ORDER PLACED — id={oid}"
+            else:
+                order_status = f"LIVE ORDER FAILED — {err}" if err else "LIVE ORDER FAILED"
         elif bool(cfg.get("live_execution")):
             if int(self._active_trade.lots or 0) == 0:
                 order_status = "LIVE skipped — insufficient funds for 1 lot"
@@ -574,13 +575,14 @@ class PDHPDLBreakoutScanner:
         exit_order_status = "OBSERVE ONLY — paper trade"
         if trade.live_executed and trade.lots > 0:
             qty = trade.lots * int(instrument.lot_size)
-            ok, oid = await self._place_option_order(
+            ok, oid, err = await self._place_option_order(
                 instrument, trade, "SELL", qty, tag=f"exit_{exit_reason}",
             )
             trade.exit_order_id = oid
-            exit_order_status = (
-                f"LIVE EXIT PLACED — id={oid}" if ok else "LIVE EXIT FAILED"
-            )
+            if ok:
+                exit_order_status = f"LIVE EXIT PLACED — id={oid}"
+            else:
+                exit_order_status = f"LIVE EXIT FAILED — {err}" if err else "LIVE EXIT FAILED"
         msg = (
             f"{emoji} PDH/PDL — EXIT {'WIN' if is_win else 'LOSS'} (PAPER)\n"
             f"{'=' * 36}\n"
@@ -647,13 +649,19 @@ class PDHPDLBreakoutScanner:
         side: str,
         quantity: int,
         tag: str,
-    ) -> tuple[bool, str]:
-        """Place an option order via the configured broker abstraction."""
+    ) -> tuple[bool, str, str]:
+        """Place an option order via the configured broker abstraction.
+
+        Returns ``(ok, order_id, error_message)``. ``error_message`` is
+        empty on success; on failure it carries the broker rejection
+        text so the alert layer can surface a useful reason instead of
+        a bare "LIVE ORDER FAILED".
+        """
         if not trade.option_symbol or quantity <= 0:
-            return False, ""
+            return False, "", "invalid symbol/quantity"
         if self.broker is None:
             logger.error("[PDHPDL] No broker configured — cannot place %s order", side)
-            return False, ""
+            return False, "", "no broker configured"
         request = OrderRequest(
             instrument=instrument,
             trading_symbol=trade.option_symbol,
@@ -673,25 +681,25 @@ class PDHPDLBreakoutScanner:
         )
         try:
             resp = await asyncio.to_thread(self.broker.place_order, request)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[PDHPDL] Broker order exception side=%s symbol=%s tag=%s",
                 side, trade.option_symbol, tag,
             )
-            return False, ""
+            return False, "", f"exception: {exc}"
         if not resp or resp.status == OrderStatus.REJECTED:
             msg = (resp.message if resp else "no response") or "rejected"
             logger.error(
                 "[PDHPDL] Order rejected side=%s symbol=%s tag=%s msg=%s",
                 side, trade.option_symbol, tag, msg,
             )
-            return False, getattr(resp, "order_id", "") or ""
+            return False, getattr(resp, "order_id", "") or "", str(msg)
         order_id = resp.order_id or ""
         logger.info(
             "[PDHPDL] %s order placed via %s: %s qty=%d id=%s tag=%s",
             side, self.broker.name, trade.option_symbol, quantity, order_id, tag,
         )
-        return True, order_id
+        return True, order_id, ""
 
     async def _fetch_option_quote(
         self,
