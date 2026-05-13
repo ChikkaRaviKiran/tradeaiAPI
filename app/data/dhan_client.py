@@ -328,9 +328,14 @@ class DhanClient:
 
         for row in self._load_scrip_master():
             seg = self._row_get(row, "SEM_EXM_EXCH_ID", "EXCH_ID", "exchange_segment")
-            # SEM_EXM_EXCH_ID is "NSE"/"BSE"; SEM_SEGMENT denotes "D" (derivative)
-            segment = self._row_get(row, "SEM_SEGMENT")
-            instr = self._row_get(row, "SEM_INSTRUMENT_NAME", "INSTRUMENT")
+            # SEM_EXM_EXCH_ID is "NSE"/"BSE"; SEM_SEGMENT denotes "D" (derivative).
+            # Dhan's "detailed" CSV uses SEGMENT (no SEM_ prefix), so fall
+            # back to that — without the fallback every option row was
+            # silently rejected and the resolver returned None for all
+            # contracts (NIFTY+SENSEX) starting from the day Dhan changed
+            # the master schema.
+            segment = self._row_get(row, "SEM_SEGMENT", "SEGMENT")
+            instr = self._row_get(row, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "INSTRUMENT_TYPE")
             if instr.upper() not in {"OPTIDX", "OPTSTK", "OPTFUT"}:
                 continue
             # Map row to a dhan exchange segment
@@ -344,7 +349,8 @@ class DhanClient:
                 continue
 
             under = self._row_get(
-                row, "SM_SYMBOL_NAME", "SEM_TRADING_SYMBOL", "UNDERLYING_SYMBOL"
+                row, "SM_SYMBOL_NAME", "SEM_TRADING_SYMBOL",
+                "UNDERLYING_SYMBOL", "SYMBOL_NAME", "DISPLAY_NAME"
             ).upper()
             # underlying name often appears in SM_SYMBOL_NAME or as prefix of trading symbol
             if target_under not in under:
@@ -360,7 +366,7 @@ class DhanClient:
                 continue
             if row_strike != target_strike:
                 continue
-            exp_str = self._row_get(row, "SEM_EXPIRY_DATE", "EXPIRY_DATE")
+            exp_str = self._row_get(row, "SEM_EXPIRY_DATE", "SM_EXPIRY_DATE", "EXPIRY_DATE")
             if not exp_str:
                 continue
             row_expiry = self._parse_expiry(exp_str)
