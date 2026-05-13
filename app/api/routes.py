@@ -296,7 +296,21 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     await init_db()
 
+    # Pattern Engine: seed defaults + start nightly scheduler (isolated subsystem)
     import os
+    if os.environ.get("PATTERN_ENGINE_SCHEDULER", "1") != "0":
+        try:
+            from app.db.models import AsyncSessionLocal as _PE_Session
+            from app.pattern_engine.seed import upsert_seed_patterns
+            from app.pattern_engine.scheduler import start_scheduler
+
+            async with _PE_Session() as _s:
+                inserted = await upsert_seed_patterns(_s)
+                logger.info("pattern_engine: seed upsert ok (inserted=%d)", inserted)
+            start_scheduler()
+        except Exception as _pe_e:
+            logger.warning("pattern_engine startup hook failed: %s", _pe_e)
+
     if os.environ.get("SKIP_ORCHESTRATOR") == "1":
         logger.info("SKIP_ORCHESTRATOR=1 — skipping orchestrator (backtest-only mode)")
         yield
@@ -319,6 +333,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down...")
+    # Stop pattern-engine scheduler if running
+    try:
+        from app.pattern_engine.scheduler import stop_scheduler
+        stop_scheduler()
+    except Exception:
+        pass
     # Safety kill-switch: prevent any new real order execution during shutdown.
     settings.paper_trading = True
     orch = _state.get("orchestrator")
@@ -350,6 +370,14 @@ app.add_middleware(
 
 trade_logger = TradeLogger()
 history_logger = HistoryLogger()
+
+
+# ── Pattern Engine routes (isolated subsystem) ───────────────────────────
+try:
+    from app.pattern_engine.routes import register_routes as _register_pe_routes
+    _register_pe_routes(app)
+except Exception as _pe_err:  # pragma: no cover
+    logger.warning("pattern_engine routes not registered: %s", _pe_err)
 
 
 # ── Market Overview ───────────────────────────────────────────────────────
