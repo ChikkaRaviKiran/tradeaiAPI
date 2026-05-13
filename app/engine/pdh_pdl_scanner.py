@@ -341,7 +341,10 @@ class PDHPDLBreakoutScanner:
         if option_symbol:
             token_info = self.client._search_symbol(option_symbol)
             if token_info:
-                symboltoken = token_info.get("token", "")
+                # Index built by AngelOneClient stores the token under
+                # "symboltoken" (the value of the master row's "token" field).
+                # Falling back to "token" preserves any other index variants.
+                symboltoken = token_info.get("symboltoken") or token_info.get("token", "")
                 exchange = token_info.get("exch_seg", "NFO")
         self._active_trade.symboltoken = symboltoken
         self._active_trade.exchange = exchange

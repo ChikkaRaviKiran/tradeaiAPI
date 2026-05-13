@@ -484,7 +484,10 @@ class MoveDetectionScanner:
         # live execution is enabled.
         exec_summary = ""
         token_info = self.client._search_symbol(option_symbol) if option_symbol else None
-        symboltoken = (token_info or {}).get("token", "")
+        # Index built by AngelOneClient stores the token under "symboltoken"
+        # (the value of the master row's "token" field). Falling back to
+        # "token" preserves any other index variants.
+        symboltoken = (token_info or {}).get("symboltoken") or (token_info or {}).get("token", "")
         exchange = (token_info or {}).get("exch_seg", "NFO")
         self._active_trade.symboltoken = symboltoken
         self._active_trade.exchange = exchange
