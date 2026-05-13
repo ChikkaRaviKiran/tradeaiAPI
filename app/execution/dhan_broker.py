@@ -143,15 +143,52 @@ class DhanBroker(BaseBroker):
             logger.error(msg)
             return OrderResponse(status=OrderStatus.REJECTED, message=msg)
 
+        # ── BSE/BFO market-protection LIMIT ─────────────────────────
+        # BSE does NOT accept pure MARKET orders for SENSEX/BANKEX
+        # options. Dhan auto-converts MARKET → LIMIT using a tight
+        # protection band (~5%) which causes legs to fail in fast
+        # markets (e.g. CALL @ LTP 519 with broker-set limit 450
+        # never fills). To make BFO behave like NFO ("just fill it")
+        # we send an explicit LIMIT with a wide ±20% protection: BUY
+        # caps at ask × 1.20, SELL floors at bid × 0.80. NFO stays
+        # on true MARKET because NSE accepts it natively.
+        order_type_str = self._map_order_type(OrderType.MARKET)
+        limit_price = 0.0
+        if exchange_segment == "BSE_FNO":
+            try:
+                ltp = self._client.get_ltp(exchange_segment, security_id) or 0.0
+            except Exception:
+                ltp = 0.0
+            if ltp and ltp > 0:
+                buffer = 0.20  # ±20% market-protection band
+                if request.side.value.upper() == "BUY":
+                    raw = ltp * (1.0 + buffer)
+                else:
+                    raw = ltp * (1.0 - buffer)
+                # BFO option tick size is 0.05 — round to tick.
+                tick = 0.05
+                limit_price = max(tick, round(raw / tick) * tick)
+                order_type_str = "LIMIT"
+                logger.info(
+                    "DHAN BFO MARKET-as-LIMIT: side=%s ltp=%.2f limit=%.2f (buffer=%.0f%%)",
+                    request.side.value, ltp, limit_price, buffer * 100,
+                )
+            else:
+                logger.warning(
+                    "DHAN BFO LTP unavailable for %s — falling back to MARKET "
+                    "(broker may auto-convert to tight LIMIT)",
+                    request.trading_symbol,
+                )
+
         resp = self._client.place_order(
             security_id=security_id,
             exchange_segment=exchange_segment,
             transaction_type=request.side.value,
             quantity=int(request.quantity),
-            order_type=self._map_order_type(OrderType.MARKET),
+            order_type=order_type_str,
             product_type=self._map_product(ProductType.CARRYFORWARD),
-            price=float(request.price or 0),
-            trigger_price=float(request.trigger_price or 0),
+            price=float(limit_price),
+            trigger_price=0.0,
         )
 
         if not isinstance(resp, dict) or resp.get("status") != "success":
