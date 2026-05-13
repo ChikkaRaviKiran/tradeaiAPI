@@ -1,7 +1,8 @@
 """Live matcher + mini-sim gate.
 
-Used by the orchestrator (when wired in later) and by the API for "what's
-happening right now" queries. Pure function — no orders placed.
+Reads pattern definitions (trigger_json) FROM THE DB and evaluates them via
+the JSON DSL. This means trigger tweaks made via the UI are picked up
+immediately on the next live evaluation — no code change required.
 """
 
 from __future__ import annotations
@@ -17,8 +18,8 @@ from app.pattern_engine.db_models import (
     PEPattern,
     PEPatternOccurrence,
 )
+from app.pattern_engine.dsl import evaluate_trigger
 from app.pattern_engine.features import FeatureSnapshot, compute_snapshot
-from app.pattern_engine.patterns import SEED_PATTERNS, evaluate_all, get_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -75,64 +76,52 @@ def _passes_minisim(sim: dict, status: str) -> tuple[bool, str]:
 async def evaluate_live(
     session, symbol: str = "NIFTY", at: Optional[datetime] = None
 ) -> list[dict]:
-    """Evaluate all patterns at the given (or now) timestamp.
-
-    Returns a list of match descriptors with mini-sim + decision. Logs every
-    decision to pe_live_probes.
-    """
+    """Evaluate all DB patterns at the given (or now) timestamp."""
     ts = at or datetime.now().replace(second=0, microsecond=0)
     snap = await compute_snapshot(session, symbol, ts)
     if snap is None:
         return []
+    snap_dict = snap.to_dict()
 
-    matched = evaluate_all(snap)
+    patterns = (await session.execute(select(PEPattern))).scalars().all()
     out: list[dict] = []
 
-    # Get pattern statuses from DB (preserves user-managed state)
-    statuses: dict[str, dict] = {}
-    rows = (await session.execute(select(PEPattern))).scalars().all()
-    for r in rows:
-        statuses[r.pattern_id] = {
-            "status": r.status,
-            "size_multiplier": r.size_multiplier,
-        }
+    for p in patterns:
+        if p.status == "retired":
+            continue
+        try:
+            if not evaluate_trigger(p.trigger_json, snap_dict):
+                continue
+        except Exception as e:
+            logger.debug("trigger eval failed for %s: %s", p.pattern_id, e)
+            continue
 
-    for p in matched:
-        st = statuses.get(p.pattern_id, {"status": "shadow", "size_multiplier": 1.0})
         sim = await mini_sim(session, p.pattern_id, days=30)
-        passes, reason = _passes_minisim(sim, st["status"])
+        passes, reason = _passes_minisim(sim, p.status)
 
-        decision = "taken" if (passes and st["status"] == "live") else (
-            "shadow_match" if st["status"] == "shadow" else (
+        decision = "taken" if (passes and p.status == "live") else (
+            "shadow_match" if p.status == "shadow" else (
                 "skipped_minisim" if not passes else "skipped_status"
             )
         )
 
-        # Probe log
-        session.add(
-            PELiveProbe(
-                ts=ts,
-                pattern_id=p.pattern_id,
-                symbol=symbol,
-                edge_score=sim["expectancy_pct"],
-                minisim_n=sim["n"],
-                minisim_wr=sim["wr"],
-                minisim_pf=sim["pf"],
-                decision=decision,
-                skip_reason=reason or None,
-            )
-        )
+        session.add(PELiveProbe(
+            ts=ts, pattern_id=p.pattern_id, symbol=symbol,
+            edge_score=sim["expectancy_pct"],
+            minisim_n=sim["n"], minisim_wr=sim["wr"], minisim_pf=sim["pf"],
+            decision=decision, skip_reason=reason or None,
+        ))
 
         out.append({
             "pattern_id": p.pattern_id,
             "name": p.name,
             "direction": p.direction,
-            "status": st["status"],
-            "size_multiplier": st["size_multiplier"],
+            "status": p.status,
+            "size_multiplier": p.size_multiplier,
             "minisim": sim,
             "decision": decision,
             "skip_reason": reason or None,
-            "snapshot": snap.to_dict(),
+            "snapshot": snap_dict,
         })
 
     await session.commit()

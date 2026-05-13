@@ -39,6 +39,25 @@ class SizeUpdate(BaseModel):
     size_multiplier: float
 
 
+class TriggerUpdate(BaseModel):
+    trigger_json: dict
+    lock: bool = True  # set [locked] in notes so seeder won't overwrite
+
+
+class ExitRuleUpdate(BaseModel):
+    exit_rule_json: dict
+    lock: bool = True
+
+
+class NotesUpdate(BaseModel):
+    notes: str
+
+
+class RebackfillRequest(BaseModel):
+    days: int = 540
+    reset: bool = True  # wipe this pattern's existing backfill occurrences first
+
+
 def _latest_stats_subquery():
     """Subquery returning latest computed_at per (pattern_id, window)."""
     return (
@@ -245,6 +264,97 @@ def register_routes(app: FastAPI) -> None:
             p.size_multiplier = body.size_multiplier
             await s.commit()
             return {"ok": True, "pattern_id": pattern_id, "size_multiplier": body.size_multiplier}
+
+    def _toggle_lock(notes: str | None, lock: bool) -> str:
+        notes = notes or ""
+        if lock and "[locked]" not in notes:
+            notes = (notes + " [locked]").strip()
+        if not lock:
+            notes = notes.replace("[locked]", "").strip()
+        return notes
+
+    @app.post("/api/pattern-engine/patterns/{pattern_id}/trigger")
+    async def set_pattern_trigger(pattern_id: str, body: TriggerUpdate):
+        # Validate via DSL
+        from app.pattern_engine.dsl import evaluate_trigger
+        try:
+            evaluate_trigger(body.trigger_json, {})  # syntax-only check
+        except KeyError:
+            pass  # missing fields ok during validation
+        except Exception as e:
+            raise HTTPException(400, f"invalid trigger_json: {e}")
+
+        async with AsyncSessionLocal() as s:
+            p = (await s.execute(select(PEPattern).where(PEPattern.pattern_id == pattern_id))).scalar_one_or_none()
+            if not p:
+                raise HTTPException(404, "Pattern not found")
+            p.trigger_json = body.trigger_json
+            p.notes = _toggle_lock(p.notes, body.lock)
+            await s.commit()
+            return {"ok": True, "pattern_id": pattern_id, "trigger_json": body.trigger_json, "notes": p.notes}
+
+    @app.post("/api/pattern-engine/patterns/{pattern_id}/exit-rule")
+    async def set_pattern_exit_rule(pattern_id: str, body: ExitRuleUpdate):
+        from app.pattern_engine.dsl import normalize_exit
+        try:
+            normalize_exit(body.exit_rule_json)
+        except Exception as e:
+            raise HTTPException(400, f"invalid exit_rule_json: {e}")
+        async with AsyncSessionLocal() as s:
+            p = (await s.execute(select(PEPattern).where(PEPattern.pattern_id == pattern_id))).scalar_one_or_none()
+            if not p:
+                raise HTTPException(404, "Pattern not found")
+            p.exit_rule_json = body.exit_rule_json
+            p.notes = _toggle_lock(p.notes, body.lock)
+            await s.commit()
+            return {"ok": True, "pattern_id": pattern_id, "exit_rule_json": body.exit_rule_json, "notes": p.notes}
+
+    @app.post("/api/pattern-engine/patterns/{pattern_id}/notes")
+    async def set_pattern_notes(pattern_id: str, body: NotesUpdate):
+        async with AsyncSessionLocal() as s:
+            p = (await s.execute(select(PEPattern).where(PEPattern.pattern_id == pattern_id))).scalar_one_or_none()
+            if not p:
+                raise HTTPException(404, "Pattern not found")
+            p.notes = body.notes
+            await s.commit()
+            return {"ok": True, "pattern_id": pattern_id, "notes": p.notes}
+
+    @app.post("/api/pattern-engine/patterns/{pattern_id}/rebackfill")
+    async def rebackfill_pattern(pattern_id: str, body: RebackfillRequest):
+        """Re-run backfill for a SINGLE pattern using its current trigger/exit JSON.
+
+        Snapshots are not re-written (they're already in the DB). Existing
+        occurrences for this pattern are deleted first when reset=True.
+        Stats are refreshed at the end so the UI sees fresh win-rate / PF.
+        """
+        from datetime import date as _date
+        from app.pattern_engine.backfill import run_backfill
+
+        async with AsyncSessionLocal() as s:
+            exists = (await s.execute(select(PEPattern.pattern_id).where(PEPattern.pattern_id == pattern_id))).scalar_one_or_none()
+            if not exists:
+                raise HTTPException(404, "Pattern not found")
+
+        days = max(1, min(body.days, 2000))
+        end = _date.today()
+        start = end - timedelta(days=days)
+        try:
+            totals = await run_backfill(
+                symbol="NIFTY",
+                start=start, end=end, days=None,
+                reset_occurrences=body.reset,
+                reset_snapshots=False,
+                only_pattern_id=pattern_id,
+            )
+        except Exception as e:
+            logger.exception("rebackfill failed for %s", pattern_id)
+            raise HTTPException(500, f"rebackfill failed: {e}")
+
+        # Refresh stats so UI shows fresh numbers immediately
+        async with AsyncSessionLocal() as s:
+            await refresh_pattern_stats(s)
+
+        return {"ok": True, "pattern_id": pattern_id, "totals": totals}
 
     @app.get("/api/pattern-engine/live")
     async def live_state(symbol: str = "NIFTY"):

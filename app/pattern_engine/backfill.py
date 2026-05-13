@@ -27,8 +27,8 @@ from app.pattern_engine.db_models import (
     PEPattern,
     PEPatternOccurrence,
 )
+from app.pattern_engine.dsl import evaluate_trigger, normalize_exit
 from app.pattern_engine.features import compute_snapshot
-from app.pattern_engine.patterns import SEED_PATTERNS, get_pattern
 from app.pattern_engine.seed import upsert_seed_patterns
 
 logger = logging.getLogger(__name__)
@@ -178,25 +178,41 @@ def _simulate_outcome(
     }
 
 
-async def backfill_date(session, symbol: str, target_date: str, force: bool = False) -> dict:
+async def backfill_date(
+    session,
+    symbol: str,
+    target_date: str,
+    force: bool = False,
+    only_pattern_ids: Optional[set[str]] = None,
+    skip_snapshots: bool = False,
+) -> dict:
     """Generate snapshots + occurrences for a single date.
+
+    - only_pattern_ids: if given, only those patterns are evaluated (used for
+      single-pattern re-backfill from the UI)
+    - skip_snapshots: if True, snapshots are not re-written (use during single-
+      pattern re-backfill since snapshots already exist)
 
     Returns counters {snapshots, occurrences} for logging.
     """
-    if not force and await _date_already_processed(session, symbol, target_date):
+    if not skip_snapshots and not force and await _date_already_processed(session, symbol, target_date):
         return {"snapshots": 0, "occurrences": 0, "skipped": True}
 
     full_day = await _load_full_day_candles(session, symbol, target_date)
     if full_day.empty:
         return {"snapshots": 0, "occurrences": 0, "no_data": True}
 
+    # Load patterns from DB (so UI tweaks are honored)
+    db_patterns = (await session.execute(select(PEPattern))).scalars().all()
+    if only_pattern_ids:
+        db_patterns = [p for p in db_patterns if p.pattern_id in only_pattern_ids]
+
     snap_count = 0
     occ_count = 0
-    seen_pattern_today = set()  # one entry per pattern per day (avoid spam)
+    seen_pattern_today: set[str] = set()  # one entry per pattern per day
 
     for hour, minute in SNAPSHOT_TIMES:
         ts = datetime.strptime(target_date, "%Y-%m-%d").replace(hour=hour, minute=minute)
-        # Need at least one candle <= ts in the full_day index
         if not (full_day.index <= ts).any():
             continue
 
@@ -204,38 +220,41 @@ async def backfill_date(session, symbol: str, target_date: str, force: bool = Fa
         if snap is None:
             continue
 
-        session.add(
-            PEMarketSnapshot(
-                **{k: v for k, v in snap.to_dict().items() if k != "ts" and k != "symbol"},
-                ts=ts,
-                symbol=symbol,
+        if not skip_snapshots:
+            session.add(
+                PEMarketSnapshot(
+                    **{k: v for k, v in snap.to_dict().items() if k != "ts" and k != "symbol"},
+                    ts=ts,
+                    symbol=symbol,
+                )
             )
-        )
-        snap_count += 1
+            snap_count += 1
 
-        for pattern in SEED_PATTERNS:
-            if pattern.pattern_id in seen_pattern_today:
+        snap_dict = snap.to_dict()
+
+        for p in db_patterns:
+            if p.pattern_id in seen_pattern_today:
                 continue
             try:
-                if not pattern.matches(snap):
+                if not evaluate_trigger(p.trigger_json, snap_dict):
                     continue
             except Exception as e:
-                logger.debug("pattern %s match error at %s: %s", pattern.pattern_id, ts, e)
+                logger.debug("trigger %s eval error at %s: %s", p.pattern_id, ts, e)
                 continue
 
-            seen_pattern_today.add(pattern.pattern_id)
+            seen_pattern_today.add(p.pattern_id)
             outcome = _simulate_outcome(
-                ts, pattern.direction, snap.spot, full_day, pattern.exit_rule_json
+                ts, p.direction, snap.spot, full_day, normalize_exit(p.exit_rule_json)
             )
 
             session.add(
                 PEPatternOccurrence(
-                    pattern_id=pattern.pattern_id,
+                    pattern_id=p.pattern_id,
                     ts=ts,
                     symbol=symbol,
-                    direction=pattern.direction,
+                    direction=p.direction,
                     spot_at_entry=snap.spot,
-                    strike=round(snap.spot / 50) * 50,  # nearest 50
+                    strike=round(snap.spot / 50) * 50,
                     entry_premium=None,
                     exit_premium=outcome["exit_premium"],
                     outcome_pnl_pct=outcome["outcome_pnl_pct"],
@@ -246,7 +265,7 @@ async def backfill_date(session, symbol: str, target_date: str, force: bool = Fa
                     mfe_pct=outcome["mfe_pct"],
                     regime_at_entry=snap.regime,
                     source="backfill",
-                    features_json=snap.to_dict(),
+                    features_json=snap_dict,
                 )
             )
             occ_count += 1
@@ -262,7 +281,9 @@ async def run_backfill(
     days: Optional[int],
     reset_occurrences: bool = False,
     reset_snapshots: bool = False,
-) -> None:
+    only_pattern_id: Optional[str] = None,
+) -> dict:
+    """Execute backfill. Returns totals dict."""
     await init_db()
 
     if days and not start:
@@ -275,8 +296,11 @@ async def run_backfill(
         await upsert_seed_patterns(session)
 
         if reset_occurrences:
-            await session.execute(delete(PEPatternOccurrence).where(PEPatternOccurrence.source == "backfill"))
-            logger.warning("Deleted existing backfill occurrences")
+            stmt = delete(PEPatternOccurrence).where(PEPatternOccurrence.source == "backfill")
+            if only_pattern_id:
+                stmt = stmt.where(PEPatternOccurrence.pattern_id == only_pattern_id)
+            await session.execute(stmt)
+            logger.warning("Deleted existing backfill occurrences (pattern=%s)", only_pattern_id or "ALL")
         if reset_snapshots:
             await session.execute(delete(PEMarketSnapshot))
             logger.warning("Deleted existing snapshots")
@@ -285,16 +309,25 @@ async def run_backfill(
 
         dates = await _get_trading_dates(session, symbol, start, end)
         logger.info(
-            "Backfill %s: %s → %s (%d trading days available)",
+            "Backfill %s: %s → %s (%d trading days available)%s",
             symbol, start, end, len(dates),
+            f" only_pattern={only_pattern_id}" if only_pattern_id else "",
         )
 
+    only_pattern_ids = {only_pattern_id} if only_pattern_id else None
+    skip_snapshots = bool(only_pattern_id)  # snapshots already exist for re-backfill
+
     total = {"snapshots": 0, "occurrences": 0, "days": 0, "skipped": 0}
-    # Use a FRESH session per day so a single-day failure can't poison the rest
+    # Fresh session per day so a single-day failure can't poison the rest
     for d in dates:
         try:
             async with AsyncSessionLocal() as day_session:
-                result = await backfill_date(day_session, symbol, d, force=reset_snapshots)
+                result = await backfill_date(
+                    day_session, symbol, d,
+                    force=reset_snapshots,
+                    only_pattern_ids=only_pattern_ids,
+                    skip_snapshots=skip_snapshots,
+                )
         except Exception as e:
             logger.exception("Failed to backfill %s: %s", d, e)
             continue
@@ -312,6 +345,7 @@ async def run_backfill(
 
     logger.info("=" * 60)
     logger.info("Backfill complete: %s", total)
+    return total
 
 
 def _parse_args() -> argparse.Namespace:
