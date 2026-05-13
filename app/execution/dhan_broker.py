@@ -181,7 +181,8 @@ class DhanBroker(BaseBroker):
             "DHAN ORDER PLACED: %s %s qty=%s id=%s",
             request.side.value, request.trading_symbol, request.quantity, order_id,
         )
-        if not settings.wait_for_terminal_order_status:
+        wait_terminal = bool(settings.wait_for_terminal_order_status) or bool(getattr(request, "wait_for_terminal", False))
+        if not wait_terminal:
             return OrderResponse(
                 order_id=order_id,
                 status=OrderStatus.OPEN,

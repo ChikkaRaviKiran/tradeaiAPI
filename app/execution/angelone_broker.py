@@ -82,7 +82,8 @@ class AngelOneBroker(BaseBroker):
             if resp and resp.get("status"):
                 order_id = resp.get("data", {}).get("orderid", "")
                 logger.info("Order placed: %s | %s", order_id, request.trading_symbol)
-                if not settings.wait_for_terminal_order_status:
+                wait_terminal = bool(settings.wait_for_terminal_order_status) or bool(getattr(request, "wait_for_terminal", False))
+                if not wait_terminal:
                     return OrderResponse(
                         order_id=order_id,
                         status=OrderStatus.OPEN,

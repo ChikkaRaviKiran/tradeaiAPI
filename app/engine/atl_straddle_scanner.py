@@ -494,7 +494,7 @@ class ATLStraddleScanner:
                 hedges_placed = bool(self._state.hedge_ce and self._state.hedge_pe)
                 if not hedges_placed:
                     # Hedge failure: flatten whatever was placed and finish for the day.
-                    await self._close_hedges(instrument, "entry_fail_hedge")
+                    await self._close_hedges(instrument, "entry_fail_hedge", force=True)
                     self._state.hedge_ce = None
                     self._state.hedge_pe = None
                     self._state.entry_in_progress = False
@@ -507,7 +507,7 @@ class ATLStraddleScanner:
                 # Roll back the hedges we just placed so we don't sit on
                 # naked long premium when the shorts couldn't be opened.
                 if hedges_placed:
-                    await self._close_hedges(instrument, "rollback_initial_entry")
+                    await self._close_hedges(instrument, "rollback_initial_entry", force=True)
                     self._state.hedge_ce = None
                     self._state.hedge_pe = None
                 self._state.entry_in_progress = False
@@ -772,7 +772,7 @@ class ATLStraddleScanner:
 
             if hedge_failed:
                 await self._close_current_shorts(instrument, "hedge_leg_fail")
-                await self._close_hedges(instrument, "hedge_leg_fail")
+                await self._close_hedges(instrument, "hedge_leg_fail", force=True)
                 self._state.ce = None
                 self._state.pe = None
                 self._state.hedge_ce = None
@@ -799,9 +799,17 @@ class ATLStraddleScanner:
         target_premium: float,
         interval: int,
     ) -> Optional[ATLLeg]:
+        """Walk OTM and pick the FIRST strike whose LTP ≤ target premium.
+
+        If no strike within range reaches the target, return the closest
+        match seen (deepest OTM tried). The walk extends up to 80 strikes
+        outward — SENSEX (interval 100) needs to cover ~8000 pts to find
+        a ₹5–10 premium when spot is far from ATM; the previous 20-strike
+        cap returned strikes still ~₹30–40 above target.
+        """
         best: Optional[ATLLeg] = None
         best_diff: Optional[float] = None
-        for step in range(1, 21):
+        for step in range(1, 81):
             strike = ref_strike + (interval * step if option_type == "CE" else -interval * step)
             q = await self._fetch_option_quote(instrument, strike, option_type)
             if not q:
@@ -809,14 +817,25 @@ class ATLStraddleScanner:
             ltp = float(q.get("ltp", 0) or 0)
             if ltp <= 0:
                 continue
+            # First strike at or below target wins outright — no need to
+            # keep walking further OTM where LTP only gets smaller and
+            # liquidity disappears.
+            if ltp <= target_premium:
+                candidate = await self._build_leg(instrument, strike, option_type, fallback_quote=q)
+                if candidate:
+                    return candidate
+                # If build failed, fall back to closest-match logic below.
             diff = abs(ltp - target_premium)
             if best_diff is None or diff < best_diff:
                 best_diff = diff
                 candidate = await self._build_leg(instrument, strike, option_type, fallback_quote=q)
                 if candidate:
                     best = candidate
-            if ltp <= target_premium:
-                break
+        if best is None:
+            logger.warning(
+                "[ATL] No %s hedge candidate found within 80 strikes of %.0f (target=%.2f)",
+                option_type, ref_strike, target_premium,
+            )
         return best
 
     def _record_event(self, event_type: str, message: str) -> None:
@@ -994,6 +1013,14 @@ class ATLStraddleScanner:
             expiry_date=self._expiry_date,
             strike=float(leg.strike),
             option_type=leg.option_type,
+            # ATL must know the FINAL order outcome before moving on. With
+            # fast-ack mode, the broker returns OPEN as soon as it accepts
+            # the order — but exchange-side rejections (insufficient
+            # margin, freeze qty, lot multiple, etc.) arrive seconds later
+            # and would otherwise leave the strategy with one short and
+            # two naked hedges. Force terminal-status polling for every
+            # entry/exit/rollback leg so the rollback path actually fires.
+            wait_for_terminal=True,
         )
         try:
             resp = await asyncio.to_thread(target.place_order, request)
@@ -1212,7 +1239,7 @@ class ATLStraddleScanner:
             await self._place_leg_order(instrument, pe_leg, "BUY", lots, f"rollback_{reason}")
         # Ensure no residual exposure remains on leg mismatch.
         await self._close_current_shorts(instrument, f"flatten_{reason}")
-        await self._close_hedges(instrument, f"flatten_{reason}")
+        await self._close_hedges(instrument, f"flatten_{reason}", force=True)
         self._state.ce = None
         self._state.pe = None
         self._state.hedge_ce = None
@@ -1301,12 +1328,19 @@ class ATLStraddleScanner:
                 ok = await self._place_leg_order(instrument, self._state.pe, "BUY", lots, reason) and ok
         return ok
 
-    async def _close_hedges(self, instrument: InstrumentConfig, reason: str) -> bool:
+    async def _close_hedges(self, instrument: InstrumentConfig, reason: str, force: bool = False) -> bool:
         hedge_lots = int(self._settings.get("hedge_lots", 0) or 0)
         short_lots = int(self._settings.get("lots", 1) or 1)
         lots = hedge_lots if hedge_lots > 0 else short_lots
         ok = True
-        open_syms = await self._broker_open_symbols()
+        # ``force=True`` is used by entry-rollback paths where the hedges
+        # were placed seconds ago in the same call and MUST be unwound
+        # regardless of what the broker's positions endpoint reports. The
+        # default broker-position guard exists only to avoid orphan exits
+        # against legs the user manually closed mid-day; it falsely
+        # suppresses rollbacks when the broker reports trading symbols in
+        # a different format (e.g. Dhan vs AngelOne SENSEX symbology).
+        open_syms = None if force else await self._broker_open_symbols()
         if self._state.hedge_ce:
             sym = (self._state.hedge_ce.symbol or "").upper()
             if open_syms is not None and sym and sym not in open_syms:

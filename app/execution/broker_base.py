@@ -73,6 +73,13 @@ class OrderRequest:
     # per-strategy "Live Orders" toggle takes precedence over the global
     # PAPER/LIVE badge (e.g. MoveDet, PDH/PDL).
     force_live: bool = False
+    # When True, the adapter MUST poll the broker for terminal order
+    # status (TRADED/REJECTED/CANCELLED) before returning, even if the
+    # global ``WAIT_FOR_TERMINAL_ORDER_STATUS`` flag is False. Use for
+    # entry legs where a silent exchange-side rejection (after broker
+    # accepts the order) leaves the strategy with naked positions and
+    # no chance to roll back.
+    wait_for_terminal: bool = False
 
 
 @dataclass
