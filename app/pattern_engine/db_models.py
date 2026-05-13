@@ -131,7 +131,7 @@ class PEPatternStats(Base):
     monthly_pnl_json = Column(JSON, nullable=True)           # {"2026-04": 12.4, ...}
     months_profitable = Column(Integer, default=0)
     months_total = Column(Integer, default=0)
-    suggested_tier = Column(String(2), nullable=True)        # S/A/B/REJECT
+    suggested_tier = Column(String(10), nullable=True)        # S/A/B/REJECT
 
 
 class PEPatternOccurrence(Base):

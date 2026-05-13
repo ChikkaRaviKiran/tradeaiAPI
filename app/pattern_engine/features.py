@@ -58,7 +58,11 @@ class FeatureSnapshot:
     orb_broken: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Make JSON-serializable: convert datetimes to ISO strings
+        if isinstance(d.get("ts"), datetime):
+            d["ts"] = d["ts"].isoformat()
+        return d
 
 
 def _time_bucket(t: datetime) -> str:
@@ -147,7 +151,8 @@ async def load_intraday_candles(
         )
         .order_by(IndexCandle.timestamp.asc())
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    with session.no_autoflush:
+        rows = (await session.execute(stmt)).scalars().all()
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(
@@ -179,7 +184,8 @@ async def load_prior_day_levels(
         .order_by(IndexCandle.timestamp.desc())
         .limit(2000)  # plenty for last day
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    with session.no_autoflush:
+        rows = (await session.execute(stmt)).scalars().all()
     if not rows:
         return None, None, None
     # Group by date, pick most recent

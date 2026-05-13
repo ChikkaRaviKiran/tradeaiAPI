@@ -289,27 +289,29 @@ async def run_backfill(
             symbol, start, end, len(dates),
         )
 
-        total = {"snapshots": 0, "occurrences": 0, "days": 0, "skipped": 0}
-        for d in dates:
-            try:
-                result = await backfill_date(session, symbol, d, force=reset_snapshots)
-            except Exception as e:
-                logger.exception("Failed to backfill %s: %s", d, e)
-                continue
-            if result.get("skipped"):
-                total["skipped"] += 1
-                continue
-            total["snapshots"] += result.get("snapshots", 0)
-            total["occurrences"] += result.get("occurrences", 0)
-            total["days"] += 1
-            if total["days"] % 10 == 0:
-                logger.info(
-                    "Progress: %d days done, %d snapshots, %d occurrences",
-                    total["days"], total["snapshots"], total["occurrences"],
-                )
+    total = {"snapshots": 0, "occurrences": 0, "days": 0, "skipped": 0}
+    # Use a FRESH session per day so a single-day failure can't poison the rest
+    for d in dates:
+        try:
+            async with AsyncSessionLocal() as day_session:
+                result = await backfill_date(day_session, symbol, d, force=reset_snapshots)
+        except Exception as e:
+            logger.exception("Failed to backfill %s: %s", d, e)
+            continue
+        if result.get("skipped"):
+            total["skipped"] += 1
+            continue
+        total["snapshots"] += result.get("snapshots", 0)
+        total["occurrences"] += result.get("occurrences", 0)
+        total["days"] += 1
+        if total["days"] % 10 == 0:
+            logger.info(
+                "Progress: %d days done, %d snapshots, %d occurrences",
+                total["days"], total["snapshots"], total["occurrences"],
+            )
 
-        logger.info("=" * 60)
-        logger.info("Backfill complete: %s", total)
+    logger.info("=" * 60)
+    logger.info("Backfill complete: %s", total)
 
 
 def _parse_args() -> argparse.Namespace:
