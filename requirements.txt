@@ -27,6 +27,7 @@ dhanhq==2.1.0
 # Database
 sqlalchemy==2.0.48
 asyncpg==0.31.0
+psycopg2-binary==2.9.9
 alembic==1.13.0
 redis==5.0.1
 
