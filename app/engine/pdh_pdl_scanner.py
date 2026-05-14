@@ -403,7 +403,7 @@ class PDHPDLBreakoutScanner:
             (self._expiry_date - now.date()).days if self._expiry_date else "?"
         )
         msg = (
-            f"⚡ PDH/PDL BREAKOUT — {side} SIGNAL (PAPER)\n"
+            f"⚡ PDH/PDL BREAKOUT — {side} SIGNAL ({'LIVE' if self._active_trade.live_executed else 'PAPER'})\n"
             f"{'=' * 36}\n"
             f"\n"
             f"📅 Date: {self._today_str}\n"
@@ -584,7 +584,7 @@ class PDHPDLBreakoutScanner:
             else:
                 exit_order_status = f"LIVE EXIT FAILED — {err}" if err else "LIVE EXIT FAILED"
         msg = (
-            f"{emoji} PDH/PDL — EXIT {'WIN' if is_win else 'LOSS'} (PAPER)\n"
+            f"{emoji} PDH/PDL — EXIT {'WIN' if is_win else 'LOSS'} ({'LIVE' if trade.live_executed else 'PAPER'})\n"
             f"{'=' * 36}\n"
             f"\n"
             f"📅 Date: {trade.trade_date}\n"

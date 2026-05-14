@@ -759,7 +759,7 @@ class MoveDetectionScanner:
             f"  Confidence was: {trade.confidence}/100\n"
             f"  Expansion was: {trade.expansion_ratio:.1f}×\n"
             f"\n"
-            f"⚠️ OBSERVE ONLY"
+            f"{'✅ LIVE TRADE' if trade.live_executed else '⚠️ OBSERVE ONLY'}"
         )
 
         await self.alert_manager.telegram.send(msg)

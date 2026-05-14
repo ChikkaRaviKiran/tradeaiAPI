@@ -273,6 +273,28 @@ class Orchestrator:
         if not settings.pdh_pdl_scanner_enabled:
             logger.info("[PDHPDL] Scanner disabled via config (PDH_PDL_SCANNER_ENABLED=false)")
 
+        # Safety: surface scanners holding a broker with no live client.
+        # When TRADING_ACCOUNT=dhan but credentials are missing/expired at
+        # startup, _build_atl_broker() still returns a DhanBroker shell —
+        # any subsequent live order would just be REJECTED. Log loudly so
+        # the operator can rotate the token before market open instead of
+        # discovering it from the first failed signal.
+        for tag, scanner in (
+            ("MoveDet", self.move_detection_scanner),
+            ("PDH/PDL", self.pdh_pdl_scanner),
+        ):
+            broker = getattr(scanner, "broker", None)
+            if broker is None:
+                logger.warning("[%s] No broker injected — live execution will skip", tag)
+                continue
+            inner = getattr(broker, "_client", "MISSING_ATTR")
+            if inner is None:
+                logger.error(
+                    "[%s] Broker %s has no live client (credentials missing/expired). "
+                    "Live orders WILL be rejected until credentials are saved via the UI.",
+                    tag, type(broker).__name__,
+                )
+
         # ── ATL Straddle Scanner (UI-driven ATM straddle on NIFTY/SENSEX) ──
         # Routes orders through the broker matching settings.trading_account
         # (kite/dhan/angel). Falls back to the angel broker if the configured

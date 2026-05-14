@@ -41,6 +41,57 @@ _IST = pytz.timezone("Asia/Kolkata")
 ORDER_POLL_RETRIES = 8
 ORDER_POLL_DELAY_SECONDS = 1.0
 
+# ── Exchange freeze quantities (max units per single order) ──────────
+# Beyond these caps, orders MUST be split into multiple child orders.
+# Dhan's UI shows them as "iceberg" but only the first slice actually
+# executes — the remainder is silently dropped. We pre-slice here so
+# every chunk is a normal MARKET/LIMIT order that fully fills.
+# Source: NSE/BSE F&O circulars, current as of FY26.
+_FREEZE_QTY_BY_UNDERLYING: dict[str, int] = {
+    "NIFTY": 1800,        # lot 65  → 27 lots/slice
+    "BANKNIFTY": 900,     # lot 35  → 25 lots/slice
+    "FINNIFTY": 1800,     # lot 65  → 27 lots/slice
+    "MIDCPNIFTY": 1800,   # lot 120 → 15 lots/slice
+    "NIFTYNXT50": 1000,   # lot 25  → 40 lots/slice
+    "SENSEX": 1000,       # lot 20  → 50 lots/slice
+    "BANKEX": 900,        # lot 30  → 30 lots/slice
+    "SENSEX50": 1000,
+}
+
+
+def _resolve_freeze_qty(request: OrderRequest) -> int:
+    """Return the per-order freeze qty for this underlying, or 0 if unknown
+    (in which case the caller falls back to single-order behaviour)."""
+    underlying = (request.underlying or "").upper().strip()
+    if not underlying:
+        # Try to parse from trading_symbol prefix (e.g. "NIFTY26MAY...PE")
+        sym = (request.trading_symbol or "").upper()
+        for key in _FREEZE_QTY_BY_UNDERLYING:
+            if sym.startswith(key):
+                underlying = key
+                break
+    return int(_FREEZE_QTY_BY_UNDERLYING.get(underlying, 0))
+
+
+def _split_quantity(total_qty: int, freeze_qty: int, lot_size: int) -> list[int]:
+    """Split ``total_qty`` into chunks each ≤ freeze_qty and a multiple of
+    lot_size. The final chunk carries the remainder."""
+    if freeze_qty <= 0 or total_qty <= freeze_qty:
+        return [int(total_qty)]
+    ls = max(1, int(lot_size or 1))
+    # Largest multiple of lot_size that is ≤ freeze_qty
+    chunk = (freeze_qty // ls) * ls
+    if chunk <= 0:
+        return [int(total_qty)]
+    slices: list[int] = []
+    remaining = int(total_qty)
+    while remaining > chunk:
+        slices.append(chunk)
+        remaining -= chunk
+    if remaining > 0:
+        slices.append(remaining)
+    return slices
+
 
 def _supports_fresh_kw() -> bool:
     """``broker_credentials.get_dhan_credentials`` only accepts ``fresh=`` in\n    newer revisions; this lets the broker work with both signatures."""
@@ -243,72 +294,149 @@ class DhanBroker(BaseBroker):
                     request.trading_symbol,
                 )
 
-        resp = self._client.place_order(
-            security_id=security_id,
-            exchange_segment=exchange_segment,
-            transaction_type=request.side.value,
-            quantity=int(request.quantity),
-            order_type=order_type_str,
-            product_type=self._map_product(ProductType.CARRYFORWARD),
-            price=float(limit_price),
-            trigger_price=0.0,
-        )
-
-        if not isinstance(resp, dict) or resp.get("status") != "success":
-            err = ""
-            if isinstance(resp, dict):
-                err = (
-                    (resp.get("remarks") or {}).get("error_message")
-                    if isinstance(resp.get("remarks"), dict)
-                    else resp.get("remarks") or resp.get("message") or ""
-                )
-            logger.error(
-                "DHAN ORDER REJECTED: %s | %s | %s",
-                request.trading_symbol, security_id, err,
-            )
-            return OrderResponse(
-                status=OrderStatus.REJECTED, message=str(err) or "Dhan rejected order"
+        # ── Freeze-qty slicing ───────────────────────────────────────
+        # Exchanges cap units per single order (NIFTY 1800, BANKNIFTY 900,
+        # SENSEX 1000, etc.). Above that, Dhan tags the order "iceberg"
+        # but only the first slice executes and the rest is dropped. To
+        # avoid silent under-fills, pre-slice into chunks ≤ freeze qty
+        # and place each as an independent MARKET/LIMIT.
+        freeze_qty = _resolve_freeze_qty(request)
+        lot_size = int(getattr(request.instrument, "lot_size", 0) or 0)
+        slice_qtys = _split_quantity(int(request.quantity), freeze_qty, lot_size)
+        if len(slice_qtys) > 1:
+            logger.info(
+                "DHAN SLICING: %s %s total_qty=%d freeze=%d → %d slices %s",
+                request.side.value, request.trading_symbol,
+                int(request.quantity), freeze_qty, len(slice_qtys), slice_qtys,
             )
 
-        data = resp.get("data") or {}
-        order_id = str(data.get("orderId") or data.get("order_id") or "")
-        if not order_id:
-            return OrderResponse(
-                status=OrderStatus.REJECTED, message="No orderId returned"
-            )
-
-        logger.info(
-            "DHAN ORDER PLACED: %s %s qty=%s id=%s",
-            request.side.value, request.trading_symbol, request.quantity, order_id,
-        )
         wait_terminal = bool(settings.wait_for_terminal_order_status) or bool(getattr(request, "wait_for_terminal", False))
-        if not wait_terminal:
+        primary_id: str = ""
+        all_ids: list[str] = []
+        total_filled: int = 0
+        weighted_price_sum: float = 0.0
+        last_status: OrderStatus = OrderStatus.OPEN
+        last_message: str = ""
+
+        for idx, slice_qty in enumerate(slice_qtys):
+            resp = self._client.place_order(
+                security_id=security_id,
+                exchange_segment=exchange_segment,
+                transaction_type=request.side.value,
+                quantity=int(slice_qty),
+                order_type=order_type_str,
+                product_type=self._map_product(ProductType.CARRYFORWARD),
+                price=float(limit_price),
+                trigger_price=0.0,
+            )
+
+            if not isinstance(resp, dict) or resp.get("status") != "success":
+                err = ""
+                if isinstance(resp, dict):
+                    err = (
+                        (resp.get("remarks") or {}).get("error_message")
+                        if isinstance(resp.get("remarks"), dict)
+                        else resp.get("remarks") or resp.get("message") or ""
+                    )
+                logger.error(
+                    "DHAN ORDER REJECTED (slice %d/%d qty=%d): %s | %s | %s",
+                    idx + 1, len(slice_qtys), slice_qty,
+                    request.trading_symbol, security_id, err,
+                )
+                # If first slice fails, return rejection immediately —
+                # nothing was placed, so nothing to clean up.
+                if idx == 0:
+                    return OrderResponse(
+                        status=OrderStatus.REJECTED,
+                        message=str(err) or "Dhan rejected order",
+                    )
+                # Later slice failed AFTER earlier slices already filled.
+                # Per operator policy: DO NOT auto-rollback (no flatten
+                # SELL). Keep the partial position, log loudly so it can
+                # be reviewed, and report partial success up the stack.
+                placed_qty = sum(slice_qtys[:idx])
+                missing_qty = sum(slice_qtys[idx:])
+                logger.error(
+                    "DHAN PARTIAL FILL — KEEPING POSITION (no rollback): "
+                    "%s %s placed=%d/%d missing=%d child_ids=%s reason=%s",
+                    request.side.value, request.trading_symbol,
+                    placed_qty, int(request.quantity), missing_qty,
+                    ",".join(all_ids), err,
+                )
+                last_status = OrderStatus.OPEN  # Earlier slices ARE live
+                last_message = (
+                    f"PARTIAL FILL: placed {placed_qty}/{int(request.quantity)} "
+                    f"qty in {idx} slice(s) [{','.join(all_ids)}]. "
+                    f"Slice {idx + 1} ({slice_qty} qty) rejected: {err}. "
+                    f"Position kept as-is (no auto-rollback)."
+                )
+                break
+
+            data = resp.get("data") or {}
+            order_id = str(data.get("orderId") or data.get("order_id") or "")
+            if not order_id:
+                if idx == 0:
+                    return OrderResponse(
+                        status=OrderStatus.REJECTED, message="No orderId returned"
+                    )
+                last_status = OrderStatus.REJECTED
+                last_message = f"Slice {idx + 1} returned no orderId"
+                break
+
+            all_ids.append(order_id)
+            if not primary_id:
+                primary_id = order_id
+
+            logger.info(
+                "DHAN ORDER PLACED: %s %s qty=%s id=%s (slice %d/%d)",
+                request.side.value, request.trading_symbol, slice_qty,
+                order_id, idx + 1, len(slice_qtys),
+            )
+
+            if wait_terminal:
+                info = self._wait_terminal_status(order_id, expected_qty=int(slice_qty))
+                status_raw = (info.get("orderStatus") or info.get("status") or "").upper()
+                last_status = self._map_status(status_raw)
+                last_message = info.get("omsErrorDescription", "") or ""
+                avg_price = float(
+                    info.get("averageTradedPrice", 0)
+                    or info.get("avg_traded_price", 0)
+                    or 0
+                )
+                slice_filled = int(
+                    info.get("filledQty", 0) or info.get("filled_qty", 0) or 0
+                )
+                total_filled += slice_filled
+                weighted_price_sum += avg_price * slice_filled
+
+        # Build aggregated response
+        if wait_terminal:
+            avg_price_combined = (
+                weighted_price_sum / total_filled if total_filled > 0 else 0.0
+            )
             return OrderResponse(
-                order_id=order_id,
-                status=OrderStatus.OPEN,
-                message="Order accepted by broker",
-                filled_price=0.0,
-                filled_quantity=0,
+                order_id=primary_id,
+                status=last_status,
+                message=(
+                    last_message
+                    if len(slice_qtys) == 1
+                    else f"{last_message} | child_ids={','.join(all_ids)}"
+                ).strip(" |"),
+                filled_price=avg_price_combined,
+                filled_quantity=total_filled,
                 timestamp=datetime.now(_IST),
             )
-        info = self._wait_terminal_status(
-            order_id, expected_qty=int(request.quantity)
-        )
-        status_raw = (info.get("orderStatus") or info.get("status") or "").upper()
-        avg_price = float(
-            info.get("averageTradedPrice", 0)
-            or info.get("avg_traded_price", 0)
-            or 0
-        )
-        filled_qty = int(
-            info.get("filledQty", 0) or info.get("filled_qty", 0) or 0
-        )
+        # Fire-and-forget path
         return OrderResponse(
-            order_id=order_id,
-            status=self._map_status(status_raw),
-            message=info.get("omsErrorDescription", "") or "",
-            filled_price=avg_price,
-            filled_quantity=filled_qty,
+            order_id=primary_id,
+            status=OrderStatus.OPEN,
+            message=(
+                "Order accepted by broker"
+                if len(slice_qtys) == 1
+                else f"Sliced into {len(slice_qtys)} child orders: {','.join(all_ids)}"
+            ),
+            filled_price=0.0,
+            filled_quantity=0,
             timestamp=datetime.now(_IST),
         )
 

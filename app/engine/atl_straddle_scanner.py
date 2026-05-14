@@ -550,6 +550,58 @@ class ATLStraddleScanner:
             self._record_diag("done_for_day", "Strategy already completed for the day")
             return
 
+        # ── Detect manual exit at the broker ────────────────────────────
+        # If the engine thinks it's in a straddle but the broker shows
+        # both SELL legs are gone (qty=0), the user must have closed the
+        # position manually (broker terminal, mobile app, or our own
+        # positions page that bypasses the scanner). Stop the scanner for
+        # the rest of the day so it doesn't auto-place a new straddle on
+        # the next tick. The user can move `entry_time` to a future moment
+        # (the existing future_rearm path) to schedule a fresh entry.
+        if self._state.entered and self._state.phase == "STRADDLE" and self._state.ce and self._state.pe:
+            try:
+                broker_symbols = await self._broker_open_symbols()
+            except Exception:
+                broker_symbols = None
+            if broker_symbols is not None:
+                ce_open = self._state.ce.symbol in broker_symbols if self._state.ce.symbol else True
+                pe_open = self._state.pe.symbol in broker_symbols if self._state.pe.symbol else True
+                if not ce_open and not pe_open:
+                    logger.warning(
+                        "[ATL] Manual exit detected: broker shows no open SELL legs "
+                        "(CE=%s PE=%s). Stopping scanner for today.",
+                        self._state.ce.symbol, self._state.pe.symbol,
+                    )
+                    self._record_event(
+                        "manual_exit_detected",
+                        f"Broker shows no open SELL legs for {int(self._state.straddle_strike)} "
+                        f"straddle. Scanner stopped — change entry_time to a future moment "
+                        f"to schedule a fresh entry.",
+                    )
+                    try:
+                        await self.alert_manager.telegram.send(
+                            f"🛑 ATL MANUAL EXIT DETECTED ({self._mode_label()})\n"
+                            f"Strike: {int(self._state.straddle_strike)}\n"
+                            f"Both SELL legs were closed externally.\n"
+                            f"Scanner is now stopped for today.\n"
+                            f"To re-enter: set a new entry_time in Settings."
+                        )
+                    except Exception:
+                        logger.exception("[ATL] Failed to send manual-exit Telegram alert")
+                    # Wipe leg state so re-arm with a future entry_time works
+                    # cleanly via the existing future_rearm flow.
+                    self._state.phase = "IDLE"
+                    self._state.entered = False
+                    self._state.ce = None
+                    self._state.pe = None
+                    self._state.straddle_strike = 0.0
+                    self._state.ref_spot = 0.0
+                    # NOTE: hedges are intentionally left in state — user
+                    # may have closed only the SELL legs and kept hedges.
+                    # If they want everything flat, they can use Force Close.
+                    self._complete_for_day("manual_exit_at_broker")
+                    return
+
         if peer_in_trade and not self.is_in_trade():
             self._record_diag(
                 "peer_in_trade",
@@ -561,25 +613,18 @@ class ATLStraddleScanner:
         interval = max(1, int(self._settings.get("strike_interval", 50)))
         offset = max(0, int(self._settings.get("offset_points", 500)))
         rolling = max(1, int(self._settings.get("rolling_points", 300)))
-        sl_type = str(self._settings.get("sl_type", "premium_pct")).lower()
-        sl_lower = float(self._settings.get("sl_lower", 0) or 0)
-        sl_upper = float(self._settings.get("sl_upper", 0) or 0)
-
-        if sl_type == "spot" and self._state.entered:
-            lower_hit = sl_lower > 0 and spot <= sl_lower
-            upper_hit = sl_upper > 0 and spot >= sl_upper
-            if lower_hit or upper_hit:
-                self._record_event(
-                    "stoploss",
-                    f"SPOT SL breach spot={spot:.2f} lower={sl_lower:.2f} upper={sl_upper:.2f}",
-                )
-                await self.alert_manager.telegram.send(
-                    f"🛑 ATL SPOT SL HIT\n"
-                    f"Spot: {spot:.2f}\n"
-                    f"SL Range: {sl_lower:.2f} - {sl_upper:.2f}"
-                )
-                await self.force_close(df_today, instrument, reason="spot_sl_breach")
-                return
+        # ATM-straddle adjustment trigger: when |spot - entry_spot| >= this,
+        # close existing SELL legs and re-short at the new ATM strike. Hedges
+        # are intentionally left intact across reforms. Falls back to the
+        # legacy `rolling_points` key so existing settings keep working.
+        adjustment_points = max(
+            1,
+            int(self._settings.get("adjustment_points", self._settings.get("rolling_points", 100))),
+        )
+        # SL logic removed per ATM-straddle spec — strategy exits only at
+        # exit_time or via emergency force_close. sl_type kept for API
+        # back-compat but no longer evaluated.
+        sl_type = "none"
 
         # Initial entry
         if not self._state.entered:
@@ -689,12 +734,8 @@ class ATLStraddleScanner:
                 # close/reopen of identical strikes on the next touch check.
                 self._state.phase = "STRADDLE"
                 self._state.straddle_strike = ce_strike
-                prem_sum = self._state.ce.premium + self._state.pe.premium
-                self._state.straddle_sl_points = (
-                    prem_sum * (int(self._settings.get("first_straddle_sl_pct", 100)) / 100.0)
-                    if sl_type == "premium_pct"
-                    else 0.0
-                )
+                # SL logic removed per ATM-straddle spec.
+                self._state.straddle_sl_points = 0.0
             else:
                 self._state.phase = "STRANGLE"
             self._state.ref_spot = spot
@@ -778,24 +819,40 @@ class ATLStraddleScanner:
                     await self._convert_to_straddle(instrument, self._state.pe.strike, spot)
                 return
 
-        # STRADDLE phase logic
-        if sl_type == "premium_pct" and self._state.phase == "STRADDLE" and self._state.straddle_sl_points > 0:
-            upper = self._state.straddle_strike + self._state.straddle_sl_points
-            lower = self._state.straddle_strike - self._state.straddle_sl_points
-            if spot >= upper or spot <= lower:
+        # STRADDLE phase logic — pure spot-distance adjustment.
+        # When the live spot has moved >= adjustment_points away from the
+        # spot at which the current straddle was opened (NOT the rounded
+        # strike), close only the SELL legs and re-short at the new ATM.
+        # Hedges are left in place untouched. There is no premium-based
+        # SL — the strategy holds till exit_time unless force-closed.
+        if (
+            self._state.phase == "STRADDLE"
+            and self._state.entered
+            and self._state.ref_spot > 0
+        ):
+            drift = abs(spot - self._state.ref_spot)
+            if drift >= adjustment_points:
                 new_strike = round(spot / interval) * interval
+                if new_strike == self._state.straddle_strike:
+                    # Spot drifted enough but rounds back to the same
+                    # strike (e.g. interval=100, drift=110, strike doesn't
+                    # change). Just refresh the reference so we don't keep
+                    # re-checking; no order churn needed.
+                    self._state.ref_spot = spot
+                    self._save_state_to_disk()
+                    return
                 self._state.reform_count += 1
                 self._state.is_first_straddle = False
                 logger.info(
-                    "[ATL] Reform triggered: spot=%.2f outside [%.2f, %.2f] "
-                    "(strike=%.2f sl_points=%.2f) -> new_strike=%.2f",
-                    spot, lower, upper, self._state.straddle_strike,
-                    self._state.straddle_sl_points, new_strike,
+                    "[ATL] Reform triggered: spot=%.2f drift=%.2f >= adj=%d "
+                    "old_strike=%.0f -> new_strike=%.0f (hedges kept)",
+                    spot, drift, adjustment_points,
+                    self._state.straddle_strike, new_strike,
                 )
                 self._record_event(
                     "reform_trigger",
-                    f"spot={spot:.2f} outside [{lower:.2f}, {upper:.2f}] "
-                    f"-> new strike {int(new_strike)}",
+                    f"spot={spot:.2f} drift={drift:.2f} >= adj={adjustment_points} "
+                    f"-> {int(self._state.straddle_strike)} → {int(new_strike)} (hedges kept)",
                 )
                 await self._convert_to_straddle(instrument, new_strike, spot, reform=True)
 
@@ -809,12 +866,11 @@ class ATLStraddleScanner:
             # Already on the requested straddle strike — do not churn orders.
             self._state.phase = "STRADDLE"
             self._state.straddle_strike = strike
-            if str(self._settings.get("sl_type", "premium_pct")).lower() == "premium_pct":
-                pct = int(self._settings.get("first_straddle_sl_pct", 100)) if self._state.is_first_straddle else int(self._settings.get("reform_straddle_sl_pct", 60))
-                self._state.straddle_sl_points = (self._state.ce.premium + self._state.pe.premium) * (pct / 100.0)
-            else:
-                self._state.straddle_sl_points = 0.0
-            self._record_event("straddle", f"AT-STRIKE strike {int(strike)} spot {spot:.2f} sl {self._state.straddle_sl_points:.2f} (no switch)")
+            self._state.straddle_sl_points = 0.0  # SL logic removed
+            # Refresh the reference spot so the next adjustment trigger is
+            # measured from the current spot, not the original entry.
+            self._state.ref_spot = spot
+            self._record_event("straddle", f"AT-STRIKE strike {int(strike)} spot {spot:.2f} (no switch)")
             return
 
         ce_q = await self._fetch_option_quote(instrument, strike, "CE")
@@ -834,22 +890,30 @@ class ATLStraddleScanner:
         self._state.straddle_strike = strike
         self._state.ce = ce_leg
         self._state.pe = pe_leg
+        # Reset reference spot so next adjustment trigger is measured from
+        # the spot at which this (re)formation happened.
+        self._state.ref_spot = spot
+        self._state.straddle_sl_points = 0.0  # SL logic removed
+        # Hedges: only place if missing. On reform, existing hedges are
+        # intentionally KEPT in place (per ATM-straddle spec) — we do not
+        # roll/close them when the SELL legs move strikes.
         if self._settings.get("hedge_enabled", False) and (not self._state.hedge_ce or not self._state.hedge_pe):
             await self._ensure_hedges(instrument, strike)
 
-        sl_type = str(self._settings.get("sl_type", "premium_pct")).lower()
-        pct = int(self._settings.get("first_straddle_sl_pct", 100)) if self._state.is_first_straddle else int(self._settings.get("reform_straddle_sl_pct", 60))
-        prem_sum = self._state.ce.premium + self._state.pe.premium
-        self._state.straddle_sl_points = prem_sum * (pct / 100.0) if sl_type == "premium_pct" else 0.0
-
         tag = "REFORM" if reform else "AT-STRIKE"
-        self._record_event("straddle", f"{tag} strike {int(strike)} spot {spot:.2f} sl {self._state.straddle_sl_points:.2f}")
+        hedge_note = ""
+        if reform and self._state.hedge_ce and self._state.hedge_pe:
+            hedge_note = (
+                f"\nHedges held: CE {int(self._state.hedge_ce.strike)} / "
+                f"PE {int(self._state.hedge_pe.strike)}"
+            )
+        self._record_event("straddle", f"{tag} strike {int(strike)} spot {spot:.2f}")
         await self.alert_manager.telegram.send(
             f"⚡ ATL {tag} STRADDLE ({self._mode_label()})\n"
             f"Spot: {spot:.2f}\n"
             f"Strike: {int(strike)}\n"
-            f"CE ₹{self._state.ce.premium:.2f} + PE ₹{self._state.pe.premium:.2f}\n"
-            f"SL points: {self._state.straddle_sl_points:.2f}"
+            f"CE ₹{self._state.ce.premium:.2f} + PE ₹{self._state.pe.premium:.2f}"
+            f"{hedge_note}"
         )
 
     async def force_close(

@@ -39,6 +39,18 @@ class Settings(BaseSettings):
     # over 131 days. Stop=15 pts, Target=60 pts (R:R 1:4). Mutex w/ peers.
     pdh_pdl_scanner_enabled: bool = Field(default=True, alias="PDH_PDL_SCANNER_ENABLED")
 
+    # MoveDet scanner — env-level fallbacks. The per-strategy JSON
+    # (data/move_det_exec_settings.json) takes precedence at runtime;
+    # these defaults are read only when the JSON is missing a field, and
+    # `move_det_live_execution` acts as a kill-switch (set to False to
+    # disable live execution globally regardless of the per-strategy
+    # toggle). Default True so the JSON's `live_execution` flag controls
+    # behaviour.
+    move_det_live_execution: bool = Field(default=True, alias="MOVE_DET_LIVE_EXECUTION")
+    move_det_max_funds: float = Field(default=0.0, alias="MOVE_DET_MAX_FUNDS")
+    move_det_funds_buffer_pct: float = Field(default=0.0, alias="MOVE_DET_FUNDS_BUFFER_PCT")
+    move_det_max_lots: int = Field(default=20, alias="MOVE_DET_MAX_LOTS")
+
     # DhanHQ (expired options data only)
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
 
