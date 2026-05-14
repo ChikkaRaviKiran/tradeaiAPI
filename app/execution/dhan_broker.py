@@ -42,6 +42,16 @@ ORDER_POLL_RETRIES = 8
 ORDER_POLL_DELAY_SECONDS = 1.0
 
 
+def _supports_fresh_kw() -> bool:
+    """``broker_credentials.get_dhan_credentials`` only accepts ``fresh=`` in\n    newer revisions; this lets the broker work with both signatures."""
+    try:
+        import inspect
+        from app.db.broker_credentials import get_dhan_credentials
+        return "fresh" in inspect.signature(get_dhan_credentials).parameters
+    except Exception:
+        return False
+
+
 class DhanBroker(BaseBroker):
     """DhanHQ broker implementation."""
 
@@ -49,6 +59,10 @@ class DhanBroker(BaseBroker):
         self._client: Optional[DhanClient] = None
         self._authenticated = False
         self._client_id: str = ""
+        # Track the access_token that built the current `_client` so we can
+        # detect token rotations (UI save / .env edit) and rebuild lazily
+        # instead of relying on every caller to invoke reload_credentials().
+        self._client_token: str = ""
         self._init_client()
 
     @property
@@ -59,10 +73,10 @@ class DhanBroker(BaseBroker):
     def client(self) -> Optional[DhanClient]:
         return self._client
 
-    def _init_client(self) -> None:
+    def _init_client(self, *, fresh: bool = False) -> None:
         from app.db.broker_credentials import get_dhan_credentials
 
-        creds = get_dhan_credentials()
+        creds = get_dhan_credentials(fresh=fresh) if _supports_fresh_kw() else get_dhan_credentials()
         client_id = creds.get("client_id") or ""
         access_token = creds.get("access_token") or ""
         if not client_id or not access_token:
@@ -72,6 +86,7 @@ class DhanBroker(BaseBroker):
             )
             self._client = None
             self._client_id = ""
+            self._client_token = ""
             return
         try:
             self._client = DhanClient(
@@ -79,18 +94,63 @@ class DhanBroker(BaseBroker):
                 access_token=access_token,
             )
             self._client_id = client_id
+            self._client_token = access_token
+            logger.info(
+                "DhanBroker: client (re)built for client_id=%s token_tail=...%s",
+                (client_id[:4] + "***") if client_id else "***",
+                access_token[-8:] if access_token else "",
+            )
         except Exception:
             logger.exception("DhanBroker: failed to initialise DhanClient")
             self._client = None
             self._client_id = ""
+            self._client_token = ""
+
+    def _ensure_fresh_client(self) -> None:
+        """Self-heal: if the access_token in the DB differs from the one the
+        current ``_client`` was built with, transparently rebuild it.
+
+        This is what makes "Save credentials in the UI" actually take effect
+        for the very next order, without requiring every caller (scanners,
+        exit engine, …) to know about ``reload_credentials()``. The DB read
+        is served from a 30s in-process cache, and the UI save invalidates
+        that cache, so the rotated token is picked up on the next call and
+        is then sticky for the rest of the cache window.
+        """
+        try:
+            from app.db.broker_credentials import get_dhan_credentials
+
+            creds = get_dhan_credentials()
+            db_client_id = creds.get("client_id") or ""
+            db_token = creds.get("access_token") or ""
+        except Exception:
+            logger.debug("DhanBroker: credential refresh check failed", exc_info=True)
+            return
+
+        if not db_client_id or not db_token:
+            return
+        if db_token == self._client_token and db_client_id == self._client_id and self._client is not None:
+            return
+
+        logger.info(
+            "DhanBroker: detected credential change "
+            "(client_id %s→%s, token tail ...%s→...%s) — rebuilding client",
+            self._client_id or "-", db_client_id,
+            (self._client_token or "")[-8:] or "-",
+            db_token[-8:],
+        )
+        self._authenticated = False
+        self._init_client()
 
     def reload_credentials(self) -> None:
-        """Re-create the Dhan client after credentials change at runtime."""
+        """Force-refresh the Dhan client. Kept for explicit callers (env
+        rotation, /update-credentials endpoint). Day-to-day rotation is
+        handled transparently by ``_ensure_fresh_client``."""
         from app.db.broker_credentials import invalidate
 
         invalidate("dhan")
         self._authenticated = False
-        self._init_client()
+        self._init_client(fresh=True)
 
     def authenticate(self) -> bool:
         """Validate the configured access token by hitting fund limits."""
@@ -120,6 +180,9 @@ class DhanBroker(BaseBroker):
     def place_order(self, request: OrderRequest) -> OrderResponse:
         if settings.paper_trading and not getattr(request, "force_live", False):
             return self._simulate_order(request)
+        # Self-heal: pick up any token rotation done via the UI / env reload
+        # before we burn the order on an expired token.
+        self._ensure_fresh_client()
         if not self._client:
             return OrderResponse(
                 status=OrderStatus.REJECTED, message="Dhan client not initialised"
@@ -261,6 +324,7 @@ class DhanBroker(BaseBroker):
                 order_id=order_id, status=OrderStatus.COMPLETE,
                 message="Simulated modify",
             )
+        self._ensure_fresh_client()
         ok = self._client.modify_order(
             order_id=order_id,
             quantity=new_quantity,
@@ -276,11 +340,13 @@ class DhanBroker(BaseBroker):
     def cancel_order(self, order_id: str) -> bool:
         if settings.paper_trading or not self._client:
             return True
+        self._ensure_fresh_client()
         return self._client.cancel_order(order_id)
 
     def get_order_status(self, order_id: str) -> OrderResponse:
         if settings.paper_trading or not self._client:
             return OrderResponse(order_id=order_id, status=OrderStatus.COMPLETE)
+        self._ensure_fresh_client()
         info = self._client.get_order_by_id(order_id)
         if not info:
             return OrderResponse(order_id=order_id, status=OrderStatus.PENDING)
@@ -295,6 +361,7 @@ class DhanBroker(BaseBroker):
     def get_positions(self) -> list[Position]:
         if settings.paper_trading or not self._client:
             return []
+        self._ensure_fresh_client()
         out: list[Position] = []
         for p in self._client.get_positions():
             qty = int(p.get("netQty", 0) or 0)
@@ -330,6 +397,7 @@ class DhanBroker(BaseBroker):
             return {"available": settings.initial_capital}
         if not self._client:
             return {}
+        self._ensure_fresh_client()
         data = self._client.get_fund_limits() or {}
         cash = float(
             data.get("availabelBalance")  # Dhan API field is misspelt

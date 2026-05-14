@@ -32,7 +32,9 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_CACHE_TTL_SECONDS = 30.0
+# Short TTL so a UI credential save propagates to live brokers within a
+# few seconds even if the broker forgets to invalidate explicitly.
+_CACHE_TTL_SECONDS = 5.0
 _cache: Dict[str, Dict[str, str]] = {}
 _cache_ts: Dict[str, float] = {}
 _cache_lock = threading.Lock()
@@ -142,9 +144,14 @@ def invalidate(broker: Optional[str] = None) -> None:
 
 # ── Convenience wrappers ─────────────────────────────────────────────────
 
-def get_dhan_credentials() -> Dict[str, str]:
-    """Return ``{"client_id": ..., "access_token": ...}`` falling back to env."""
-    creds = get_credentials("dhan")
+def get_dhan_credentials(*, fresh: bool = False) -> Dict[str, str]:
+    """Return ``{"client_id": ..., "access_token": ...}`` falling back to env.
+
+    Pass ``fresh=True`` to bypass the in-process cache (used after a token
+    rotation when the broker wants to be 100% certain it has the latest
+    value, even within the cache window).
+    """
+    creds = get_credentials("dhan", fresh=fresh)
     client_id = creds.get("client_id") or settings.dhan_client_id or ""
     access_token = creds.get("access_token") or settings.dhan_access_token or ""
     return {"client_id": client_id, "access_token": access_token}
