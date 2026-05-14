@@ -283,6 +283,13 @@ class Orchestrator:
             client=self.client,
             alert_manager=self.alert_manager,
             broker=atl_broker,
+            # Provider lets ATL pull the live expiry for whatever index is
+            # currently configured in the UI, so a NIFTY↔SENSEX switch
+            # intraday immediately uses the right contract.
+            expiry_provider=lambda idx: (
+                self._expiries.get(idx, ""),
+                self._expiry_dates.get(idx),
+            ),
         )
         logger.info(
             "[ATL] Straddle scanner initialised (broker=%s, trading_account=%s)",

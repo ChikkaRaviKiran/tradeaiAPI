@@ -18,7 +18,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pandas as pd
 import pytz
@@ -92,10 +92,16 @@ class ATLStraddleScanner:
         client: AngelOneClient,
         alert_manager: AlertManager,
         broker: Optional[BaseBroker] = None,
+        expiry_provider: Optional["Callable[[str], tuple[str, Optional[date]]]"] = None,
     ):
         self.client = client
         self.alert_manager = alert_manager
         self.broker = broker
+        # Optional callback (index_symbol) -> (expiry_str, expiry_date). When
+        # provided, the scanner consults it every cycle so changing the index
+        # in the UI mid-session immediately picks up the new index's expiry
+        # instead of being stuck with whatever set_expiry() pushed at startup.
+        self._expiry_provider = expiry_provider
         self._settings = load_atl_settings()
         self._today_str = ""
         self._expiry = ""
@@ -352,6 +358,32 @@ class ATLStraddleScanner:
         self._expiry = expiry
         self._expiry_date = expiry_date
 
+    def _refresh_expiry_for_configured_index(self) -> None:
+        """Re-pull expiry from the orchestrator for the currently configured
+        index. Called every cycle so a UI index switch (NIFTY ↔ SENSEX)
+        takes effect immediately instead of being stuck on the index that
+        was configured at process start.
+        """
+        if self._expiry_provider is None:
+            return
+        try:
+            idx = str(self._settings.get("index", "NIFTY")).upper()
+            new_exp, new_exp_date = self._expiry_provider(idx)
+        except Exception:
+            logger.exception("[ATL] expiry_provider call failed")
+            return
+        if new_exp and new_exp != self._expiry:
+            logger.info(
+                "[ATL] Expiry refreshed for %s: %s → %s",
+                idx, self._expiry or "-", new_exp,
+            )
+            self._record_event(
+                "expiry_refresh",
+                f"Expiry updated for {idx}: {self._expiry or '-'} → {new_exp}",
+            )
+            self._expiry = new_exp
+            self._expiry_date = new_exp_date
+
     def is_in_trade(self) -> bool:
         return self._state.phase in {"STRANGLE", "STRADDLE"} and not self._state.done_for_day
 
@@ -370,6 +402,11 @@ class ATLStraddleScanner:
         if cycle % refresh_every == 0:
             prev_signature = self._settings_signature()
             self._settings = load_atl_settings()
+            # Re-pull expiry for the (possibly newly chosen) index. Without
+            # this the scanner would keep using whatever expiry was injected
+            # at startup, so switching NIFTY ↔ SENSEX in the UI silently
+            # breaks option-quote lookups for the new index.
+            self._refresh_expiry_for_configured_index()
             new_signature = self._settings_signature()
             signature_changed = new_signature != prev_signature
             # Determine if newly-configured entry_time is still in the future
