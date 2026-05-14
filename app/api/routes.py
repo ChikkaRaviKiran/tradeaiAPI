@@ -2059,17 +2059,46 @@ async def update_dhan_credentials(body: dict):
 
     updated = [k for k, v in (("client_id", client_id), ("access_token", access_token)) if v]
 
-    # Hot-reload the active broker so the new token is picked up immediately.
+    # Hot-reload all broker adapters so the new token is picked up
+    # immediately. NOTE: orch.broker is always AngelOneBroker. The Dhan
+    # broker instances used for live order routing are held by the scanners
+    # (built by `_build_atl_broker` at orchestrator init), so we must walk
+    # every known holder — otherwise rotating the token here leaves the
+    # scanners using the expired one and orders keep getting rejected with
+    # "Client ID or user generated access token is invalid or expired."
+    reloaded: list[str] = []
     try:
         orch = _state.get("orchestrator")
-        broker = getattr(orch, "broker", None) if orch else None
-        if broker is not None and hasattr(broker, "reload_credentials"):
-            broker.reload_credentials()
+        if orch is not None:
+            seen_brokers: set[int] = set()
+            broker_holders = [
+                orch,
+                getattr(orch, "move_detection_scanner", None),
+                getattr(orch, "pdh_pdl_scanner", None),
+                getattr(orch, "atl_straddle_scanner", None),
+            ]
+            for holder in broker_holders:
+                if holder is None:
+                    continue
+                broker = getattr(holder, "broker", None)
+                if broker is None or id(broker) in seen_brokers:
+                    continue
+                seen_brokers.add(id(broker))
+                if hasattr(broker, "reload_credentials"):
+                    try:
+                        broker.reload_credentials()
+                        reloaded.append(
+                            f"{type(broker).__name__}@{type(holder).__name__}"
+                        )
+                    except Exception:
+                        logger.exception(
+                            "reload_credentials failed on %s", type(broker).__name__,
+                        )
     except Exception:
         logger.exception("Failed to reload broker credentials after Dhan update")
 
-    logger.info("Dhan credentials updated in DB: %s", updated)
-    return {"success": True, "updated_fields": updated}
+    logger.info("Dhan credentials updated in DB: %s (reloaded: %s)", updated, reloaded)
+    return {"success": True, "updated_fields": updated, "reloaded": reloaded}
 
 
 @app.post("/api/broker/dhan/refresh-instruments")
