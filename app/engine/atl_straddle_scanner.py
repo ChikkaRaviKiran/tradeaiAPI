@@ -564,8 +564,10 @@ class ATLStraddleScanner:
             except Exception:
                 broker_symbols = None
             if broker_symbols is not None:
-                ce_open = self._state.ce.symbol in broker_symbols if self._state.ce.symbol else True
-                pe_open = self._state.pe.symbol in broker_symbols if self._state.pe.symbol else True
+                ce_sym = (self._state.ce.symbol or "").upper()
+                pe_sym = (self._state.pe.symbol or "").upper()
+                ce_open = (ce_sym in broker_symbols) if ce_sym else True
+                pe_open = (pe_sym in broker_symbols) if pe_sym else True
                 if not ce_open and not pe_open:
                     logger.warning(
                         "[ATL] Manual exit detected: broker shows no open SELL legs "
@@ -1095,7 +1097,12 @@ class ATLStraddleScanner:
         if last and (now - last).total_seconds() < 60:
             return
         self._diag_last[key] = now
-        self._record_event("skip", message)
+        # NOTE: do NOT push diag/skip events into self._events. They are
+        # not shown in the UI timeline (frontend filters them out), and
+        # at ~2 skips/minute they would fill the 200-entry cap within
+        # ~1.5 hours and evict real lifecycle events (entry, hedge,
+        # complete, manual_exit_detected) — leaving the user with an
+        # apparently-empty timeline. Log only.
         logger.info("ATL[%s] skip: %s", self._settings.get("index", "?"), message)
 
     def _trip_halt(self, reason: str) -> None:
