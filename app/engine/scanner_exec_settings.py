@@ -33,6 +33,7 @@ DEFAULTS: dict[str, Any] = {
 
 _FILES = {
     "move_det": "move_det_exec_settings.json",
+    "move_det_bull": "move_det_bull_exec_settings.json",
     "pdh_pdl": "pdh_pdl_exec_settings.json",
 }
 

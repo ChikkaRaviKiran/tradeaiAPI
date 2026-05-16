@@ -237,6 +237,18 @@ def _mark_scanners_completed_for_today(reason: str = "manual_user_exit") -> None
         except Exception:
             logger.exception("Failed to mark MoveDet complete after manual exit")
 
+    mdb = getattr(orch, "move_detection_scanner_bull", None)
+    if mdb is not None:
+        try:
+            mdb._signal_found_today = True  # noqa: SLF001
+            tr = getattr(mdb, "_active_trade", None)
+            if tr is not None and not getattr(tr, "exited", False):
+                tr.exited = True
+                tr.exit_reason = reason
+                tr.exit_time = now_str
+        except Exception:
+            logger.exception("Failed to mark MoveDetBull complete after manual exit")
+
     pdh = getattr(orch, "pdh_pdl_scanner", None)
     if pdh is not None:
         try:
@@ -274,6 +286,13 @@ def _rearm_scanners_for_today() -> None:
             md._signal_found_today = False  # noqa: SLF001
         except Exception:
             logger.exception("Failed to re-arm MoveDet")
+
+    mdb = getattr(orch, "move_detection_scanner_bull", None)
+    if mdb is not None:
+        try:
+            mdb._signal_found_today = False  # noqa: SLF001
+        except Exception:
+            logger.exception("Failed to re-arm MoveDetBull")
 
     pdh = getattr(orch, "pdh_pdl_scanner", None)
     if pdh is not None:
@@ -588,6 +607,7 @@ async def get_system_status():
     scanner_info = {}
     if orch:
         move_det = getattr(orch, "move_detection_scanner", None)
+        move_det_bull = getattr(orch, "move_detection_scanner_bull", None)
         pdh_pdl = getattr(orch, "pdh_pdl_scanner", None)
         atm = getattr(orch, "atl_straddle_scanner", None)
         if move_det:
@@ -598,6 +618,15 @@ async def get_system_status():
                 "signal_found": move_det._signal_found_today,
                 "in_trade": md_trade is not None and not md_trade.exited if md_trade else False,
                 "last_trade_week": move_det._last_trade_week,
+            }
+        if move_det_bull:
+            mdb_trade = move_det_bull._active_trade
+            scanner_info["move_det_bull"] = {
+                "active": True,
+                "day_tradeable": move_det_bull._day_tradeable,
+                "signal_found": move_det_bull._signal_found_today,
+                "in_trade": mdb_trade is not None and not mdb_trade.exited if mdb_trade else False,
+                "last_trade_week": move_det_bull._last_trade_week,
             }
         if pdh_pdl:
             p_trade = pdh_pdl._active_trade
@@ -1712,6 +1741,7 @@ def _persist_env_vars(updates: dict[str, str]) -> None:
             broker_holders = [
                 orch,
                 getattr(orch, "move_detection_scanner", None),
+                getattr(orch, "move_detection_scanner_bull", None),
                 getattr(orch, "pdh_pdl_scanner", None),
                 getattr(orch, "atl_straddle_scanner", None),
             ]
@@ -2074,6 +2104,7 @@ async def update_dhan_credentials(body: dict):
             broker_holders = [
                 orch,
                 getattr(orch, "move_detection_scanner", None),
+                getattr(orch, "move_detection_scanner_bull", None),
                 getattr(orch, "pdh_pdl_scanner", None),
                 getattr(orch, "atl_straddle_scanner", None),
             ]
@@ -2171,6 +2202,16 @@ async def get_move_det_settings():
 @app.put("/api/strategy-settings/move-det")
 async def update_move_det_settings(body: dict):
     return _scanner_exec_put("move_det", body)
+
+
+@app.get("/api/strategy-settings/move-det-bull")
+async def get_move_det_bull_settings():
+    return _scanner_exec_get("move_det_bull")
+
+
+@app.put("/api/strategy-settings/move-det-bull")
+async def update_move_det_bull_settings(body: dict):
+    return _scanner_exec_put("move_det_bull", body)
 
 
 @app.get("/api/strategy-settings/pdh-pdl")

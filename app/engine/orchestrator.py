@@ -71,6 +71,7 @@ from app.ai.pre_market_analyst import PreMarketAnalyst
 from app.ai.insight_manager import InsightManager
 from app.engine.ai_decision import set_ai_insight_manager
 from app.engine.move_detection_scanner import MoveDetectionScanner
+from app.engine.move_detection_scanner_bullish import MoveDetectionScannerBullish
 from app.engine.pdh_pdl_scanner import PDHPDLBreakoutScanner
 from app.engine.atl_straddle_scanner import ATLStraddleScanner
 from app.engine.day_classifier import DayClassifier
@@ -263,6 +264,19 @@ class Orchestrator:
             pre_entry_hook=self._pre_signal_handoff,
         )
 
+        # ── Move Detection Scanner BULLISH (CONSERVATIVE tier) ──
+        # Mirror of MoveDetectionScanner but for bullish (CE) signals,
+        # with the locked CONSERVATIVE post-filter (no pullback, neither
+        # EMA nor VWAP aligned, expansion<2.0). Backtest: 72.7% win rate,
+        # max DD only −6 pts over 144 trading days.
+        self.move_detection_scanner_bull = MoveDetectionScannerBullish(
+            client=self.client,
+            feature_engine=self.feature_engine,
+            alert_manager=self.alert_manager,
+            broker=self._build_atl_broker(),
+            pre_entry_hook=self._pre_signal_handoff,
+        )
+
         # ── PDH/PDL Breakout Scanner (prev-day H/L breakout) ──
         self.pdh_pdl_scanner = PDHPDLBreakoutScanner(
             client=self.client,
@@ -281,6 +295,7 @@ class Orchestrator:
         # discovering it from the first failed signal.
         for tag, scanner in (
             ("MoveDet", self.move_detection_scanner),
+            ("MoveDetBull", self.move_detection_scanner_bull),
             ("PDH/PDL", self.pdh_pdl_scanner),
         ):
             broker = getattr(scanner, "broker", None)
@@ -526,6 +541,7 @@ class Orchestrator:
         self.strategies = []
         # Reset Move Detection scanner daily state
         self.move_detection_scanner.reset_daily()
+        self.move_detection_scanner_bull.reset_daily()
         # Reset PDH/PDL scanner daily state
         self.pdh_pdl_scanner.reset_daily()
         self.running = False
@@ -605,6 +621,7 @@ class Orchestrator:
 
         # Reset scanner daily state (ensures _today_str is correct after weekends/holidays)
         self.move_detection_scanner.reset_daily()
+        self.move_detection_scanner_bull.reset_daily()
         self.pdh_pdl_scanner.reset_daily()
 
         self.running = True
@@ -673,8 +690,9 @@ class Orchestrator:
             nifty_expiry_date = self._expiry_dates.get("NIFTY")
             if nifty_expiry:
                 self.move_detection_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
+                self.move_detection_scanner_bull.set_expiry(nifty_expiry, nifty_expiry_date)
                 self.pdh_pdl_scanner.set_expiry(nifty_expiry, nifty_expiry_date)
-                logger.info("[MoveDet+PDHPDL] Expiry set: %s", nifty_expiry)
+                logger.info("[MoveDet+MoveDetBull+PDHPDL] Expiry set: %s", nifty_expiry)
 
             # Pass the ATL-configured index's expiry to the ATL scanner.
             # Strategy may be set to NIFTY or SENSEX in the UI; honour that.
@@ -948,7 +966,42 @@ class Orchestrator:
         instrument: InstrumentConfig,
         df_today: pd.DataFrame,
     ) -> bool:
-        """Ensure ATM is flattened before MoveDet/PDH-PDL entries."""
+        """Flatten lower-priority scanners before a new entry.
+
+        Always closes ATL (ATM Straddle) before any MoveDet/PDH-PDL entry.
+        For `source == "move_det_bull"` (CONSERVATIVE bullish scanner —
+        marked as the highest-priority signal per user requirement) we
+        additionally force-close the bearish MoveDet trade and the
+        PDH/PDL trade if either is live, so the bullish entry truly
+        replaces every other open position.
+        """
+        nifty_inst = instrument
+        nifty_df = df_today
+        for inst in self._active_instruments:
+            if inst.symbol == "NIFTY":
+                nifty_inst = inst
+                nifty_df = self._df_today_cache.get("NIFTY") or df_today
+                break
+
+        # ── Priority override: MoveDetBull flattens MoveDet + PDH/PDL ──
+        if source == "move_det_bull":
+            md = getattr(self, "move_detection_scanner", None)
+            if md is not None and md.is_in_trade():
+                try:
+                    await md.force_close(nifty_df, nifty_inst, reason="priority_handoff_move_det_bull")
+                    logger.info("Priority handoff: force-closed MoveDet before MoveDetBull entry")
+                except Exception:
+                    logger.exception("Priority handoff: failed to force-close MoveDet")
+                    return False
+            pdh = getattr(self, "pdh_pdl_scanner", None)
+            if pdh is not None and pdh.is_in_trade():
+                try:
+                    await pdh.force_close(nifty_df, nifty_inst, reason="priority_handoff_move_det_bull")
+                    logger.info("Priority handoff: force-closed PDH/PDL before MoveDetBull entry")
+                except Exception:
+                    logger.exception("Priority handoff: failed to force-close PDH/PDL")
+                    return False
+
         atl = self.atl_straddle_scanner
         if not atl or not atl.is_in_trade():
             return True
@@ -1520,26 +1573,31 @@ class Orchestrator:
                 except Exception:
                     logger.exception("10AM strategy re-selection failed")
 
-            # ── SIGNAL SCANNERS (Move Detection + PDH/PDL) ────
-            # Mutex: only one of the two can hold a live trade at a time.
+            # ── SIGNAL SCANNERS (Move Detection + Bullish + PDH/PDL) ────
+            # Mutex: only one of the scanners can hold a live trade at a time.
             if symbol == "NIFTY":
                 md_in_trade = self.move_detection_scanner.is_in_trade()
+                mdb_in_trade = self.move_detection_scanner_bull.is_in_trade()
                 pdh_in_trade = self.pdh_pdl_scanner.is_in_trade()
                 await self.move_detection_scanner.run_cycle(
                     df_today, instrument, cycle,
-                    peer_in_trade=pdh_in_trade,
+                    peer_in_trade=(mdb_in_trade or pdh_in_trade),
+                )
+                await self.move_detection_scanner_bull.run_cycle(
+                    df_today, instrument, cycle,
+                    peer_in_trade=(md_in_trade or pdh_in_trade),
                 )
                 if settings.pdh_pdl_scanner_enabled:
                     await self.pdh_pdl_scanner.run_cycle(
                         df_today, instrument, cycle,
-                        peer_in_trade=md_in_trade,
+                        peer_in_trade=(md_in_trade or mdb_in_trade),
                     )
             # ATL Straddle scanner runs for whichever index it is configured
             # for (NIFTY or SENSEX) — internal symbol gate skips other instruments.
             try:
                 atl_peer_in_trade = False
                 if symbol == "NIFTY":
-                    atl_peer_in_trade = md_in_trade or pdh_in_trade
+                    atl_peer_in_trade = md_in_trade or mdb_in_trade or pdh_in_trade
                 await self.atl_straddle_scanner.run_cycle(
                     df_today, instrument, cycle,
                     peer_in_trade=atl_peer_in_trade,
@@ -3156,6 +3214,8 @@ class Orchestrator:
         nifty_df = self._df_today_cache.get("NIFTY")
         # Close Move Detection scanner trade
         await self.move_detection_scanner.force_close(nifty_df, _NIFTY_INST)
+        # Close Move Detection BULLISH scanner trade
+        await self.move_detection_scanner_bull.force_close(nifty_df, _NIFTY_INST)
         # Close PDH/PDL Breakout scanner trade
         await self.pdh_pdl_scanner.force_close(nifty_df, _NIFTY_INST)
 
