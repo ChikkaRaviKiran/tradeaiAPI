@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable, Optional
@@ -586,9 +587,9 @@ class ATLStraddleScanner:
                 and (now - self._last_legs_changed_at).total_seconds() < grace_seconds
             )
             try:
-                broker_symbols = await self._broker_open_symbols() if not in_grace else None
+                broker_legs = await self._broker_open_strike_legs() if not in_grace else None
             except Exception:
-                broker_symbols = None
+                broker_legs = None
             if in_grace:
                 # Keep the miss counter clean across the grace window so the
                 # first tick after grace expires starts from zero.
@@ -597,11 +598,11 @@ class ATLStraddleScanner:
                     "manual_exit_grace",
                     f"Skipping manual-exit check; within {grace_seconds}s grace after last leg change",
                 )
-            if broker_symbols is not None:
-                ce_sym = (self._state.ce.symbol or "").upper()
-                pe_sym = (self._state.pe.symbol or "").upper()
-                ce_open = (ce_sym in broker_symbols) if ce_sym else True
-                pe_open = (pe_sym in broker_symbols) if pe_sym else True
+            if broker_legs is not None:
+                ce_key = (int(round(self._state.ce.strike)), "CE")
+                pe_key = (int(round(self._state.pe.strike)), "PE")
+                ce_open = ce_key in broker_legs
+                pe_open = pe_key in broker_legs
                 if not ce_open and not pe_open:
                     # Require two consecutive misses before declaring a
                     # manual exit. Dhan's positions API is occasionally
@@ -610,17 +611,20 @@ class ATLStraddleScanner:
                     self._manual_exit_misses += 1
                     if self._manual_exit_misses < 2:
                         logger.info(
-                            "[ATL] Broker shows no open SELL legs (CE=%s PE=%s) — "
-                            "miss %d/2; waiting one more tick before declaring manual exit.",
-                            self._state.ce.symbol, self._state.pe.symbol,
+                            "[ATL] Broker shows no open SELL legs (CE %d / PE %d) — "
+                            "miss %d/2; waiting one more tick. Broker legs seen=%s",
+                            ce_key[0], pe_key[0],
                             self._manual_exit_misses,
+                            sorted(broker_legs),
                         )
                         return
                     logger.warning(
                         "[ATL] Manual exit detected: broker shows no open SELL legs "
-                        "(CE=%s PE=%s) for %d consecutive ticks. Stopping scanner for today.",
-                        self._state.ce.symbol, self._state.pe.symbol,
+                        "(CE %d / PE %d) for %d consecutive ticks. Broker legs seen=%s. "
+                        "Stopping scanner for today.",
+                        ce_key[0], pe_key[0],
                         self._manual_exit_misses,
+                        sorted(broker_legs),
                     )
                     self._record_event(
                         "manual_exit_detected",
@@ -1599,15 +1603,85 @@ class ATLStraddleScanner:
                 symbols.add(sym.upper())
         return symbols
 
+    async def _broker_open_strike_legs(self) -> Optional[set[tuple[int, str]]]:
+        """Return open broker positions as a set of ``(strike, 'CE'|'PE')`` tuples.
+
+        Format-agnostic alternative to :meth:`_broker_open_symbols` —
+        works regardless of whether the broker returns trading symbols in
+        AngelOne style (``NIFTY19MAY2624100CE``), Dhan style
+        (``NIFTY-19May2026-23700-CE`` / ``NIFTY 19 MAY 23700 CALL``) or
+        Kite style (``NIFTY26MAY23700CE``). Used by the manual-exit
+        detector so a symbol-format mismatch can never falsely declare
+        the legs gone.
+
+        Returns ``None`` when the broker can't be queried so the caller
+        falls back to the safe behaviour (assume legs are present).
+        """
+        broker = self._resolve_broker()
+        if broker is None:
+            return None
+        get_positions = getattr(broker, "get_positions", None)
+        if not callable(get_positions):
+            return None
+        try:
+            positions = await asyncio.to_thread(get_positions)
+        except Exception:
+            logger.exception("[ATL] Could not query broker positions for manual-exit detector")
+            return None
+        out: set[tuple[int, str]] = set()
+        for p in positions or []:
+            sym = ""
+            qty = 0
+            if hasattr(p, "trading_symbol"):
+                sym = (p.trading_symbol or "")
+                qty = int(getattr(p, "quantity", 0) or 0)
+            elif isinstance(p, dict):
+                sym = str(
+                    p.get("trading_symbol")
+                    or p.get("tradingsymbol")
+                    or p.get("tradingSymbol")
+                    or ""
+                )
+                qty = int(
+                    p.get("quantity")
+                    or p.get("netqty")
+                    or p.get("netQty")
+                    or 0
+                )
+            if not sym or qty == 0:
+                continue
+            s = sym.upper()
+            # Option type: any of CE, PE, CALL, PUT (case-insensitive,
+            # punctuation-tolerant).
+            if re.search(r"(?:^|[^A-Z])CALL(?:$|[^A-Z])", s) or re.search(r"CE(?:$|[^A-Z0-9])", s):
+                opt = "CE"
+            elif re.search(r"(?:^|[^A-Z])PUT(?:$|[^A-Z])", s) or re.search(r"PE(?:$|[^A-Z0-9])", s):
+                opt = "PE"
+            else:
+                continue
+            # Strike: pick the largest plausible integer in the symbol.
+            # Plausible = at least 3 digits long (covers MIDCPNIFTY 8000
+            # → BANKNIFTY 95000). Year (2-digit) and day-of-month (1-2
+            # digit) tokens are too short and naturally fall out.
+            nums = [int(x) for x in re.findall(r"\d+", s) if len(x) >= 3]
+            if not nums:
+                continue
+            strike = max(nums)
+            out.add((strike, opt))
+        return out
+
     async def _close_current_shorts(self, instrument: InstrumentConfig, reason: str) -> bool:
         lots = int(self._settings.get("lots", 1) or 1)
         ok = True
         # Skip legs the user has already closed manually at the broker so we
-        # don't fire orphan exit orders against zero positions.
-        open_syms = await self._broker_open_symbols()
+        # don't fire orphan exit orders against zero positions. Compare by
+        # (strike, CE/PE) — symbol-string comparison breaks for Dhan because
+        # its tradingSymbol format differs from the AngelOne format stored
+        # in state.
+        open_legs = await self._broker_open_strike_legs()
         if self._state.ce:
-            sym = (self._state.ce.symbol or "").upper()
-            if open_syms is not None and sym and sym not in open_syms:
+            key = (int(round(self._state.ce.strike)), "CE")
+            if open_legs is not None and key not in open_legs:
                 logger.info(
                     "[ATL] Skipping CE close (%s): broker shows no open position. reason=%s",
                     self._state.ce.symbol, reason,
@@ -1619,8 +1693,8 @@ class ATLStraddleScanner:
             else:
                 ok = await self._place_leg_order(instrument, self._state.ce, "BUY", lots, reason) and ok
         if self._state.pe:
-            sym = (self._state.pe.symbol or "").upper()
-            if open_syms is not None and sym and sym not in open_syms:
+            key = (int(round(self._state.pe.strike)), "PE")
+            if open_legs is not None and key not in open_legs:
                 logger.info(
                     "[ATL] Skipping PE close (%s): broker shows no open position. reason=%s",
                     self._state.pe.symbol, reason,
@@ -1642,13 +1716,11 @@ class ATLStraddleScanner:
         # were placed seconds ago in the same call and MUST be unwound
         # regardless of what the broker's positions endpoint reports. The
         # default broker-position guard exists only to avoid orphan exits
-        # against legs the user manually closed mid-day; it falsely
-        # suppresses rollbacks when the broker reports trading symbols in
-        # a different format (e.g. Dhan vs AngelOne SENSEX symbology).
-        open_syms = None if force else await self._broker_open_symbols()
+        # against legs the user manually closed mid-day.
+        open_legs = None if force else await self._broker_open_strike_legs()
         if self._state.hedge_ce:
-            sym = (self._state.hedge_ce.symbol or "").upper()
-            if open_syms is not None and sym and sym not in open_syms:
+            key = (int(round(self._state.hedge_ce.strike)), "CE")
+            if open_legs is not None and key not in open_legs:
                 logger.info(
                     "[ATL] Skipping HEDGE CE close (%s): broker shows no open position. reason=%s",
                     self._state.hedge_ce.symbol, reason,
@@ -1660,8 +1732,8 @@ class ATLStraddleScanner:
             else:
                 ok = await self._place_leg_order(instrument, self._state.hedge_ce, "SELL", lots, reason) and ok
         if self._state.hedge_pe:
-            sym = (self._state.hedge_pe.symbol or "").upper()
-            if open_syms is not None and sym and sym not in open_syms:
+            key = (int(round(self._state.hedge_pe.strike)), "PE")
+            if open_legs is not None and key not in open_legs:
                 logger.info(
                     "[ATL] Skipping HEDGE PE close (%s): broker shows no open position. reason=%s",
                     self._state.hedge_pe.symbol, reason,
