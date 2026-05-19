@@ -111,6 +111,16 @@ class ATLStraddleScanner:
         self._diag_last: dict[str, datetime] = {}
         self._force_entry: bool = False
         self._last_done_signature: str = ""
+        # Consecutive scanner ticks where the broker reported BOTH SELL legs
+        # missing. We only declare a manual exit after >=2 consecutive misses
+        # to avoid false positives from Dhan's positions API being briefly
+        # stale right after a fresh entry. Transient — not persisted.
+        self._manual_exit_misses: int = 0
+        # Wall-clock timestamp of the most recent SELL-leg placement (initial
+        # entry OR reform/switch). Used to suppress the manual-exit detector
+        # for a grace window so a slow broker positions endpoint can't
+        # falsely trip it during/after a strike rollover. Transient.
+        self._last_legs_changed_at: Optional[datetime] = None
         # Recover prior intraday state from disk if it's from today.
         self._load_state_from_disk()
 
@@ -122,6 +132,8 @@ class ATLStraddleScanner:
         self._diag_last = {}
         self._force_entry = False
         self._last_done_signature = ""
+        self._manual_exit_misses = 0
+        self._last_legs_changed_at = None
         self._save_state_to_disk()
 
     # ── State persistence ────────────────────────────────────────────
@@ -559,26 +571,62 @@ class ATLStraddleScanner:
         # the next tick. The user can move `entry_time` to a future moment
         # (the existing future_rearm path) to schedule a fresh entry.
         if self._state.entered and self._state.phase == "STRADDLE" and self._state.ce and self._state.pe:
+            # Grace window: suppress the manual-exit check for N seconds
+            # after the most recent leg placement (initial entry OR strike
+            # reform). Dhan's positions endpoint is routinely stale for
+            # 15-45s after order fills — during a reform the OLD symbols are
+            # already gone and the NEW symbols haven't appeared yet, so
+            # without this guard a rollover trips manual-exit every time.
+            grace_seconds = max(
+                0,
+                int(self._settings.get("manual_exit_grace_seconds", 90) or 0),
+            )
+            in_grace = (
+                self._last_legs_changed_at is not None
+                and (now - self._last_legs_changed_at).total_seconds() < grace_seconds
+            )
             try:
-                broker_symbols = await self._broker_open_symbols()
+                broker_symbols = await self._broker_open_symbols() if not in_grace else None
             except Exception:
                 broker_symbols = None
+            if in_grace:
+                # Keep the miss counter clean across the grace window so the
+                # first tick after grace expires starts from zero.
+                self._manual_exit_misses = 0
+                self._record_diag(
+                    "manual_exit_grace",
+                    f"Skipping manual-exit check; within {grace_seconds}s grace after last leg change",
+                )
             if broker_symbols is not None:
                 ce_sym = (self._state.ce.symbol or "").upper()
                 pe_sym = (self._state.pe.symbol or "").upper()
                 ce_open = (ce_sym in broker_symbols) if ce_sym else True
                 pe_open = (pe_sym in broker_symbols) if pe_sym else True
                 if not ce_open and not pe_open:
+                    # Require two consecutive misses before declaring a
+                    # manual exit. Dhan's positions API is occasionally
+                    # stale for a few seconds after a fresh entry, which
+                    # would otherwise instantly shut the scanner down.
+                    self._manual_exit_misses += 1
+                    if self._manual_exit_misses < 2:
+                        logger.info(
+                            "[ATL] Broker shows no open SELL legs (CE=%s PE=%s) — "
+                            "miss %d/2; waiting one more tick before declaring manual exit.",
+                            self._state.ce.symbol, self._state.pe.symbol,
+                            self._manual_exit_misses,
+                        )
+                        return
                     logger.warning(
                         "[ATL] Manual exit detected: broker shows no open SELL legs "
-                        "(CE=%s PE=%s). Stopping scanner for today.",
+                        "(CE=%s PE=%s) for %d consecutive ticks. Stopping scanner for today.",
                         self._state.ce.symbol, self._state.pe.symbol,
+                        self._manual_exit_misses,
                     )
                     self._record_event(
                         "manual_exit_detected",
                         f"Broker shows no open SELL legs for {int(self._state.straddle_strike)} "
-                        f"straddle. Scanner stopped — change entry_time to a future moment "
-                        f"to schedule a fresh entry.",
+                        f"straddle (confirmed {self._manual_exit_misses} ticks). Scanner stopped "
+                        f"— change entry_time to a future moment to schedule a fresh entry.",
                     )
                     try:
                         await self.alert_manager.telegram.send(
@@ -603,6 +651,11 @@ class ATLStraddleScanner:
                     # If they want everything flat, they can use Force Close.
                     self._complete_for_day("manual_exit_at_broker")
                     return
+                else:
+                    # At least one leg still visible at broker → not a manual
+                    # exit. Clear any prior miss so a later transient single
+                    # miss doesn't accumulate across unrelated ticks.
+                    self._manual_exit_misses = 0
 
         if peer_in_trade and not self.is_in_trade():
             self._record_diag(
@@ -731,6 +784,8 @@ class ATLStraddleScanner:
             self._state.ce = ce_leg
             self._state.pe = pe_leg
             self._state.entered = True
+            self._manual_exit_misses = 0
+            self._last_legs_changed_at = datetime.now(IST)
             if ce_strike == pe_strike:
                 # Entry is already ATM straddle (offset=0). Avoid immediate
                 # close/reopen of identical strikes on the next touch check.
@@ -892,6 +947,13 @@ class ATLStraddleScanner:
         self._state.straddle_strike = strike
         self._state.ce = ce_leg
         self._state.pe = pe_leg
+        # Legs just changed — reset the manual-exit miss counter and stamp
+        # the change time so the detector's grace window kicks in. Without
+        # this, the next 1-3 ticks see broker positions still reflecting
+        # the OLD strike (or empty during the swap) and falsely declare
+        # a manual exit, shutting the scanner down for the day.
+        self._manual_exit_misses = 0
+        self._last_legs_changed_at = datetime.now(IST)
         # Reset reference spot so next adjustment trigger is measured from
         # the spot at which this (re)formation happened.
         self._state.ref_spot = spot
@@ -1653,6 +1715,9 @@ class ATLStraddleScanner:
             return False
         self._state.ce = new_ce
         self._state.pe = new_pe
+        # Legs just changed — reset manual-exit guard (see _convert_to_straddle).
+        self._manual_exit_misses = 0
+        self._last_legs_changed_at = datetime.now(IST)
         self._record_event("roll", f"{reason}: CE {int(new_ce_strike)} PE {int(new_pe_strike)}")
         return True
 
