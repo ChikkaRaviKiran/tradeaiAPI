@@ -43,6 +43,16 @@ IST = pytz.timezone("Asia/Kolkata")
 ORDER_POLL_RETRIES = 8
 ORDER_POLL_DELAY_SECONDS = 1.0
 
+# Built-in per-instrument minimum drift floors for smart-mode reforms
+# (when settings `smart_min_drift_<index>` is 0). Chosen so we only ever
+# consider a reform after spot has clearly moved at least one strike
+# interval (or more for higher-priced indices where 50 pts is noise).
+SMART_MIN_DRIFT_DEFAULTS: dict[str, int] = {
+    "NIFTY": 50,        # strike interval 50
+    "BANKNIFTY": 150,   # strike interval 100, more volatile
+    "SENSEX": 200,      # strike interval 100, ~3.3× NIFTY price
+}
+
 
 def _atl_state_path() -> str:
     """On-disk location for persisted ATL runtime state + events.
@@ -122,6 +132,12 @@ class ATLStraddleScanner:
         # for a grace window so a slow broker positions endpoint can't
         # falsely trip it during/after a strike rollover. Transient.
         self._last_legs_changed_at: Optional[datetime] = None
+        # Wall-clock timestamp of the most recent successful reform (smart
+        # mode only). Used to enforce `smart_reform_cooldown_min`. Transient
+        # — not persisted, because if the backend restarts mid-day the
+        # cooldown's safety value is small compared to the cost of a buggy
+        # persisted clock.
+        self._last_reform_at: Optional[datetime] = None
         # Recover prior intraday state from disk if it's from today.
         self._load_state_from_disk()
 
@@ -135,6 +151,7 @@ class ATLStraddleScanner:
         self._last_done_signature = ""
         self._manual_exit_misses = 0
         self._last_legs_changed_at = None
+        self._last_reform_at = None
         self._save_state_to_disk()
 
     # ── State persistence ────────────────────────────────────────────
@@ -672,14 +689,26 @@ class ATLStraddleScanner:
         interval = max(1, int(self._settings.get("strike_interval", 50)))
         offset = max(0, int(self._settings.get("offset_points", 500)))
         rolling = max(1, int(self._settings.get("rolling_points", 300)))
-        # ATM-straddle adjustment trigger: when |spot - entry_spot| >= this,
-        # close existing SELL legs and re-short at the new ATM strike. Hedges
-        # are intentionally left intact across reforms. Falls back to the
-        # legacy `rolling_points` key so existing settings keep working.
-        adjustment_points = max(
-            1,
-            int(self._settings.get("adjustment_points", self._settings.get("rolling_points", 100))),
-        )
+        # ATM-straddle adjustment trigger:
+        #   adjustment_points > 0  → legacy fixed-distance rule (when
+        #                            |spot - ref_spot| >= this, reform).
+        #   adjustment_points == 0 → SMART mode: condition-based reform
+        #                            (premium imbalance + trend confirm +
+        #                            cooldown + per-instrument min drift +
+        #                            time cutoff + max reforms/day).
+        # If the key is absent we fall back to the legacy rolling_points
+        # (with min 1) so existing settings continue to behave identically.
+        raw_adj = self._settings.get("adjustment_points", None)
+        if raw_adj is None:
+            adjustment_points = max(1, rolling)
+        else:
+            try:
+                adjustment_points = int(raw_adj)
+            except Exception:
+                adjustment_points = max(1, rolling)
+            if adjustment_points < 0:
+                adjustment_points = 0
+        smart_mode = (adjustment_points == 0)
         # SL logic removed per ATM-straddle spec — strategy exits only at
         # exit_time or via emergency force_close. sl_type kept for API
         # back-compat but no longer evaluated.
@@ -880,17 +909,23 @@ class ATLStraddleScanner:
                     await self._convert_to_straddle(instrument, self._state.pe.strike, spot)
                 return
 
-        # STRADDLE phase logic — pure spot-distance adjustment.
-        # When the live spot has moved >= adjustment_points away from the
-        # spot at which the current straddle was opened (NOT the rounded
-        # strike), close only the SELL legs and re-short at the new ATM.
-        # Hedges are left in place untouched. There is no premium-based
-        # SL — the strategy holds till exit_time unless force-closed.
+        # STRADDLE phase logic.
+        # Legacy (adjustment_points > 0): pure spot-distance adjustment.
+        # Smart (adjustment_points == 0): condition-based adjustment.
+        # In BOTH paths: hedges are left in place untouched; there is no
+        # premium-based SL — the strategy holds till exit_time unless
+        # force-closed.
         if (
             self._state.phase == "STRADDLE"
             and self._state.entered
             and self._state.ref_spot > 0
         ):
+            if smart_mode:
+                await self._maybe_reform_smart(
+                    instrument, df_today, spot, interval, now,
+                )
+                return
+
             drift = abs(spot - self._state.ref_spot)
             if drift >= adjustment_points:
                 new_strike = round(spot / interval) * interval
@@ -916,6 +951,204 @@ class ATLStraddleScanner:
                     f"-> {int(self._state.straddle_strike)} → {int(new_strike)} (hedges kept)",
                 )
                 await self._convert_to_straddle(instrument, new_strike, spot, reform=True)
+
+    # ── Smart-mode reform helpers (active when adjustment_points == 0) ──
+    def _smart_min_drift(self, instrument: InstrumentConfig) -> int:
+        """Per-instrument minimum drift floor for smart-mode reforms.
+        User-configured override (smart_min_drift_<index>) wins if >0,
+        otherwise built-in default for that index, otherwise 50.
+        """
+        idx = str(instrument.symbol).upper()
+        key_map = {
+            "NIFTY": "smart_min_drift_nifty",
+            "BANKNIFTY": "smart_min_drift_banknifty",
+            "SENSEX": "smart_min_drift_sensex",
+        }
+        override = 0
+        try:
+            override = int(self._settings.get(key_map.get(idx, ""), 0) or 0)
+        except Exception:
+            override = 0
+        if override > 0:
+            return override
+        return SMART_MIN_DRIFT_DEFAULTS.get(idx, 50)
+
+    def _parse_hhmm(self, raw: str, default_h: int, default_m: int) -> tuple[int, int]:
+        try:
+            h, m = [int(x) for x in str(raw).split(":")]
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return h, m
+        except Exception:
+            pass
+        return default_h, default_m
+
+    async def _maybe_reform_smart(
+        self,
+        instrument: InstrumentConfig,
+        df_today: pd.DataFrame,
+        spot: float,
+        interval: int,
+        now: datetime,
+    ) -> None:
+        """Condition-based reform (adjustment_points == 0).
+
+        Reform is allowed ONLY when ALL of the following hold:
+          1. Time is before the configured no_reform_after cutoff.
+          2. Reform count < smart_max_reforms_per_day.
+          3. At least cooldown_min minutes since the last reform.
+          4. The new ATM strike differs from the current straddle strike.
+          5. Trend-confirmed drift (5-min close avg if enabled, else LTP)
+             is >= per-instrument min_drift.
+          6. Either:
+               (a) premium ratio max/min >= ratio_trigger, OR
+               (b) emergency: drift >= force_reform_drift_mult × min_drift.
+
+        Hedges are NOT touched (same as legacy path).
+        On any failure, log a diag but DO NOT reform — safe default is hold.
+        """
+        # Read settings (all already normalized + clamped by atl_settings).
+        is_expiry = bool(self._expiry_date and now.date() == self._expiry_date)
+
+        ratio_trigger = float(
+            self._settings.get(
+                "smart_ratio_trigger_expiry" if is_expiry else "smart_ratio_trigger",
+                1.6 if is_expiry else 2.0,
+            )
+        )
+        cooldown_min = int(
+            self._settings.get(
+                "smart_reform_cooldown_min_expiry" if is_expiry else "smart_reform_cooldown_min",
+                10 if is_expiry else 20,
+            )
+        )
+        max_reforms = int(self._settings.get("smart_max_reforms_per_day", 4))
+        cutoff_raw = str(
+            self._settings.get(
+                "smart_no_reform_after_expiry" if is_expiry else "smart_no_reform_after",
+                "14:30" if is_expiry else "14:45",
+            )
+        )
+        use_5min = bool(self._settings.get("smart_use_5min_close", True))
+        force_mult = float(self._settings.get("smart_force_reform_drift_mult", 3.0))
+        min_drift = self._smart_min_drift(instrument)
+
+        # 1. Time cutoff
+        cutoff_h, cutoff_m = self._parse_hhmm(cutoff_raw, 14, 30 if is_expiry else 45)
+        if (now.hour, now.minute) >= (cutoff_h, cutoff_m):
+            self._record_diag(
+                "smart_after_cutoff",
+                f"Past reform cutoff {cutoff_h:02d}:{cutoff_m:02d} "
+                f"({'expiry' if is_expiry else 'non-expiry'}); holding straddle to exit",
+            )
+            return
+
+        # 2. Max reforms
+        if max_reforms > 0 and self._state.reform_count >= max_reforms:
+            self._record_diag(
+                "smart_max_reforms",
+                f"Already reformed {self._state.reform_count}× today "
+                f"(cap={max_reforms}); holding",
+            )
+            return
+
+        # 3. Cooldown
+        if self._last_reform_at is not None and cooldown_min > 0:
+            since = (now - self._last_reform_at).total_seconds() / 60.0
+            if since < cooldown_min:
+                self._record_diag(
+                    "smart_cooldown",
+                    f"Cooldown active: {since:.1f}/{cooldown_min} min since last reform",
+                )
+                return
+
+        # 5. Compute drift metric (trend-confirmed if requested)
+        spot_for_drift = spot
+        if use_5min:
+            try:
+                close_s = df_today["close"]
+                if len(close_s) >= 5:
+                    spot_for_drift = float(close_s.tail(5).mean())
+                # If <5 candles yet (very early in session), fall back to LTP
+                # rather than blocking the strategy.
+            except Exception:
+                spot_for_drift = spot
+
+        drift = abs(spot_for_drift - self._state.ref_spot)
+        if drift < min_drift:
+            # Too quiet — not even worth checking premium ratio.
+            # Record diag at most once per minute via _record_diag throttling.
+            self._record_diag(
+                "smart_drift_below_min",
+                f"drift={drift:.1f} < min_drift={min_drift} "
+                f"(spot_ref={'5m_avg' if use_5min else 'ltp'}={spot_for_drift:.2f}); holding",
+            )
+            return
+
+        # 4. Strike-change check (skip churn if rounding lands on same strike)
+        new_strike = round(spot / interval) * interval
+        if new_strike == self._state.straddle_strike:
+            # Refresh ref_spot so we don't keep re-evaluating identical state.
+            self._state.ref_spot = spot
+            self._save_state_to_disk()
+            self._record_diag(
+                "smart_same_strike",
+                f"drift={drift:.1f} but new_strike={int(new_strike)} == current; "
+                f"refreshed ref_spot",
+            )
+            return
+
+        # 6. Premium ratio OR emergency override
+        try:
+            ce_prem = float(self._state.ce.premium) if self._state.ce else 0.0
+            pe_prem = float(self._state.pe.premium) if self._state.pe else 0.0
+        except Exception:
+            ce_prem = pe_prem = 0.0
+        if ce_prem <= 0 or pe_prem <= 0:
+            # Without both premiums we can't compute ratio — fall back to
+            # holding rather than guessing. Premiums are refreshed every
+            # tick just above this block, so this is only ever transient.
+            self._record_diag(
+                "smart_no_premiums",
+                f"CE/PE premium not available (CE={ce_prem} PE={pe_prem}); holding",
+            )
+            return
+
+        ratio = max(ce_prem, pe_prem) / max(0.01, min(ce_prem, pe_prem))
+        emergency = drift >= (force_mult * min_drift)
+
+        if ratio < ratio_trigger and not emergency:
+            self._record_diag(
+                "smart_ratio_ok",
+                f"ratio={ratio:.2f} < trigger={ratio_trigger:.2f} "
+                f"(drift={drift:.1f}, min={min_drift}); holding for theta",
+            )
+            return
+
+        # All conditions met — reform.
+        trigger_reason = "emergency_drift" if emergency else "premium_imbalance"
+        self._state.reform_count += 1
+        self._state.is_first_straddle = False
+        logger.info(
+            "[ATL][SMART] Reform: %s | spot=%.2f drift=%.2f (ref=%s) min=%d "
+            "ratio=%.2f trigger=%.2f reforms=%d/%d cooldown=%dm "
+            "old=%.0f -> new=%.0f (hedges kept)",
+            trigger_reason, spot, drift,
+            f"{spot_for_drift:.2f}({'5m' if use_5min else 'ltp'})",
+            min_drift, ratio, ratio_trigger,
+            self._state.reform_count, max_reforms, cooldown_min,
+            self._state.straddle_strike, new_strike,
+        )
+        self._record_event(
+            "reform_trigger",
+            f"[SMART/{trigger_reason}] drift={drift:.1f}≥{min_drift} "
+            f"ratio={ratio:.2f}≥{ratio_trigger:.2f} "
+            f"-> {int(self._state.straddle_strike)} → {int(new_strike)} (hedges kept)",
+        )
+        await self._convert_to_straddle(instrument, new_strike, spot, reform=True)
+        # Stamp last_reform_at AFTER the await — if the order fails inside
+        # _convert_to_straddle it returns early without rotating legs, but
+        # cooldown should still apply to avoid hammering the broker.
+        self._last_reform_at = datetime.now(IST)
 
     async def _convert_to_straddle(self, instrument: InstrumentConfig, strike: float, spot: float, reform: bool = False) -> None:
         if (

@@ -32,6 +32,31 @@ ATL_SETTINGS_DEFAULTS: dict[str, Any] = {
     "hedge_otm_points": 500,
     "hedge_lots": 0,
     "execution_account": "Primary",
+    # ── Smart-condition reform mode ─────────────────────────────────
+    # Activated ONLY when `adjustment_points == 0`. When >0, the legacy
+    # fixed-distance reform rule runs and these keys are ignored. This
+    # preserves the exact current behavior for every existing user.
+    #
+    # `adjustment_points` is intentionally NOT in defaults — its absence
+    # means "fall back to rolling_points" (legacy path). Setting it to 0
+    # via the API/UI is the explicit opt-in for smart mode.
+    "smart_ratio_trigger": 2.0,             # CE/PE premium imbalance to allow a reform
+    "smart_ratio_trigger_expiry": 1.6,      # tighter on expiry day (gamma is brutal)
+    "smart_use_5min_close": True,           # require trend confirm (5-min close avg vs LTP)
+    "smart_reform_cooldown_min": 20,        # min minutes between consecutive reforms
+    "smart_reform_cooldown_min_expiry": 10, # shorter cooldown on expiry day
+    "smart_max_reforms_per_day": 4,         # hard cap on intraday reforms
+    "smart_no_reform_after": "14:45",       # last clock time a reform may fire
+    "smart_no_reform_after_expiry": "14:30",
+    # Per-instrument minimum drift floor (in spot points) before any
+    # smart reform is considered. 0 = use built-in default for that index.
+    "smart_min_drift_nifty": 0,             # built-in default: 50
+    "smart_min_drift_banknifty": 0,         # built-in default: 150
+    "smart_min_drift_sensex": 0,            # built-in default: 200
+    # Emergency override: if drift exceeds this multiplier × min_drift,
+    # reform regardless of premium ratio (handles vol-crush edge cases
+    # where ratio stays low despite a large directional move).
+    "smart_force_reform_drift_mult": 3.0,
 }
 
 
@@ -111,6 +136,55 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
 
     if hedge_mode == "none":
         out["hedge_lots"] = 0
+
+    # ── Smart-mode normalization ─────────────────────────────────────
+    # `adjustment_points` is optional. If the user provided it, accept it
+    # as a non-negative int (0 == smart mode). If absent, leave it absent
+    # so the scanner's legacy fallback (`rolling_points`) kicks in.
+    if "adjustment_points" in (payload or {}):
+        try:
+            adj = int(payload.get("adjustment_points"))
+        except Exception:
+            adj = 0
+        out["adjustment_points"] = max(0, adj)
+
+    def _clamp_float(key: str, lo: float, hi: float, default: float) -> None:
+        try:
+            v = float(out.get(key, default))
+        except Exception:
+            v = default
+        out[key] = max(lo, min(hi, v))
+
+    def _clamp_int(key: str, lo: int, hi: int, default: int) -> None:
+        try:
+            v = int(out.get(key, default))
+        except Exception:
+            v = default
+        out[key] = max(lo, min(hi, v))
+
+    def _clamp_time(key: str, default: str) -> None:
+        raw = str(out.get(key, default))
+        try:
+            h, m = [int(x) for x in raw.split(":")]
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                out[key] = f"{h:02d}:{m:02d}"
+                return
+        except Exception:
+            pass
+        out[key] = default
+
+    _clamp_float("smart_ratio_trigger", 1.05, 10.0, 2.0)
+    _clamp_float("smart_ratio_trigger_expiry", 1.05, 10.0, 1.6)
+    out["smart_use_5min_close"] = bool(out.get("smart_use_5min_close", True))
+    _clamp_int("smart_reform_cooldown_min", 0, 240, 20)
+    _clamp_int("smart_reform_cooldown_min_expiry", 0, 240, 10)
+    _clamp_int("smart_max_reforms_per_day", 0, 50, 4)
+    _clamp_time("smart_no_reform_after", "14:45")
+    _clamp_time("smart_no_reform_after_expiry", "14:30")
+    _clamp_int("smart_min_drift_nifty", 0, 5000, 0)
+    _clamp_int("smart_min_drift_banknifty", 0, 5000, 0)
+    _clamp_int("smart_min_drift_sensex", 0, 10000, 0)
+    _clamp_float("smart_force_reform_drift_mult", 1.0, 20.0, 3.0)
 
     return out
 
