@@ -348,6 +348,15 @@ async def lifespan(app: FastAPI):
 
     orchestrator_task = asyncio.create_task(_run_orchestrator())
 
+    # Account-level kill-switch watchdog (Dhan only — polls positions
+    # every few seconds and force-closes everything if total PnL
+    # crosses the configured daily loss limit).
+    try:
+        from app.execution.account_kill_switch import start_watchdog as _aks_start
+        _aks_start()
+    except Exception:
+        logger.exception("Failed to start account kill switch watchdog")
+
     yield
 
     # Shutdown
@@ -358,6 +367,12 @@ async def lifespan(app: FastAPI):
         stop_scheduler()
     except Exception:
         pass
+    # Stop the kill-switch watchdog.
+    try:
+        from app.execution.account_kill_switch import stop_watchdog as _aks_stop
+        await _aks_stop()
+    except Exception:
+        logger.debug("Kill switch stop hook failed", exc_info=True)
     # Safety kill-switch: prevent any new real order execution during shutdown.
     settings.paper_trading = True
     orch = _state.get("orchestrator")
@@ -2150,6 +2165,48 @@ async def refresh_dhan_instruments():
     except Exception as exc:
         logger.exception("Dhan scrip master refresh failed")
         return {"ok": False, "error": str(exc)}
+
+
+# ── Account-level kill switch ─────────────────────────────────────────
+
+@app.get("/api/risk/kill-switch")
+async def get_kill_switch_state():
+    """Return the current account-level kill-switch state for the UI."""
+    from app.execution.account_kill_switch import get_state
+
+    return {"ok": True, "state": get_state().to_dict()}
+
+
+@app.put("/api/risk/kill-switch")
+async def update_kill_switch(body: dict):
+    """Update the kill-switch enable flag and/or daily loss limit.
+
+    Note: bumping the limit does NOT release a tripped lock within the
+    same IST day — use POST /api/risk/kill-switch/reset explicitly.
+    """
+    from app.execution.account_kill_switch import update_settings
+
+    enabled = body.get("enabled")
+    limit = body.get("limit")
+    try:
+        limit_f = float(limit) if limit is not None else None
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "limit must be a number"}
+    state = update_settings(enabled=enabled, limit=limit_f)
+    return {"ok": True, "state": state.to_dict()}
+
+
+@app.post("/api/risk/kill-switch/reset")
+async def reset_kill_switch_route(body: dict | None = None):
+    """Manually clear a tripped lock so the bot can place new entries
+    again. Typically used after the user resolves the underlying
+    issue (added funds, reviewed the loss, etc.).
+    """
+    from app.execution.account_kill_switch import reset_kill_switch
+
+    reason = (body or {}).get("reason") or "manual_reset_via_ui"
+    state = reset_kill_switch(reason=str(reason))
+    return {"ok": True, "state": state.to_dict()}
 
 
 # ── Strategy Settings (per-scanner exec params + ATL straddle) ────────────

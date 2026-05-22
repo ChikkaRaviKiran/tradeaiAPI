@@ -232,6 +232,26 @@ class Settings(BaseSettings):
     # Active trading account: "angel" | "kite" | "dhan"
     trading_account: str = Field(default="angel", alias="TRADING_ACCOUNT")
 
+    # ── Account-level daily-loss kill switch ───────────────────────
+    # When enabled, a background watchdog polls broker positions every
+    # `account_kill_switch_poll_seconds` and computes total PnL across
+    # EVERY position in the trading account (including manually-placed
+    # ones). If PnL <= -account_max_daily_loss, the switch trips:
+    #   * Every open position is force-closed via MARKET orders.
+    #   * All subsequent place_order calls are gated — only orders
+    #     that REDUCE an existing position are allowed (exits work,
+    #     new entries / pyramiding are rejected).
+    # Profit side is intentionally uncapped. Resets at IST midnight.
+    account_kill_switch_enabled: bool = Field(
+        default=True, alias="ACCOUNT_KILL_SWITCH_ENABLED",
+    )
+    account_max_daily_loss: float = Field(
+        default=6000.0, alias="ACCOUNT_MAX_DAILY_LOSS",
+    )
+    account_kill_switch_poll_seconds: float = Field(
+        default=5.0, alias="ACCOUNT_KILL_SWITCH_POLL_SECONDS",
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_active_instrument_list(self) -> list[str]:

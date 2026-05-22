@@ -257,6 +257,30 @@ class DhanBroker(BaseBroker):
             logger.error(msg)
             return OrderResponse(status=OrderStatus.REJECTED, message=msg)
 
+        # ── Account-level kill-switch gate ─────────────────────────
+        # When tripped, only orders that REDUCE an existing position
+        # are allowed (exits, partial squareoffs, rollbacks). New
+        # entries / pyramiding are rejected so the daily loss cap
+        # cannot be re-breached by re-entries on the same session.
+        from app.execution import account_kill_switch as _aks
+
+        gate = _aks.evaluate_order(
+            security_id=security_id,
+            side=request.side.value,
+            quantity=int(request.quantity),
+        )
+        if not gate.allowed:
+            logger.warning(
+                "DHAN ORDER BLOCKED BY KILL SWITCH: %s %s qty=%d "
+                "(current_qty=%d new_qty=%d) reason=%s",
+                request.side.value, request.trading_symbol,
+                int(request.quantity), gate.current_qty, gate.new_qty, gate.reason,
+            )
+            return OrderResponse(
+                status=OrderStatus.REJECTED,
+                message=f"Blocked: {gate.reason}",
+            )
+
         # ── Per-contract lot-size reconciliation ────────────────────
         # SEBI lot-size revisions only apply to NEWLY-issued contracts;
         # already-listed monthly expiries keep their original lot size.
