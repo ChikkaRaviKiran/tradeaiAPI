@@ -58,6 +58,14 @@ class KillSwitchState:
     # gate to decide whether an incoming order REDUCES or GROWS the position
     # without having to hit the broker on every order.
     net_qty_by_security: dict[str, int] = field(default_factory=dict)
+    # Per-security pending exit qty (set when the watchdog has already
+    # issued a force-close MARKET order but the fill hasn't been reflected
+    # in the next /positions snapshot). Prevents the next watchdog tick
+    # from firing a duplicate squareoff that would flip the net position.
+    pending_exit_qty: dict[str, int] = field(default_factory=dict)
+    # IST timestamp of the most recent force-close pass. Used as a safety
+    # cooldown so we never spam squareoffs faster than fills can reflect.
+    last_force_close_at: Optional[datetime] = None
 
     def to_dict(self) -> dict:
         return {
@@ -101,6 +109,8 @@ def get_state() -> KillSwitchState:
             last_error=_state.last_error,
             state_date=_state.state_date,
             net_qty_by_security=dict(_state.net_qty_by_security),
+            pending_exit_qty=dict(_state.pending_exit_qty),
+            last_force_close_at=_state.last_force_close_at,
         )
 
 
@@ -129,6 +139,11 @@ def update_settings(*, enabled: Optional[bool] = None, limit: Optional[float] = 
         # Note: changing the limit does NOT unlock a tripped switch within
         # the same IST day — the explicit reset is required so this can't
         # be used to escape a losing session.
+        # Seed state_date so the IST-rollover auto-reset has a baseline
+        # even if the user changes settings before the watchdog's first
+        # poll completes.
+        if _state.state_date is None:
+            _state.state_date = datetime.now(_IST).date()
         logger.info(
             "Kill switch settings updated: enabled=%s limit=%.2f locked=%s",
             _state.enabled, _state.limit, _state.locked,
@@ -144,6 +159,11 @@ def reset_kill_switch(reason: str = "manual_reset") -> KillSwitchState:
         _state.tripped_at = None
         _state.tripped_pnl = 0.0
         _state.last_error = ""
+        # Clearing pending exits ensures a re-trip later in the day will
+        # cleanly fire fresh force-close orders on any positions that
+        # have since been re-opened.
+        _state.pending_exit_qty = {}
+        _state.last_force_close_at = None
         if was_locked:
             logger.warning("Kill switch RESET (%s)", reason)
         return get_state()
@@ -175,27 +195,34 @@ def evaluate_order(security_id: str, side: str, quantity: int) -> GateDecision:
     if not is_enabled() or not is_locked():
         return GateDecision(allowed=True, reason="not_locked")
 
-    with _state_lock:
-        current = int(_state.net_qty_by_security.get(str(security_id), 0))
-
+    sid = str(security_id)
     sgn = +1 if side.upper() == "BUY" else -1
     incoming = sgn * abs(int(quantity))
-    new_qty = current + incoming
-    if abs(new_qty) < abs(current):
+
+    with _state_lock:
+        current = int(_state.net_qty_by_security.get(sid, 0))
+        new_qty = current + incoming
+        if abs(new_qty) < abs(current):
+            # Apply the delta locally so the very next order sees the
+            # already-reduced position, even before the next /positions
+            # poll refreshes the snapshot. Without this, several reducing
+            # orders fired within one poll window could collectively
+            # over-reduce and flip the position to the opposite side.
+            _state.net_qty_by_security[sid] = new_qty
+            return GateDecision(
+                allowed=True,
+                reason="reducing_position",
+                current_qty=current,
+                incoming_signed_qty=incoming,
+                new_qty=new_qty,
+            )
         return GateDecision(
-            allowed=True,
-            reason="reducing_position",
+            allowed=False,
+            reason="account_kill_switch_triggered_daily_loss",
             current_qty=current,
             incoming_signed_qty=incoming,
             new_qty=new_qty,
         )
-    return GateDecision(
-        allowed=False,
-        reason="account_kill_switch_triggered_daily_loss",
-        current_qty=current,
-        incoming_signed_qty=incoming,
-        new_qty=new_qty,
-    )
 
 
 # ── Internal: watchdog loop ─────────────────────────────────────────
@@ -250,6 +277,7 @@ async def _force_close_all(dhan_client, positions: list[dict]) -> int:
     doesn't stop the rest.
     """
     closed = 0
+    now = datetime.now(_IST)
     for p in positions:
         try:
             sec_id = str(p.get("securityId") or p.get("security_id") or "")
@@ -258,6 +286,19 @@ async def _force_close_all(dhan_client, positions: list[dict]) -> int:
             product = str(p.get("productType") or p.get("product_type") or "INTRADAY")
             if not sec_id or net_qty == 0 or not seg:
                 continue
+
+            # Skip positions that already have a pending squareoff with
+            # the same sign — the previous tick's exit is still settling.
+            with _state_lock:
+                pending = int(_state.pending_exit_qty.get(sec_id, 0))
+            if pending != 0 and ((pending > 0) == (net_qty > 0)):
+                logger.info(
+                    "KILL SWITCH skip duplicate force-close: security_id=%s "
+                    "net_qty=%d pending_exit=%d",
+                    sec_id, net_qty, pending,
+                )
+                continue
+
             side = "SELL" if net_qty > 0 else "BUY"
             qty = abs(net_qty)
             logger.warning(
@@ -276,6 +317,10 @@ async def _force_close_all(dhan_client, positions: list[dict]) -> int:
                 trigger_price=0.0,
             )
             logger.info("KILL SWITCH force-close response: %s", resp)
+            # Mark the in-flight exit so we don't duplicate next tick.
+            with _state_lock:
+                _state.pending_exit_qty[sec_id] = net_qty
+                _state.last_force_close_at = now
             closed += 1
         except Exception:
             logger.exception("Kill switch force-close failed for position %s", p)
@@ -314,6 +359,12 @@ async def _watchdog_loop() -> None:
             from app.execution.dhan_broker import DhanBroker
 
             broker = _get_or_build_dhan_broker(DhanBroker)
+            # Pick up rotated access tokens (UI save / .env edit) without
+            # needing a process restart — the order path does this too.
+            try:
+                broker._ensure_fresh_client()  # type: ignore[attr-defined]
+            except Exception:
+                logger.debug("Kill switch: broker token refresh failed", exc_info=True)
             if broker is None or broker.client is None:
                 continue
 
@@ -329,6 +380,20 @@ async def _watchdog_loop() -> None:
                 if _state.state_date is None:
                     _state.state_date = now.date()
                 _maybe_auto_reset_locked()
+                # Drop stale pending-exit entries that the latest snapshot
+                # proves are already settled (position closed, or sign
+                # flipped — meaning the prior exit clearly filled).
+                if _state.pending_exit_qty:
+                    cleaned: dict[str, int] = {}
+                    for sid, pending_qty in _state.pending_exit_qty.items():
+                        cur = by_sec.get(sid, 0)
+                        if cur == 0:
+                            continue
+                        if (pending_qty > 0) != (cur > 0):
+                            continue
+                        # Cap pending at observed net qty.
+                        cleaned[sid] = cur if abs(cur) < abs(pending_qty) else pending_qty
+                    _state.pending_exit_qty = cleaned
                 already_locked = _state.locked
                 should_trip = (
                     _state.enabled
@@ -352,6 +417,18 @@ async def _watchdog_loop() -> None:
                     f"PnL: ₹{pnl:,.2f} (limit ₹-{_state.limit:,.0f})\n"
                     f"Force-closing {len(open_positions)} open position(s). "
                     f"New entries blocked for the rest of the IST day."
+                )
+                await _force_close_all(broker.client, open_positions)
+            elif already_locked and open_positions:
+                # Lock was already active from a prior tick but positions
+                # are still open (manual re-entries on the broker app,
+                # partial fills, late hedge legs, etc). Keep squaring off
+                # — _force_close_all dedupes via pending_exit_qty so this
+                # is safe to call every tick.
+                logger.warning(
+                    "KILL SWITCH still active with %d open positions → "
+                    "continuing force-close pass",
+                    len(open_positions),
                 )
                 await _force_close_all(broker.client, open_positions)
         except asyncio.CancelledError:
@@ -379,11 +456,20 @@ def _get_or_build_dhan_broker(broker_cls):
 
 
 def start_watchdog(loop: Optional[asyncio.AbstractEventLoop] = None) -> Optional[asyncio.Task]:
-    """Start the watchdog task. Idempotent."""
+    """Start the watchdog task. Idempotent.
+
+    Must be called from inside a running event loop (FastAPI lifespan
+    satisfies this). Falls back to ``get_event_loop()`` only when no
+    running loop is available, to keep the legacy sync entrypoint working.
+    """
     global _watchdog_task
     if _watchdog_task is not None and not _watchdog_task.done():
         return _watchdog_task
-    loop = loop or asyncio.get_event_loop()
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
     _watchdog_task = loop.create_task(_watchdog_loop(), name="account_kill_switch_watchdog")
     return _watchdog_task
 
