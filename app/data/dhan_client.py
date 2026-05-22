@@ -310,7 +310,47 @@ class DhanClient:
         option_type: str,
         exchange: str,
     ) -> Optional[str]:
-        """Find Dhan ``securityId`` for an option contract.
+        """Find Dhan ``securityId`` for an option contract."""
+        row = self._find_option_row(underlying, expiry, strike, option_type, exchange)
+        if not row:
+            return None
+        sec_id = self._row_get(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID")
+        return sec_id or None
+
+    def resolve_option_lot_size(
+        self,
+        underlying: str,
+        expiry: date,
+        strike: float,
+        option_type: str,
+        exchange: str,
+    ) -> Optional[int]:
+        """Return the exchange-published lot size for an option contract.
+
+        Critical for expiries straddling SEBI lot-size revisions: existing
+        (older-issued) contracts retain their original lot size while newly
+        issued ones use the revised value. Using a stale static lot_size
+        from instrument config causes "Invalid Quantity" rejections.
+        """
+        row = self._find_option_row(underlying, expiry, strike, option_type, exchange)
+        if not row:
+            return None
+        raw = self._row_get(row, "SEM_LOT_UNITS", "LOT_SIZE", "LOT_UNITS")
+        try:
+            ls = int(float(raw)) if raw else 0
+            return ls if ls > 0 else None
+        except (ValueError, TypeError):
+            return None
+
+    def _find_option_row(
+        self,
+        underlying: str,
+        expiry: date,
+        strike: float,
+        option_type: str,
+        exchange: str,
+    ) -> Optional[dict]:
+        """Locate the scrip-master row for a specific option contract.
 
         Args:
             underlying: e.g. "NIFTY", "BANKNIFTY", "SENSEX".
@@ -372,8 +412,7 @@ class DhanClient:
             row_expiry = self._parse_expiry(exp_str)
             if not row_expiry or row_expiry != expiry:
                 continue
-            sec_id = self._row_get(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID")
-            return sec_id or None
+            return row
         return None
 
     @staticmethod

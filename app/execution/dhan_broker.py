@@ -257,6 +257,32 @@ class DhanBroker(BaseBroker):
             logger.error(msg)
             return OrderResponse(status=OrderStatus.REJECTED, message=msg)
 
+        # ── Per-contract lot-size reconciliation ────────────────────
+        # SEBI lot-size revisions only apply to NEWLY-issued contracts;
+        # already-listed monthly expiries keep their original lot size.
+        # When the active expiry was issued before a revision, our static
+        # `instrument.lot_size` (current weekly value) no longer matches
+        # the exchange-published lot for that contract → Dhan rejects
+        # the order with "Invalid Quantity". Look the true lot size up
+        # in the scrip master and rebuild qty from the user's intended
+        # lot count so the order matches what the exchange expects.
+        instrument_lot_size = int(getattr(request.instrument, "lot_size", 0) or 0)
+        exchange_lot_size = self._lookup_contract_lot_size(request, exchange)
+        if (
+            exchange_lot_size
+            and instrument_lot_size
+            and exchange_lot_size != instrument_lot_size
+        ):
+            lots = max(1, round(int(request.quantity) / instrument_lot_size))
+            new_qty = lots * exchange_lot_size
+            logger.warning(
+                "DHAN LOT-SIZE MISMATCH: %s expects lot=%d (config=%d). "
+                "Rebuilding qty %d → %d (%d lots).",
+                request.trading_symbol, exchange_lot_size, instrument_lot_size,
+                int(request.quantity), new_qty, lots,
+            )
+            request.quantity = new_qty
+
         # ── BSE/BFO market-protection LIMIT ─────────────────────────
         # BSE does NOT accept pure MARKET orders for SENSEX/BANKEX
         # options. Dhan auto-converts MARKET → LIMIT using a tight
@@ -301,7 +327,9 @@ class DhanBroker(BaseBroker):
         # avoid silent under-fills, pre-slice into chunks ≤ freeze qty
         # and place each as an independent MARKET/LIMIT.
         freeze_qty = _resolve_freeze_qty(request)
-        lot_size = int(getattr(request.instrument, "lot_size", 0) or 0)
+        # Use the reconciled per-contract lot size if we resolved one above
+        # so slicing rounds to the exchange-correct multiple.
+        lot_size = exchange_lot_size or int(getattr(request.instrument, "lot_size", 0) or 0)
         slice_qtys = _split_quantity(int(request.quantity), freeze_qty, lot_size)
         if len(slice_qtys) > 1:
             logger.info(
@@ -583,6 +611,37 @@ class DhanBroker(BaseBroker):
         return self._client.resolve_from_angel_symbol(
             request.trading_symbol, exchange
         ) or ""
+
+    def _lookup_contract_lot_size(self, request: OrderRequest, exchange: str) -> int:
+        """Return the exchange-published lot size for the contract this
+        request targets, or 0 if it can't be resolved.
+
+        Only the structured fields (underlying/expiry/strike/option_type)
+        are used; symbol-string parsing is intentionally skipped to avoid
+        guessing in fallback paths.
+        """
+        if not self._client:
+            return 0
+        underlying = request.underlying or (
+            request.instrument.option_symbol_prefix or request.instrument.symbol
+            if request.instrument else None
+        )
+        expiry = request.expiry_date
+        if isinstance(expiry, datetime):
+            expiry = expiry.date()
+        if not (underlying and expiry and request.strike and request.option_type):
+            return 0
+        try:
+            return int(self._client.resolve_option_lot_size(
+                underlying=underlying,
+                expiry=expiry,
+                strike=float(request.strike),
+                option_type=request.option_type,
+                exchange=exchange,
+            ) or 0)
+        except Exception:
+            logger.debug("Dhan lot-size lookup failed", exc_info=True)
+            return 0
 
     def resolve_symbol_debug(
         self,
