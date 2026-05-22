@@ -126,8 +126,11 @@ jobs:
                 echo "Pull failed on attempt ${i}."
                 echo "Docker status:"; sudo systemctl --no-pager -l status docker | tail -n 30 || true
                 echo "Disk/inode status:"; df -h /var/lib/docker || true; df -i /var/lib/docker || true
-                if [ "$i" -lt "$attempts" ]; then
-                  echo "Restarting Docker daemon before retry..."
+                # Only restart Docker on the final retry; restarting between every
+                # attempt can leave orphan renamed containers (e.g. <id>_tradeai-backend)
+                # that break the next `compose up` with "No such container".
+                if [ "$i" -eq $((attempts - 1)) ]; then
+                  echo "Restarting Docker daemon before final retry..."
                   sudo systemctl restart docker || true
                   sleep 5
                 fi
@@ -138,6 +141,18 @@ jobs:
 
             echo "Pulling ${BACKEND_IMAGE}:${BACKEND_TAG}"
             pull_image "${BACKEND_IMAGE}:${BACKEND_TAG}"
+
+            # Remove any stale renamed container shells left behind by a previous
+            # failed `compose up` recreate. Docker renames the old container to
+            # <shortid>_<name> before deleting it; if the daemon was restarted or
+            # storage hiccuped mid-recreate, the rename succeeds but the delete
+            # doesn't, and the next deploy dies with:
+            #   Error response from daemon: No such container: <shortid>_tradeai-backend
+            echo "Cleaning up any stale tradeai-backend container shells..."
+            sudo docker ps -a --format '{{.Names}}' \
+              | grep -E '(^|_)tradeai-backend$' \
+              | grep -v '^tradeai-backend$' \
+              | xargs -r sudo docker rm -f || true
 
             # Start backend + infrastructure only (frontend is deployed separately)
             sudo -E docker compose -f docker-compose.prod.yml up -d --no-deps postgres redis backend
