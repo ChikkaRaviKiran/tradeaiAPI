@@ -388,13 +388,31 @@ class DhanClient:
             if row_segment != target_segment:
                 continue
 
-            under = self._row_get(
-                row, "SM_SYMBOL_NAME", "SEM_TRADING_SYMBOL",
-                "UNDERLYING_SYMBOL", "SYMBOL_NAME", "DISPLAY_NAME"
+            # Exact-match against the dedicated underlying-symbol column.
+            # A substring match would wrongly route NIFTY → FINNIFTY /
+            # MIDCPNIFTY / BANKNIFTY because "NIFTY" is contained in all
+            # of them. Compare against SM_SYMBOL_NAME (or equivalents)
+            # exactly; fall back to a trading-symbol PREFIX match only
+            # when the underlying column is missing so older master
+            # schemas still resolve.
+            under_exact = self._row_get(
+                row, "SM_SYMBOL_NAME", "UNDERLYING_SYMBOL",
+                "SYMBOL_NAME", "DISPLAY_NAME",
             ).upper()
-            # underlying name often appears in SM_SYMBOL_NAME or as prefix of trading symbol
-            if target_under not in under:
-                continue
+            if under_exact:
+                if under_exact != target_under:
+                    continue
+            else:
+                tsym = self._row_get(row, "SEM_TRADING_SYMBOL").upper()
+                if not tsym.startswith(target_under):
+                    continue
+                # Ensure prefix isn't accidentally matching a longer
+                # underlying (e.g. NIFTY vs FINNIFTY). The character
+                # right after the prefix must NOT be a letter — option
+                # trading symbols put the expiry digits/format next.
+                tail = tsym[len(target_under):len(target_under) + 1]
+                if tail.isalpha():
+                    continue
             opt = self._row_get(row, "SEM_OPTION_TYPE", "OPTION_TYPE").upper()
             if opt != target_opt:
                 continue
