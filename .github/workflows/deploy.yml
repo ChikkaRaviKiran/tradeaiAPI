@@ -142,16 +142,15 @@ jobs:
             echo "Pulling ${BACKEND_IMAGE}:${BACKEND_TAG}"
             pull_image "${BACKEND_IMAGE}:${BACKEND_TAG}"
 
-            # Remove any stale renamed container shells left behind by a previous
-            # failed `compose up` recreate. Docker renames the old container to
-            # <shortid>_<name> before deleting it; if the daemon was restarted or
-            # storage hiccuped mid-recreate, the rename succeeds but the delete
-            # doesn't, and the next deploy dies with:
+            # Remove any stale renamed container shells AND the live backend
+            # container itself, so `compose up` creates fresh instead of
+            # going through the rename->delete recreate dance that fails as:
             #   Error response from daemon: No such container: <shortid>_tradeai-backend
-            echo "Cleaning up any stale tradeai-backend container shells..."
+            # Pre-removing the live container is safe — compose recreates it
+            # from the image we just pulled. Postgres/Redis are untouched.
+            echo "Cleaning up stale + live tradeai-backend container shells..."
             sudo docker ps -a --format '{{.Names}}' \
               | grep -E '(^|_)tradeai-backend$' \
-              | grep -v '^tradeai-backend$' \
               | xargs -r sudo docker rm -f || true
 
             # Start backend + infrastructure only (frontend is deployed separately)
