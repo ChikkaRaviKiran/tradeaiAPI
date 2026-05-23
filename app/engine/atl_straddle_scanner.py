@@ -855,6 +855,11 @@ class ATLStraddleScanner:
 
         # STRANGLE phase logic
         if self._state.phase == "STRANGLE":
+            # static_legs mode: hold the entered strangle untouched until
+            # exit_time. Matches the backtest simulator (no rolling, no
+            # at-touch conversion). All Phase-3a / sweep PnLs assume this.
+            if bool(self._settings.get("static_legs", False)):
+                return
             # At-strike conversion
             if spot >= self._state.ce.strike:
                 await self._convert_to_straddle(instrument, self._state.ce.strike, spot)
@@ -920,6 +925,10 @@ class ATLStraddleScanner:
             and self._state.entered
             and self._state.ref_spot > 0
         ):
+            # static_legs mode: hold the entered straddle untouched until
+            # exit_time. Matches the backtest simulator (no reform/adjustment).
+            if bool(self._settings.get("static_legs", False)):
+                return
             if smart_mode:
                 await self._maybe_reform_smart(
                     instrument, df_today, spot, interval, now,

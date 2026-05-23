@@ -17,6 +17,13 @@ ATL_SETTINGS_DEFAULTS: dict[str, Any] = {
     "entry_time": "09:20",
     "exit_time": "15:15",
     "strike_mode": "ATM",
+    "otm_strikes": 0,
+    # When True: enter the two legs once at entry_time and HOLD them
+    # unchanged until exit_time. No strangle-to-straddle conversion on
+    # touch, no rolling, no adjustment/reform. This matches the backtest
+    # simulator exactly (Phase-3a / ULTIMATE sweep results were produced
+    # under this rule).
+    "static_legs": False,
     "lots": 1,
     "strike_interval": 50,
     "offset_points": 500,
@@ -100,10 +107,22 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
     out["entry_time"] = str(out.get("entry_time", "09:20"))
     out["exit_time"] = str(out.get("exit_time", "15:15"))
     mode = str(out.get("strike_mode", "ATM")).upper()
-    out["strike_mode"] = "ITM" if mode == "ITM" else "ATM"
+    if mode not in {"ATM", "ITM", "STRANGLE"}:
+        mode = "ATM"
+    out["strike_mode"] = mode
     out["lots"] = max(1, int(out.get("lots", 1)))
     out["strike_interval"] = max(1, int(out.get("strike_interval", 50)))
-    out["offset_points"] = max(0, int(out.get("offset_points", 500)))
+    # otm_strikes is the OTM offset expressed in strike-steps (0/1/2/3...).
+    # When strike_mode == STRANGLE, this drives offset_points so users can
+    # pick "+2 OTM" without hand-computing points.
+    out["otm_strikes"] = max(0, int(out.get("otm_strikes", 0)))
+    out["static_legs"] = bool(out.get("static_legs", False))
+    if mode == "STRANGLE" and out["otm_strikes"] > 0:
+        out["offset_points"] = out["otm_strikes"] * out["strike_interval"]
+    elif mode == "ATM":
+        out["offset_points"] = 0
+    else:
+        out["offset_points"] = max(0, int(out.get("offset_points", 500)))
     out["rolling_points"] = max(1, int(out.get("rolling_points", 300)))
 
     sl_type = str(out.get("sl_type", "premium_pct")).strip().lower()
