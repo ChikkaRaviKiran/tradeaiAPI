@@ -74,6 +74,7 @@ from app.engine.move_detection_scanner import MoveDetectionScanner
 from app.engine.move_detection_scanner_bullish import MoveDetectionScannerBullish
 from app.engine.pdh_pdl_scanner import PDHPDLBreakoutScanner
 from app.engine.atl_straddle_scanner import ATLStraddleScanner
+from app.engine.research_straddle_scanner import ResearchStraddleScanner
 from app.engine.day_classifier import DayClassifier
 from app.execution.angelone_broker import AngelOneBroker
 from app.execution.broker_base import OrderRequest, OrderSide, OrderType, ProductType
@@ -331,6 +332,23 @@ class Orchestrator:
         logger.info(
             "[ATL] Straddle scanner initialised (broker=%s, trading_account=%s)",
             getattr(atl_broker, "name", "?"), settings.trading_account,
+        )
+
+        # ── Research Multi-Index Scanner (new modes: multi-index +
+        # indicator-gated). Runs in parallel to the legacy ATL scanner;
+        # idle unless `enabled=True` in atl_research_settings.json. ──
+        self.research_straddle_scanner = ResearchStraddleScanner(
+            client=self.client,
+            alert_manager=self.alert_manager,
+            broker=atl_broker,
+            expiry_provider=lambda idx: (
+                self._expiries.get(idx, ""),
+                self._expiry_dates.get(idx),
+            ),
+        )
+        logger.info(
+            "[Research] Multi-index straddle scanner initialised (broker=%s)",
+            getattr(atl_broker, "name", "?"),
         )
 
         # Strategy selector — picks best strategies based on condition-performance data
@@ -1604,6 +1622,14 @@ class Orchestrator:
                 )
             except Exception:
                 logger.exception("[ATL] scanner cycle failed for %s", symbol)
+            # Research scanner — independent state, no peer-in-trade coupling.
+            # Idle unless the user has enabled it in atl_research_settings.json.
+            try:
+                await self.research_straddle_scanner.run_cycle(
+                    df_today, instrument, cycle,
+                )
+            except Exception:
+                logger.exception("[Research] scanner cycle failed for %s", symbol)
             return
 
             # 8. Time-of-day circuit breaker — no new entries after cutoff

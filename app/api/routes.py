@@ -2388,6 +2388,135 @@ async def reset_atm():
     return {"ok": True, "message": "ATL scanner halt cleared"}
 
 
+# ── Research Multi-Index Straddle (new live modes) ────────────────────────
+# Single-index time-based mode keeps using the legacy /api/atm/* endpoints
+# above. Anything multi-index OR indicator-gated runs through this scanner.
+
+def _get_research_scanner():
+    orch = _state.get("orchestrator")
+    if orch is None:
+        return None
+    return getattr(orch, "research_straddle_scanner", None)
+
+
+@app.get("/api/atm-research/settings")
+async def get_atm_research_settings():
+    from app.engine.atl_research_settings import load_research_settings
+    return load_research_settings()
+
+
+@app.put("/api/atm-research/settings")
+async def update_atm_research_settings(body: dict):
+    from app.engine.atl_research_settings import save_research_settings
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    try:
+        saved = save_research_settings(body)
+        logger.info("Research straddle settings updated")
+        return saved
+    except Exception as exc:
+        logger.exception("Failed to save research straddle settings")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/atm-research/defaults")
+async def get_atm_research_defaults():
+    """Return the two preset schedules (time-based + indicator-based)
+    so the UI can pre-fill its grid on demand."""
+    from app.engine.atl_research_settings import (
+        DEFAULT_SCHEDULE_MULTI_INDICATOR,
+        DEFAULT_SCHEDULE_MULTI_TIME,
+    )
+    return {
+        "multi_indicator": DEFAULT_SCHEDULE_MULTI_INDICATOR,
+        "multi_time": DEFAULT_SCHEDULE_MULTI_TIME,
+    }
+
+
+@app.get("/api/atm-research/runtime")
+async def get_atm_research_runtime():
+    scanner = _get_research_scanner()
+    if scanner is None:
+        from app.engine.atl_research_settings import load_research_settings
+        return {
+            "runtime": {
+                "scanner_ready": False,
+                "live_mode": not bool(getattr(settings, "paper_trading", True)),
+                "settings": load_research_settings(),
+                "indices": {},
+            }
+        }
+    try:
+        rt = scanner.get_runtime_state()
+    except Exception as exc:
+        logger.exception("Research get_runtime_state failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+    rt["scanner_ready"] = True
+    rt["live_mode"] = not bool(getattr(settings, "paper_trading", True))
+    # Surface a warning if SENSEX/NIFTY isn't in active instruments
+    orch = _state.get("orchestrator")
+    active = {i.symbol for i in getattr(orch, "_active_instruments", []) or []}
+    rt["active_instruments"] = sorted(active)
+    rt["warnings"] = []
+    mode = (rt.get("settings", {}) or {}).get("mode", "")
+    if mode.startswith("multi_"):
+        if "NIFTY" not in active:
+            rt["warnings"].append("NIFTY is not in ACTIVE_INSTRUMENTS — NIFTY trades will be skipped.")
+        if "SENSEX" not in active:
+            rt["warnings"].append("SENSEX is not in ACTIVE_INSTRUMENTS — SENSEX trades will be skipped.")
+    return {"runtime": rt}
+
+
+def _find_instrument_by_symbol(orch, symbol: str):
+    if orch is None:
+        return None
+    for inst in getattr(orch, "_active_instruments", []) or []:
+        if inst.symbol == symbol:
+            return inst
+    return None
+
+
+@app.post("/api/atm-research/force-close")
+async def force_close_atm_research(body: dict | None = None):
+    """Close any open research-mode positions. Optional body: {"index": "NIFTY"|"SENSEX"}.
+    If omitted, closes both."""
+    scanner = _get_research_scanner()
+    if scanner is None:
+        raise HTTPException(status_code=503, detail="Research scanner not initialised")
+    orch = _state.get("orchestrator")
+    targets = []
+    requested = (body or {}).get("index") if isinstance(body, dict) else None
+    if requested:
+        targets = [str(requested).upper()]
+    else:
+        targets = ["NIFTY", "SENSEX"]
+    results: dict[str, bool] = {}
+    for sym in targets:
+        inst = _find_instrument_by_symbol(orch, sym)
+        if inst is None:
+            results[sym] = False
+            continue
+        try:
+            results[sym] = await scanner.force_close_one(inst, reason="manual_force_close")
+        except Exception:
+            logger.exception("Research force-close failed for %s", sym)
+            results[sym] = False
+    return {"ok": True, "results": results}
+
+
+@app.post("/api/atm-research/reset")
+async def reset_atm_research(body: dict | None = None):
+    scanner = _get_research_scanner()
+    if scanner is None:
+        raise HTTPException(status_code=503, detail="Research scanner not initialised")
+    sym = (body or {}).get("index") if isinstance(body, dict) else None
+    try:
+        scanner.reset_halt(sym)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True}
+
+
 # ── Strategy Analytics & Today's Plan ─────────────────────────────────────
 
 async def _load_strategy_analytics_db(today: str) -> dict:
