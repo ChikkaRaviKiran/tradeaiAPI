@@ -1,0 +1,93 @@
+{
+  "enabled": false,
+  "mode": "multi_indicator",
+  "primary_index": "NIFTY",
+  "execution_account": "Primary",
+  "lots_nifty": 4,
+  "lots_sensex": 4,
+  "sl_rs": 6000,
+  "strike_step_nifty": 50,
+  "strike_step_sensex": 100,
+  "schedule": {
+    "Mon": {
+      "SENSEX": {
+        "enabled": true,
+        "strat": "strangle_2",
+        "entry": "T1",
+        "entry_time": "09:20",
+        "exit_time": "15:15"
+      },
+      "NIFTY": {
+        "enabled": true,
+        "strat": "straddle",
+        "entry": "T0",
+        "entry_time": "09:20",
+        "exit_time": "14:30"
+      }
+    },
+    "Tue": {
+      "SENSEX": {
+        "enabled": true,
+        "strat": "strangle_2",
+        "entry": "T4",
+        "entry_time": "09:30",
+        "exit_time": "15:15"
+      },
+      "NIFTY": {
+        "enabled": true,
+        "strat": "straddle",
+        "entry": "T4",
+        "entry_time": "09:30",
+        "exit_time": "14:30"
+      }
+    },
+    "Wed": {
+      "SENSEX": {
+        "enabled": true,
+        "strat": "straddle",
+        "entry": "T2",
+        "entry_time": "09:45",
+        "exit_time": "15:15"
+      },
+      "NIFTY": {
+        "enabled": true,
+        "strat": "strangle_1",
+        "entry": "T2",
+        "entry_time": "09:45",
+        "exit_time": "15:15"
+      }
+    },
+    "Thu": {
+      "SENSEX": {
+        "enabled": true,
+        "strat": "strangle_1",
+        "entry": "T1",
+        "entry_time": "09:30",
+        "exit_time": "15:15"
+      },
+      "NIFTY": {
+        "enabled": true,
+        "strat": "straddle",
+        "entry": "T3",
+        "entry_time": "09:30",
+        "exit_time": "15:15"
+      }
+    },
+    "Fri": {
+      "SENSEX": {
+        "enabled": true,
+        "strat": "strangle_2",
+        "entry": "T4",
+        "entry_time": "11:00",
+        "exit_time": "15:15"
+      },
+      "NIFTY": {
+        "enabled": true,
+        "strat": "straddle",
+        "entry": "T3",
+        "entry_time": "11:00",
+        "exit_time": "15:15"
+      }
+    }
+  }
+}

@@ -102,10 +102,14 @@ class _IndexState:
     exit_time_str: str = ""
     strat: str = ""
     entry_trigger: str = ""
-    credit: float = 0.0           # combined credit in points (CE+PE)
+    credit: float = 0.0           # NET opening credit in points: short_credit - hedge_cost
+    short_credit: float = 0.0     # gross short premium received (CE+PE)
+    hedge_cost: float = 0.0       # gross hedge premium paid (CE+PE)
     atm: float = 0.0
     ce: Optional[ATLLeg] = None
     pe: Optional[ATLLeg] = None
+    hedge_ce: Optional[ATLLeg] = None
+    hedge_pe: Optional[ATLLeg] = None
     last_mtm_rs: float = 0.0
     events: list[dict] = field(default_factory=list)
 
@@ -151,9 +155,13 @@ class ResearchStraddleScanner:
             st.strat = ""
             st.entry_trigger = ""
             st.credit = 0.0
+            st.short_credit = 0.0
+            st.hedge_cost = 0.0
             st.atm = 0.0
             st.ce = None
             st.pe = None
+            st.hedge_ce = None
+            st.hedge_pe = None
             st.last_mtm_rs = 0.0
             st.events.clear()
 
@@ -220,9 +228,13 @@ class ResearchStraddleScanner:
                     "exit_time": st.exit_time_str,
                     "atm": st.atm,
                     "credit_pts": round(st.credit, 2),
+                    "short_credit_pts": round(st.short_credit, 2),
+                    "hedge_cost_pts": round(st.hedge_cost, 2),
                     "expiry": st.expiry,
                     "ce": leg_dict(st.ce),
                     "pe": leg_dict(st.pe),
+                    "hedge_ce": leg_dict(st.hedge_ce),
+                    "hedge_pe": leg_dict(st.hedge_pe),
                     "last_mtm_rs": round(st.last_mtm_rs, 0),
                     "events": list(st.events),
                 }
@@ -312,7 +324,8 @@ class ResearchStraddleScanner:
         except Exception:
             return None
 
-    async def _build_leg(self, instrument: InstrumentConfig, strike: float, option_type: str) -> Optional[ATLLeg]:
+    async def _build_leg(self, instrument: InstrumentConfig, strike: float, option_type: str,
+                         fallback_quote: Optional[dict] = None) -> Optional[ATLLeg]:
         st = self._states.get(instrument.symbol.upper())
         if not st or not st.expiry:
             return None
@@ -320,7 +333,7 @@ class ResearchStraddleScanner:
         token_info = self.client._search_symbol(symbol)
         if not token_info:
             return None
-        quote = await self._fetch_option_quote(instrument, strike, option_type)
+        quote = fallback_quote or await self._fetch_option_quote(instrument, strike, option_type)
         ltp = float((quote or {}).get("ltp", 0) or 0)
         return ATLLeg(
             option_type=option_type,
@@ -330,6 +343,47 @@ class ResearchStraddleScanner:
             exchange=token_info.get("exch_seg", "NFO"),
             premium=ltp,
         )
+
+    def _hedge_target_premium(self, symbol: str) -> float:
+        if symbol.upper() == "NIFTY":
+            return float(self._settings.get("hedge_premium_nifty", 3) or 3)
+        if symbol.upper() == "SENSEX":
+            return float(self._settings.get("hedge_premium_sensex", 10) or 10)
+        return 3.0
+
+    async def _find_hedge_leg(self, instrument: InstrumentConfig, ref_strike: float,
+                              option_type: str, target_premium: float) -> Optional[ATLLeg]:
+        """Walk OTM up to 80 strike-steps and return the FIRST strike whose LTP
+        is at or below ``target_premium``. Falls back to closest match if none
+        reach the target within range."""
+        step = self._strike_step_for(instrument.symbol)
+        sign = 1 if option_type == "CE" else -1
+        best: Optional[ATLLeg] = None
+        best_diff: Optional[float] = None
+        for k in range(1, 81):
+            strike = ref_strike + sign * step * k
+            q = await self._fetch_option_quote(instrument, strike, option_type)
+            if not q:
+                continue
+            ltp = float((q or {}).get("ltp", 0) or 0)
+            if ltp <= 0:
+                continue
+            if ltp <= target_premium:
+                leg = await self._build_leg(instrument, strike, option_type, fallback_quote=q)
+                if leg:
+                    return leg
+            diff = abs(ltp - target_premium)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                cand = await self._build_leg(instrument, strike, option_type, fallback_quote=q)
+                if cand:
+                    best = cand
+        if best is None:
+            logger.warning(
+                "[Research] No %s hedge candidate within 80 strikes of %.0f (target=%.2f) for %s",
+                option_type, ref_strike, target_premium, instrument.symbol,
+            )
+        return best
 
     # ── broker order placement ─────────────────────────────────────
     async def _place_leg_order(self, instrument: InstrumentConfig, leg: ATLLeg, side: str, lots: int, reason: str) -> bool:
@@ -384,12 +438,36 @@ class ResearchStraddleScanner:
         return False
 
     async def _enter_legs(self, instrument: InstrumentConfig, st: _IndexState, reason: str) -> bool:
-        """Place both SELL legs in parallel. Rollback if one fails."""
+        """Hedge-first entry. Order tier:
+          1. BUY hedge_ce + hedge_pe (parallel) — caps max loss & lowers margin.
+          2. Only if hedges OK → SELL short ce + pe (parallel).
+        If any step fails, rolls back already-placed legs and marks day done."""
         if st.ce is None or st.pe is None:
             return False
         lots = self._lots_for(instrument.symbol)
         st.entry_in_progress = True
         try:
+            # ── Tier 1: hedges (if configured & resolved) ──
+            if st.hedge_ce is not None and st.hedge_pe is not None:
+                hce_ok, hpe_ok = await asyncio.gather(
+                    self._place_leg_order(instrument, st.hedge_ce, "BUY", lots, f"hedge_{reason}"),
+                    self._place_leg_order(instrument, st.hedge_pe, "BUY", lots, f"hedge_{reason}"),
+                )
+                if not (hce_ok and hpe_ok):
+                    # Roll back any hedge that did fill
+                    if hce_ok:
+                        await self._place_leg_order(instrument, st.hedge_ce, "SELL", lots, f"rollback_hedge_{reason}")
+                    if hpe_ok:
+                        await self._place_leg_order(instrument, st.hedge_pe, "SELL", lots, f"rollback_hedge_{reason}")
+                    self._record_event(instrument.symbol, "hedge_failed",
+                                       f"hedge placement failed (ce={hce_ok}, pe={hpe_ok}) — aborting entry")
+                    st.done_for_day = True
+                    st.phase = "DONE"
+                    st.ce = None; st.pe = None; st.hedge_ce = None; st.hedge_pe = None
+                    return False
+                st.hedge_cost = float((st.hedge_ce.premium or 0) + (st.hedge_pe.premium or 0))
+
+            # ── Tier 2: shorts ──
             ce_ok, pe_ok = await asyncio.gather(
                 self._place_leg_order(instrument, st.ce, "SELL", lots, reason),
                 self._place_leg_order(instrument, st.pe, "SELL", lots, reason),
@@ -397,30 +475,41 @@ class ResearchStraddleScanner:
             if ce_ok and pe_ok:
                 st.entered = True
                 st.phase = "ENTERED"
-                # Credit in points
-                st.credit = float((st.ce.premium or 0) + (st.pe.premium or 0))
+                st.short_credit = float((st.ce.premium or 0) + (st.pe.premium or 0))
+                st.credit = st.short_credit - st.hedge_cost
+                hedge_note = (
+                    f" hedge={st.hedge_ce.symbol}+{st.hedge_pe.symbol} cost={st.hedge_cost:.2f} pts"
+                    if st.hedge_ce and st.hedge_pe else ""
+                )
                 self._record_event(
                     instrument.symbol, "entered",
-                    f"{st.strat} {st.ce.symbol}+{st.pe.symbol} credit={st.credit:.2f} pts "
-                    f"({lots} lot×{instrument.lot_size})",
+                    f"{st.strat} {st.ce.symbol}+{st.pe.symbol} short_credit={st.short_credit:.2f}"
+                    f"{hedge_note} net_credit={st.credit:.2f} pts ({lots} lot×{instrument.lot_size})",
                 )
                 return True
-            # Roll back the leg that did enter
+            # Short-leg failure: roll back whatever filled, then flatten hedges too
             if ce_ok and not pe_ok:
                 await self._place_leg_order(instrument, st.ce, "BUY", lots, f"rollback_{reason}")
             if pe_ok and not ce_ok:
                 await self._place_leg_order(instrument, st.pe, "BUY", lots, f"rollback_{reason}")
+            if st.hedge_ce is not None and st.hedge_pe is not None:
+                await asyncio.gather(
+                    self._place_leg_order(instrument, st.hedge_ce, "SELL", lots, f"rollback_hedge_{reason}"),
+                    self._place_leg_order(instrument, st.hedge_pe, "SELL", lots, f"rollback_hedge_{reason}"),
+                )
             self._record_event(instrument.symbol, "entry_failed",
-                               f"{st.strat} entry failed (ce_ok={ce_ok}, pe_ok={pe_ok}) — completed for day")
+                               f"{st.strat} short entry failed (ce_ok={ce_ok}, pe_ok={pe_ok}) — day done")
             st.done_for_day = True
             st.phase = "DONE"
-            st.ce = None
-            st.pe = None
+            st.ce = None; st.pe = None; st.hedge_ce = None; st.hedge_pe = None
             return False
         finally:
             st.entry_in_progress = False
 
     async def _exit_legs(self, instrument: InstrumentConfig, st: _IndexState, reason: str) -> bool:
+        """Exit order tier (reverse of entry):
+          1. BUY-back shorts first — removes the risky leg.
+          2. Then SELL hedges — recovers any remaining hedge value."""
         if not st.entered:
             return True
         lots = self._lots_for(instrument.symbol)
@@ -429,12 +518,17 @@ class ResearchStraddleScanner:
             ce_ok = await self._place_leg_order(instrument, st.ce, "BUY", lots, f"exit_{reason}")
         if st.pe is not None:
             pe_ok = await self._place_leg_order(instrument, st.pe, "BUY", lots, f"exit_{reason}")
+        hce_ok = hpe_ok = True
+        if st.hedge_ce is not None:
+            hce_ok = await self._place_leg_order(instrument, st.hedge_ce, "SELL", lots, f"exit_hedge_{reason}")
+        if st.hedge_pe is not None:
+            hpe_ok = await self._place_leg_order(instrument, st.hedge_pe, "SELL", lots, f"exit_hedge_{reason}")
         st.entered = False
         st.done_for_day = True
         st.phase = "DONE"
         self._record_event(instrument.symbol, "exit",
-                           f"{st.strat} exit reason={reason} ce_ok={ce_ok} pe_ok={pe_ok}")
-        return ce_ok and pe_ok
+                           f"{st.strat} exit reason={reason} short_ok=({ce_ok},{pe_ok}) hedge_ok=({hce_ok},{hpe_ok})")
+        return ce_ok and pe_ok and hce_ok and hpe_ok
 
     # ── indicator gates ───────────────────────────────────────────
     def _evaluate_entry_gate(self, kind: str, strat: str, df_today: pd.DataFrame,
@@ -601,14 +695,20 @@ class ResearchStraddleScanner:
         # ── In-trade SL monitoring ─────────────────────────────────
         if st.entered and st.ce is not None and st.pe is not None:
             await self._refresh_premiums(instrument, st)
-            cur_cost = float((st.ce.premium or 0) + (st.pe.premium or 0))
+            short_cur = float((st.ce.premium or 0) + (st.pe.premium or 0))
+            hedge_cur = 0.0
+            if st.hedge_ce is not None and st.hedge_pe is not None:
+                hedge_cur = float((st.hedge_ce.premium or 0) + (st.hedge_pe.premium or 0))
+            # Net cost to flatten = buy-back shorts − sell-back hedges
+            cur_net_cost = short_cur - hedge_cur
             rs_per_pt = self._lots_for(sym) * int(instrument.lot_size)
-            mtm = (st.credit - cur_cost) * rs_per_pt
+            mtm = (st.credit - cur_net_cost) * rs_per_pt
             st.last_mtm_rs = mtm
             sl_rs = float(self._settings.get("sl_rs", 6000))
             if mtm <= -sl_rs:
                 self._record_event(sym, "sl_hit",
-                                   f"₹SL fired: credit={st.credit:.2f} cur_cost={cur_cost:.2f} mtm=₹{mtm:.0f}")
+                                   f"₹SL fired: net_credit={st.credit:.2f} short_cur={short_cur:.2f} "
+                                   f"hedge_cur={hedge_cur:.2f} mtm=₹{mtm:.0f}")
                 await self._exit_legs(instrument, st, reason="sl_rs")
             return
 
@@ -645,18 +745,44 @@ class ResearchStraddleScanner:
             return
         st.ce = ce_leg
         st.pe = pe_leg
+        # ── Hedge legs (optional). Find far-OTM strikes at/below target premium.
+        if bool(self._settings.get("hedge_enabled", True)):
+            tgt = self._hedge_target_premium(sym)
+            hedge_ce, hedge_pe = await asyncio.gather(
+                self._find_hedge_leg(instrument, float(ce_strike), "CE", tgt),
+                self._find_hedge_leg(instrument, float(pe_strike), "PE", tgt),
+            )
+            if hedge_ce is None or hedge_pe is None:
+                self._record_event(sym, "hedge_resolve_failed",
+                                   f"Could not find hedge near target ₹{tgt} — aborting entry to stay safe")
+                st.ce = None; st.pe = None
+                return
+            st.hedge_ce = hedge_ce
+            st.hedge_pe = hedge_pe
+            self._record_event(
+                sym, "hedge_resolved",
+                f"hedge CE {hedge_ce.symbol}@{hedge_ce.premium:.2f} "
+                f"PE {hedge_pe.symbol}@{hedge_pe.premium:.2f} target=₹{tgt}",
+            )
         await self._enter_legs(instrument, st, reason=f"{st.entry_trigger}:{why}")
 
     async def _refresh_premiums(self, instrument: InstrumentConfig, st: _IndexState) -> None:
         if st.ce is None or st.pe is None:
             return
+        tasks = [
+            self._fetch_option_quote(instrument, st.ce.strike, "CE"),
+            self._fetch_option_quote(instrument, st.pe.strike, "PE"),
+        ]
+        if st.hedge_ce is not None:
+            tasks.append(self._fetch_option_quote(instrument, st.hedge_ce.strike, "CE"))
+        if st.hedge_pe is not None:
+            tasks.append(self._fetch_option_quote(instrument, st.hedge_pe.strike, "PE"))
         try:
-            ce_q, pe_q = await asyncio.gather(
-                self._fetch_option_quote(instrument, st.ce.strike, "CE"),
-                self._fetch_option_quote(instrument, st.pe.strike, "PE"),
-            )
+            results = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception:
             return
+        ce_q = results[0] if not isinstance(results[0], Exception) else None
+        pe_q = results[1] if not isinstance(results[1], Exception) else None
         if ce_q is not None:
             ltp = float((ce_q or {}).get("ltp", 0) or 0)
             if ltp > 0:
@@ -665,6 +791,20 @@ class ResearchStraddleScanner:
             ltp = float((pe_q or {}).get("ltp", 0) or 0)
             if ltp > 0:
                 st.pe.premium = ltp
+        idx = 2
+        if st.hedge_ce is not None:
+            hce_q = results[idx] if not isinstance(results[idx], Exception) else None
+            idx += 1
+            if hce_q is not None:
+                ltp = float((hce_q or {}).get("ltp", 0) or 0)
+                if ltp > 0:
+                    st.hedge_ce.premium = ltp
+        if st.hedge_pe is not None:
+            hpe_q = results[idx] if not isinstance(results[idx], Exception) else None
+            if hpe_q is not None:
+                ltp = float((hpe_q or {}).get("ltp", 0) or 0)
+                if ltp > 0:
+                    st.hedge_pe.premium = ltp
 
     # ── manual control endpoints ───────────────────────────────────
     async def force_close_all(self, reason: str = "manual") -> None:

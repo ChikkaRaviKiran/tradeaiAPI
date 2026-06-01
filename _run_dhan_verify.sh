@@ -1,0 +1,6 @@
+#!/bin/bash
+cat > ~/.env <<'EOF'
+DHAN_CLIENT_ID=1111544034
+DHAN_ACCESS_TOKEN=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzgwMTEwMzAzLCJpYXQiOjE3ODAwMjM5MDMsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTExNTQ0MDM0In0.jpiaRfmhLoRk-2_EHXJJSKlrc_1cMs4a-VMO9IuAoUwJrq-hq-ziWxXm4nl5dr-_K3aJh2cd4uWj4Py7t_VQgg
+EOF
+python3 ~/dhan_verify_expiry.py

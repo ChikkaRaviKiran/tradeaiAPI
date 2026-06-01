@@ -128,6 +128,13 @@ RESEARCH_SETTINGS_DEFAULTS: dict[str, Any] = {
     "sl_rs": 6000,                      # hard ₹ stop per (CE+PE) pair
     "strike_step_nifty": 50,
     "strike_step_sensex": 100,
+    # ── Hedge config ──
+    # When enabled, before SELLing the short legs the scanner finds far-OTM
+    # CE and PE strikes whose LTP is at/below the target premium and BUYs
+    # them in equal lots. Defines maximum loss and reduces margin.
+    "hedge_enabled": True,
+    "hedge_premium_nifty": 3,           # target ₹ premium per hedge leg
+    "hedge_premium_sensex": 10,
     "schedule": DEFAULT_SCHEDULE_MULTI_INDICATOR,
 }
 
@@ -200,6 +207,9 @@ def normalize_research_settings(payload: dict[str, Any]) -> dict[str, Any]:
     out["sl_rs"] = max(500, int(out.get("sl_rs", 6000) or 6000))
     out["strike_step_nifty"] = max(1, int(out.get("strike_step_nifty", 50) or 50))
     out["strike_step_sensex"] = max(1, int(out.get("strike_step_sensex", 100) or 100))
+    out["hedge_enabled"] = bool(out.get("hedge_enabled", True))
+    out["hedge_premium_nifty"] = max(0.5, float(out.get("hedge_premium_nifty", 3) or 3))
+    out["hedge_premium_sensex"] = max(0.5, float(out.get("hedge_premium_sensex", 10) or 10))
 
     sched = out.get("schedule") or base["schedule"]
     if not isinstance(sched, dict):
