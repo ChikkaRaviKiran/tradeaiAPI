@@ -998,7 +998,10 @@ class Orchestrator:
         for inst in self._active_instruments:
             if inst.symbol == "NIFTY":
                 nifty_inst = inst
-                nifty_df = self._df_today_cache.get("NIFTY") or df_today
+                cached = self._df_today_cache.get("NIFTY")
+                # NOTE: do not use `cached or df_today` — pandas raises
+                # "truth value of a DataFrame is ambiguous" on non-empty frames.
+                nifty_df = cached if cached is not None else df_today
                 break
 
         # ── Priority override: MoveDetBull flattens MoveDet + PDH/PDL ──
@@ -1035,7 +1038,8 @@ class Orchestrator:
                 if inst.symbol == atl_index:
                     atl_inst = inst
                     break
-            atl_df = self._df_today_cache.get(atl_inst.symbol) or atl_df
+            cached_atl = self._df_today_cache.get(atl_inst.symbol)
+            atl_df = cached_atl if cached_atl is not None else atl_df
         except Exception:
             logger.debug("Priority handoff: fallback to current instrument/frame", exc_info=True)
 
