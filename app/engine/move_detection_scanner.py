@@ -74,6 +74,7 @@ OPTION_LEVERAGE = 55            # Approximate ATM PUT leverage
 MAX_HOLD_CANDLES = 120          # ~2 hours max
 DAY_ASSESSMENT_TIME = dtime(10, 0)
 PREMIUM_TARGET_PTS = 20.0       # Exit when option premium gains ≥ ₹20 over entry
+PREMIUM_STOP_PTS = 10.0         # Exit when option premium drops ≥ ₹10 from entry
 
 SCANNER_TAG = "MOVE-DET"        # Telegram message prefix
 
@@ -657,6 +658,13 @@ class MoveDetectionScanner:
                     and (live_option_ltp - trade.option_entry_price) >= PREMIUM_TARGET_PTS
                 ):
                     exit_reason = "premium_target_20pts"
+                    exit_price = current_close
+                    trade.option_exit_price = live_option_ltp
+                elif (
+                    live_option_ltp > 0
+                    and (trade.option_entry_price - live_option_ltp) >= PREMIUM_STOP_PTS
+                ):
+                    exit_reason = "premium_stop_10pts"
                     exit_price = current_close
                     trade.option_exit_price = live_option_ltp
 
