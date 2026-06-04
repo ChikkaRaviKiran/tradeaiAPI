@@ -996,33 +996,18 @@ class Orchestrator:
         force-close bearish MoveDet and PDH/PDL so the bullish entry truly
         replaces every other open position.
         """
-        # ── Global toggle: if handoff disabled, block when any conflict ──
+        # ── Global toggle: if handoff disabled, skip all force-closes
+        #    but STILL allow the new entry (parallel positions permitted) ──
         try:
             from app.engine import priority_handoff_settings as _phs
             handoff_enabled = bool(_phs.load().get("enabled", True))
         except Exception:
             handoff_enabled = True
         if not handoff_enabled:
-            in_trade_names: list[str] = []
-            md = getattr(self, "move_detection_scanner", None)
-            if md is not None and md.is_in_trade() and source != "move_det":
-                in_trade_names.append("MoveDet")
-            mdb = getattr(self, "move_detection_scanner_bull", None)
-            if mdb is not None and mdb.is_in_trade() and source != "move_det_bull":
-                in_trade_names.append("MoveDetBull")
-            pdh = getattr(self, "pdh_pdl_scanner", None)
-            if pdh is not None and pdh.is_in_trade() and source != "pdh_pdl":
-                in_trade_names.append("PDH/PDL")
-            atl = self.atl_straddle_scanner
-            if atl and atl.is_in_trade():
-                in_trade_names.append("ATM")
-            if in_trade_names:
-                logger.info(
-                    "Priority handoff DISABLED: blocking %s entry; existing %s position(s) kept open",
-                    source, ", ".join(in_trade_names),
-                )
-                return False
-            # Nothing else live → allow entry without flattening anything
+            logger.info(
+                "Priority handoff DISABLED: %s entry will proceed without closing existing positions",
+                source,
+            )
             return True
 
         nifty_inst = instrument
