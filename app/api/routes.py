@@ -2281,6 +2281,28 @@ async def update_pdh_pdl_settings(body: dict):
     return _scanner_exec_put("pdh_pdl", body)
 
 
+@app.get("/api/strategy-settings/priority-handoff")
+async def get_priority_handoff_settings():
+    from app.engine import priority_handoff_settings as phs
+
+    return phs.load()
+
+
+@app.put("/api/strategy-settings/priority-handoff")
+async def update_priority_handoff_settings(body: dict):
+    from app.engine import priority_handoff_settings as phs
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    try:
+        saved = phs.save(body)
+        logger.info("Priority handoff settings updated: %s", saved)
+        return saved
+    except Exception as exc:
+        logger.exception("Failed to save priority handoff settings")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ── ATM Straddle Strategy runtime (ATLStraddleScanner) ────────────────────
 
 def _get_atl_scanner():
