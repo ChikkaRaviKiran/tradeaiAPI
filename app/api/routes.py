@@ -1737,7 +1737,24 @@ def _persist_env_vars(updates: dict[str, str]) -> None:
         attr = env_var.lower()
         if hasattr(settings, attr):
             try:
-                object.__setattr__(settings, attr, value)
+                # Coerce string env value to the existing attribute's type so
+                # we don't clobber booleans/ints with raw strings (e.g.
+                # PAPER_TRADING="false" → bool False, not the truthy string).
+                current = getattr(settings, attr)
+                coerced: object = value
+                if isinstance(current, bool):
+                    coerced = str(value).strip().lower() in ("1", "true", "yes", "on")
+                elif isinstance(current, int) and not isinstance(current, bool):
+                    try:
+                        coerced = int(value)
+                    except (TypeError, ValueError):
+                        coerced = current
+                elif isinstance(current, float):
+                    try:
+                        coerced = float(value)
+                    except (TypeError, ValueError):
+                        coerced = current
+                object.__setattr__(settings, attr, coerced)
             except Exception:
                 logger.exception("Failed to set settings.%s in-memory", attr)
 
@@ -2181,6 +2198,13 @@ async def get_kill_switch_state():
 async def update_kill_switch(body: dict):
     """Update the kill-switch enable flag and/or daily loss limit.
 
+    The new values are mutated in-memory **and** persisted to ``.env``
+    so they survive a backend container restart. Without persistence,
+    a container recreate (e.g. ``docker compose up -d backend``) would
+    silently revert to ``ACCOUNT_KILL_SWITCH_ENABLED`` /
+    ``ACCOUNT_MAX_DAILY_LOSS`` defaults and the UI would appear to
+    "forget" the user's change.
+
     Note: bumping the limit does NOT release a tripped lock within the
     same IST day — use POST /api/risk/kill-switch/reset explicitly.
     """
@@ -2193,6 +2217,22 @@ async def update_kill_switch(body: dict):
     except (TypeError, ValueError):
         return {"ok": False, "error": "limit must be a number"}
     state = update_settings(enabled=enabled, limit=limit_f)
+
+    # Persist to .env so the new values survive backend restarts.
+    env_updates: dict[str, str] = {}
+    if enabled is not None:
+        env_updates["ACCOUNT_KILL_SWITCH_ENABLED"] = "true" if bool(enabled) else "false"
+    if limit_f is not None and limit_f > 0:
+        # Match the .env style used elsewhere (no trailing .0 for ints).
+        env_updates["ACCOUNT_MAX_DAILY_LOSS"] = (
+            str(int(limit_f)) if float(limit_f).is_integer() else str(limit_f)
+        )
+    if env_updates:
+        try:
+            _persist_env_vars(env_updates)
+        except Exception:
+            logger.exception("Failed to persist kill-switch settings to .env")
+
     return {"ok": True, "state": state.to_dict()}
 
 
