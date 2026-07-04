@@ -54,8 +54,12 @@ SMART_MIN_DRIFT_DEFAULTS: dict[str, int] = {
 }
 
 
-def _atl_state_path() -> str:
+def _atl_state_path(instance_id: Optional[int] = None) -> str:
     """On-disk location for persisted ATL runtime state + events.
+
+    When ``instance_id`` is provided, the state file is namespaced per
+    instance (``atl_straddle_state_<id>.json``) so multiple scanners
+    running in parallel don't overwrite each other's recovery state.
 
     Lives next to atl_straddle_settings.json so restarts within the
     same trading day can recover ref_spot, current legs, hedge legs,
@@ -64,7 +68,59 @@ def _atl_state_path() -> str:
     and cannot compute roll/reform triggers correctly.
     """
     backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    return os.path.join(backend_root, "data", "atl_straddle_state.json")
+    fname = (
+        f"atl_straddle_state_{int(instance_id)}.json"
+        if instance_id is not None
+        else "atl_straddle_state.json"
+    )
+    return os.path.join(backend_root, "data", fname)
+
+
+class _TaggedTelegram:
+    """Thin wrapper that prefixes every ``send`` call with a per-instance tag.
+
+    Exposes the same coroutine surface as ``TelegramAlert`` so the
+    scanner's existing ``self.alert_manager.telegram.send(text)`` calls
+    keep working without modification.
+    """
+
+    __slots__ = ("_inner", "_prefix")
+
+    def __init__(self, inner, prefix: str) -> None:
+        self._inner = inner
+        self._prefix = prefix
+
+    async def send(self, text: str) -> None:
+        await self._inner.send(f"{self._prefix} {text}")
+
+    def __getattr__(self, name):  # pragma: no cover - passthrough
+        return getattr(self._inner, name)
+
+
+class _TaggedAlertManager:
+    """Wraps an ``AlertManager`` so ``.telegram`` sends are tagged.
+    All other attributes (email, log_trade, etc.) pass through unchanged.
+    """
+
+    __slots__ = ("_inner", "telegram")
+
+    def __init__(self, inner, prefix: str) -> None:
+        self._inner = inner
+        # Only the telegram channel is wrapped — trade logs/email keep
+        # their existing routing.
+        self.telegram = _TaggedTelegram(inner.telegram, prefix)
+
+    def __getattr__(self, name):  # pragma: no cover - passthrough
+        return getattr(self._inner, name)
+
+
+def _wrap_alert_manager_with_tag(alert_manager, instance_id: int, settings: dict):
+    """Return a tag-wrapped AlertManager for the given instance."""
+    stype = (settings.get("strategy_type") or "ATM_STRADDLE").upper()
+    idx = (settings.get("index") or "NIFTY").upper()
+    day = settings.get("trading_day") or "Daily"
+    prefix = f"[#{int(instance_id)} {stype} {idx}-{day}]"
+    return _TaggedAlertManager(alert_manager, prefix)
 
 
 @dataclass
@@ -104,6 +160,8 @@ class ATLStraddleScanner:
         alert_manager: AlertManager,
         broker: Optional[BaseBroker] = None,
         expiry_provider: Optional["Callable[[str], tuple[str, Optional[date]]]"] = None,
+        instance_id: Optional[int] = None,
+        settings_loader: Optional[Callable[[], dict]] = None,
     ):
         self.client = client
         self.alert_manager = alert_manager
@@ -113,7 +171,20 @@ class ATLStraddleScanner:
         # in the UI mid-session immediately picks up the new index's expiry
         # instead of being stuck with whatever set_expiry() pushed at startup.
         self._expiry_provider = expiry_provider
-        self._settings = load_atl_settings()
+        self.instance_id: Optional[int] = instance_id
+        self._settings_loader: Callable[[], dict] = settings_loader or load_atl_settings
+        self._settings = self._settings_loader()
+        # Multi-instance alert tagging: wrap the shared AlertManager so
+        # every Telegram send from this scanner is prefixed with a
+        # per-instance tag ("[#3 ATM_STRADDLE NIFTY-Thursday]"). This is
+        # essential when 3+ instances fire simultaneously — the user
+        # otherwise sees identical anonymous alerts.
+        if instance_id is not None:
+            self.alert_manager = _wrap_alert_manager_with_tag(
+                alert_manager, instance_id, self._settings,
+            )
+        else:
+            self.alert_manager = alert_manager
         self._today_str = ""
         self._expiry = ""
         self._expiry_date: Optional[date] = None
@@ -143,7 +214,7 @@ class ATLStraddleScanner:
 
     def reset_daily(self) -> None:
         self._today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        self._settings = load_atl_settings()
+        self._settings = self._settings_loader()
         self._state = ATLState()
         self._events = []
         self._diag_last = {}
@@ -183,7 +254,7 @@ class ATLStraddleScanner:
             return None
 
     def _save_state_to_disk(self) -> None:
-        path = _atl_state_path()
+        path = _atl_state_path(self.instance_id)
         try:
             payload = {
                 "today": self._today_str,
@@ -217,7 +288,7 @@ class ATLStraddleScanner:
             logger.exception("[ATL] Failed to persist state to %s", path)
 
     def _load_state_from_disk(self) -> None:
-        path = _atl_state_path()
+        path = _atl_state_path(self.instance_id)
         if not os.path.exists(path):
             return
         try:
@@ -431,7 +502,7 @@ class ATLStraddleScanner:
         refresh_every = max(1, int(getattr(settings, "atl_settings_refresh_cycles", 1) or 1))
         if cycle % refresh_every == 0:
             prev_signature = self._settings_signature()
-            self._settings = load_atl_settings()
+            self._settings = self._settings_loader()
             # Re-pull expiry for the (possibly newly chosen) index. Without
             # this the scanner would keep using whatever expiry was injected
             # at startup, so switching NIFTY ↔ SENSEX in the UI silently

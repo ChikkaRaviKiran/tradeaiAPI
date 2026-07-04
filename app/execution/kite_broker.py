@@ -44,10 +44,14 @@ ORDER_POLL_DELAY_SECONDS = 1.0
 class KiteBroker(BaseBroker):
     """Kite Connect (Zerodha) broker implementation."""
 
-    def __init__(self) -> None:
-        self._client: Optional[KiteClient] = None
+    def __init__(self, client: Optional[KiteClient] = None) -> None:
+        # If ``client`` is supplied (multi-account path) it is used verbatim
+        # so a per-account KiteClient can be injected by the broker factory.
+        # Otherwise the client is built from global settings (legacy path).
+        self._client: Optional[KiteClient] = client
         self._authenticated = False
-        self._init_client()
+        if client is None:
+            self._init_client()
 
     @property
     def name(self) -> str:

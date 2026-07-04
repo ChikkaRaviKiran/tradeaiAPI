@@ -405,6 +405,10 @@ async def init_db() -> None:
     async_engine = _build_engine()
     AsyncSessionLocal = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
 
+    # Import multi-account/multi-strategy models so their tables are
+    # created by ``Base.metadata.create_all`` below.
+    from app.db import account_models  # noqa: F401
+
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Add columns that may be missing on existing tables (safe migrations)
@@ -449,3 +453,14 @@ async def init_db() -> None:
                 await conn.execute(text(sql))
             except Exception:
                 pass  # Column may already exist or DB may not support IF NOT EXISTS
+
+    # Seed multi-account/multi-strategy defaults after the schema is in
+    # place.  Idempotent — only runs on empty tables.
+    try:
+        from app.db.migrations import seed_multi_account_defaults
+        await seed_multi_account_defaults()
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).exception(
+            "seed_multi_account_defaults failed (non-fatal)"
+        )

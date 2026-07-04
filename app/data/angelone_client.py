@@ -26,7 +26,13 @@ logger = logging.getLogger(__name__)
 class AngelOneClient:
     """Wrapper around AngelOne SmartAPI for authentication and data retrieval."""
 
-    def __init__(self) -> None:
+    def __init__(self, credentials: Optional[dict] = None) -> None:
+        # When ``credentials`` is provided (multi-account path), those
+        # values are used verbatim; otherwise the client falls back to
+        # global ``settings.angelone_*`` env vars (legacy singleton path).
+        # Expected keys (all strings, all optional):
+        #   api_key, client_id, mpin (or password), totp_secret
+        self._credentials_override = credentials
         self._smart_api: Optional[SmartConnect] = None
         self._auth_token: Optional[str] = None
         self._feed_token: Optional[str] = None
@@ -123,12 +129,21 @@ class AngelOneClient:
         otherwise falls back to password.
         """
         try:
-            self._smart_api = SmartConnect(api_key=settings.angelone_api_key)
-            totp = pyotp.TOTP(settings.angelone_totp_secret).now()
-            # AngelOne now requires MPIN instead of password
-            credential = settings.angelone_mpin or settings.angelone_password
+            creds = self._credentials_override or {}
+            api_key = creds.get("api_key") or settings.angelone_api_key
+            client_id = creds.get("client_id") or settings.angelone_client_id
+            totp_secret = creds.get("totp_secret") or settings.angelone_totp_secret
+            credential = (
+                creds.get("mpin")
+                or creds.get("password")
+                or creds.get("credential")
+                or settings.angelone_mpin
+                or settings.angelone_password
+            )
+            self._smart_api = SmartConnect(api_key=api_key)
+            totp = pyotp.TOTP(totp_secret).now()
             data = self._smart_api.generateSession(
-                settings.angelone_client_id,
+                client_id,
                 credential,
                 totp,
             )

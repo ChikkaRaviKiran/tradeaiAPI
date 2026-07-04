@@ -414,6 +414,14 @@ except Exception as _pe_err:  # pragma: no cover
     logger.warning("pattern_engine routes not registered: %s", _pe_err)
 
 
+# ── Multi-account / multi-strategy CRUD routes ───────────────────────────
+try:
+    from app.api.multi_account_routes import register_multi_account_routes
+    register_multi_account_routes(app)
+except Exception as _ma_err:  # pragma: no cover
+    logger.warning("multi_account routes not registered: %s", _ma_err)
+
+
 # ── Market Overview ───────────────────────────────────────────────────────
 
 @app.get("/api/market/snapshot", response_model=MarketSnapshot)

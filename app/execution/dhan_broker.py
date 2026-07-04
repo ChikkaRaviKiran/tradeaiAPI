@@ -106,15 +106,23 @@ def _supports_fresh_kw() -> bool:
 class DhanBroker(BaseBroker):
     """DhanHQ broker implementation."""
 
-    def __init__(self) -> None:
-        self._client: Optional[DhanClient] = None
+    def __init__(self, client: Optional[DhanClient] = None) -> None:
+        # When ``client`` is supplied (multi-account path) it is used
+        # verbatim — the credential self-heal check is skipped, since
+        # account-scoped clients must be rebuilt via a fresh factory call
+        # rather than by reading the shared DB credentials row.
+        self._client: Optional[DhanClient] = client
         self._authenticated = False
         self._client_id: str = ""
         # Track the access_token that built the current `_client` so we can
         # detect token rotations (UI save / .env edit) and rebuild lazily
         # instead of relying on every caller to invoke reload_credentials().
         self._client_token: str = ""
-        self._init_client()
+        # ``True`` when this broker owns a per-account injected client and
+        # must NOT auto-refresh from the shared credentials cache.
+        self._account_scoped: bool = client is not None
+        if client is None:
+            self._init_client()
 
     @property
     def name(self) -> str:
@@ -168,6 +176,12 @@ class DhanBroker(BaseBroker):
         that cache, so the rotated token is picked up on the next call and
         is then sticky for the rest of the cache window.
         """
+        # Account-scoped brokers (created via broker_factory from a
+        # BrokerAccount row) must never fall back to the shared credential
+        # cache — otherwise a second Dhan account would silently steal the
+        # first one's client.
+        if self._account_scoped:
+            return
         try:
             from app.db.broker_credentials import get_dhan_credentials
 

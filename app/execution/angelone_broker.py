@@ -40,8 +40,12 @@ class AngelOneBroker(BaseBroker):
     For live trading (paper_trading=False), orders hit real exchange.
     """
 
-    def __init__(self) -> None:
-        self.client = AngelOneClient()
+    def __init__(self, client: Optional[AngelOneClient] = None) -> None:
+        # When ``client`` is supplied (multi-account path) it is used as-is,
+        # so a per-account AngelOneClient with account-scoped credentials
+        # can be injected by ``broker_factory.build_broker_from_account``.
+        # Otherwise a default env-based client is created (legacy behaviour).
+        self.client = client or AngelOneClient()
         self._authenticated = False
 
     @property

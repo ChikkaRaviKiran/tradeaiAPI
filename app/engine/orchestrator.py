@@ -334,6 +334,26 @@ class Orchestrator:
             getattr(atl_broker, "name", "?"), settings.trading_account,
         )
 
+        # ── Multi-instance strategy registry ───────────────────────────
+        # Owns N scanners, one per active StrategyInstance DB row. Each
+        # gets its own DB-backed settings loader, per-instance state
+        # file, and per-account broker.  When ≥1 rows exist,
+        # ``self.atl_straddle_scanner`` is re-pointed to the first
+        # registry scanner so runtime API endpoints keep working.
+        from app.engine.strategy_registry import StrategyInstanceRegistry
+        self.strategy_registry = StrategyInstanceRegistry(
+            client=self.client,
+            alert_manager=self.alert_manager,
+            broker_factory=self._build_atl_broker,
+            expiry_provider=lambda idx: (
+                self._expiries.get(idx, ""),
+                self._expiry_dates.get(idx),
+            ),
+        )
+        # Track cycle count for periodic DB reconciliation.
+        self._registry_sync_every_cycles = 30  # ~= every 1-2 minutes at 3-5s cycles
+        self._registry_last_sync_cycle: dict[str, int] = {}
+
         # ── Research Multi-Index Scanner (new modes: multi-index +
         # indicator-gated). Runs in parallel to the legacy ATL scanner;
         # idle unless `enabled=True` in atl_research_settings.json. ──
@@ -724,6 +744,35 @@ class Orchestrator:
                     logger.info("[ATL] Expiry set for %s: %s", atl_idx, atl_exp)
                 else:
                     logger.warning("[ATL] No expiry available for %s — option quotes will MISS", atl_idx)
+
+                # Multi-instance path: each registry scanner has its own
+                # ``index`` in its per-instance DB row, so we must resolve
+                # and push the correct expiry to each one individually.
+                # Skips whichever scanner is aliased as
+                # ``self.atl_straddle_scanner`` since we already set it above.
+                registry = getattr(self, "strategy_registry", None)
+                if registry is not None:
+                    for iid, sc in registry.scanners.items():
+                        if sc is self.atl_straddle_scanner:
+                            continue
+                        try:
+                            inst_settings = sc._settings_loader() or {}
+                            inst_idx = (inst_settings.get("index") or "NIFTY").upper()
+                            inst_exp = self._expiries.get(inst_idx)
+                            inst_exp_date = self._expiry_dates.get(inst_idx)
+                            if inst_exp:
+                                sc.set_expiry(inst_exp, inst_exp_date)
+                                logger.info(
+                                    "[ATL] Expiry set for instance %s (%s): %s",
+                                    iid, inst_idx, inst_exp,
+                                )
+                            else:
+                                logger.warning(
+                                    "[ATL] Instance %s (%s) has no expiry — option quotes will MISS",
+                                    iid, inst_idx,
+                                )
+                        except Exception:
+                            logger.exception("[ATL] Failed to push expiry to instance %s", iid)
             except Exception:
                 logger.exception("[ATL] Failed to push expiry to scanner")
         except Exception:
@@ -1042,7 +1091,23 @@ class Orchestrator:
 
         atl = self.atl_straddle_scanner
         if not atl or not atl.is_in_trade():
-            return True
+            # Even if the primary alias is flat, one of the other
+            # registry scanners might hold a position that also needs
+            # to be flattened before the high-priority strategy fires.
+            registry = getattr(self, "strategy_registry", None)
+            other_open = False
+            if registry is not None:
+                for sc in registry.scanners.values():
+                    if sc is atl:
+                        continue
+                    try:
+                        if sc.is_in_trade():
+                            other_open = True
+                            break
+                    except Exception:
+                        continue
+            if not other_open:
+                return True
 
         # Resolve the instrument/frame for whichever index ATM is configured on.
         atl_inst = instrument
@@ -1060,17 +1125,53 @@ class Orchestrator:
         except Exception:
             logger.debug("Priority handoff: fallback to current instrument/frame", exc_info=True)
 
+        ok = True
+        # Primary alias first (if it actually has a position).
         try:
-            await atl.force_close(atl_df, atl_inst, reason=f"priority_handoff_{source}")
-            logger.info(
-                "Priority handoff: force-closed ATM before %s entry (%s)",
-                source,
-                atl_inst.symbol,
-            )
-            return True
+            if atl and atl.is_in_trade():
+                await atl.force_close(atl_df, atl_inst, reason=f"priority_handoff_{source}")
+                logger.info(
+                    "Priority handoff: force-closed ATM before %s entry (%s)",
+                    source, atl_inst.symbol,
+                )
         except Exception:
-            logger.exception("Priority handoff failed: could not force-close ATM before %s", source)
-            return False
+            logger.exception("Priority handoff failed: could not force-close ATM primary before %s", source)
+            ok = False
+
+        # Then every other registry scanner that has an open position.
+        registry = getattr(self, "strategy_registry", None)
+        if registry is not None:
+            for iid, sc in registry.scanners.items():
+                if sc is atl:
+                    continue
+                try:
+                    if not sc.is_in_trade():
+                        continue
+                    # Best-effort resolve per-instance index.
+                    try:
+                        inst_settings = sc._settings_loader() or {}
+                        inst_idx = (inst_settings.get("index") or "NIFTY").upper()
+                    except Exception:
+                        inst_idx = atl_inst.symbol
+                    scanner_inst = atl_inst
+                    for cand in self._active_instruments:
+                        if cand.symbol == inst_idx:
+                            scanner_inst = cand
+                            break
+                    cached_df = self._df_today_cache.get(scanner_inst.symbol)
+                    scanner_df = cached_df if cached_df is not None else atl_df
+                    await sc.force_close(scanner_df, scanner_inst, reason=f"priority_handoff_{source}")
+                    logger.info(
+                        "Priority handoff: force-closed instance %s (%s) before %s entry",
+                        iid, scanner_inst.symbol, source,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Priority handoff: failed to force-close instance %s before %s",
+                        iid, source,
+                    )
+                    ok = False
+        return ok
 
     async def _maybe_fetch_rss_news(self) -> None:
         """Fetch RSS + Telegram news if 15+ minutes since last fetch."""
@@ -1637,10 +1738,50 @@ class Orchestrator:
                 atl_peer_in_trade = False
                 if symbol == "NIFTY":
                     atl_peer_in_trade = md_in_trade or mdb_in_trade or pdh_in_trade
-                await self.atl_straddle_scanner.run_cycle(
-                    df_today, instrument, cycle,
-                    peer_in_trade=atl_peer_in_trade,
+
+                # Periodic DB reconciliation for the multi-instance registry.
+                # First-tick sync happens on cycle 0 for each symbol so the
+                # fleet is populated before any run_cycle call.
+                last_sync = self._registry_last_sync_cycle.get(symbol, -1)
+                should_sync = (
+                    last_sync < 0
+                    or (cycle - last_sync) >= self._registry_sync_every_cycles
                 )
+                if should_sync:
+                    try:
+                        await self.strategy_registry.sync_from_db()
+                    except Exception:
+                        logger.exception("[Registry] sync_from_db failed")
+                    self._registry_last_sync_cycle[symbol] = cycle
+
+                # Multi-instance path: dispatch to every registry scanner.
+                registry_scanners = list(self.strategy_registry.scanners.values())
+                if registry_scanners:
+                    # Repoint the legacy alias so existing runtime API
+                    # endpoints (/api/atm/runtime, force-close, etc.)
+                    # target the primary instance instead of the empty
+                    # startup singleton.
+                    primary = self.strategy_registry.get_primary()
+                    if primary is not None:
+                        self.atl_straddle_scanner = primary
+                    for sc in registry_scanners:
+                        try:
+                            await sc.run_cycle(
+                                df_today, instrument, cycle,
+                                peer_in_trade=atl_peer_in_trade,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[ATL] instance %s cycle failed for %s",
+                                getattr(sc, "instance_id", "?"), symbol,
+                            )
+                else:
+                    # Legacy fallback: no DB rows → use the singleton
+                    # scanner exactly as before, backed by JSON settings.
+                    await self.atl_straddle_scanner.run_cycle(
+                        df_today, instrument, cycle,
+                        peer_in_trade=atl_peer_in_trade,
+                    )
             except Exception:
                 logger.exception("[ATL] scanner cycle failed for %s", symbol)
             # Research scanner — independent state, no peer-in-trade coupling.
@@ -2330,17 +2471,23 @@ class Orchestrator:
 
     # ── Support Methods ──────────────────────────────────────────────────
 
-    def _build_atl_broker(self):
-        """Pick the broker for ATL straddle orders based on TRADING_ACCOUNT.
+    def _build_atl_broker(self, broker_name: Optional[str] = None):
+        """Pick the broker for ATL straddle orders.
+
+        By default uses ``settings.trading_account`` (global). When
+        ``broker_name`` is supplied (multi-instance path: comes from the
+        ``BrokerAccount`` bound to a ``StrategyInstance``), that broker
+        is preferred instead, with the same graceful fallback rules:
 
         - "kite" → KiteBroker
         - "dhan" → DhanBroker
         - anything else → AngelOne broker (already self.broker)
 
-        Returns None if the chosen adapter can't be created (e.g. SDK missing
-        or creds blank); the scanner then runs in alert-only / paper mode.
+        Returns None if the chosen adapter can't be created (e.g. SDK
+        missing or creds blank); the scanner then runs in alert-only /
+        paper mode.
         """
-        account = (settings.trading_account or "angel").strip().lower()
+        account = (broker_name or settings.trading_account or "angel").strip().lower()
         try:
             if account == "kite":
                 from app.execution.kite_broker import KiteBroker
