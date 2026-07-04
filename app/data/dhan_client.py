@@ -76,6 +76,20 @@ def _to_dhan_exchange_segment(exchange: str) -> str:
     return _EXCHANGE_SEGMENT_MAP.get((exchange or "").upper(), "NSE_FNO")
 
 
+def _mask_dhan_proxy(url: str) -> str:
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(url)
+        if p.username:
+            netloc = f"***:***@{p.hostname}"
+            if p.port:
+                netloc += f":{p.port}"
+            return urlunparse((p.scheme, netloc, p.path, "", "", ""))
+    except Exception:
+        pass
+    return url
+
+
 class DhanClient:
     """Thin wrapper around the ``dhanhq`` SDK for order placement.
 
@@ -83,7 +97,7 @@ class DhanClient:
     ``asyncio.to_thread(...)`` from async contexts.
     """
 
-    def __init__(self, client_id: str, access_token: str) -> None:
+    def __init__(self, client_id: str, access_token: str, proxy_url: str = "") -> None:
         if _DhanSDK is None:
             raise RuntimeError(
                 "dhanhq is not installed. Run `pip install dhanhq`."
@@ -92,6 +106,7 @@ class DhanClient:
             raise RuntimeError("DhanClient requires client_id and access_token")
         self.client_id = client_id
         self.access_token = access_token
+        self.proxy_url = (proxy_url or "").strip()
         # SDK shape changed in v3.x: dhanhq(client_id, token) → dhanhq(DhanContext(...))
         # Try the new style first, fall back to legacy positional args.
         if _DhanContext is not None:
@@ -102,8 +117,54 @@ class DhanClient:
                 self._dhan = _DhanSDK(client_id, access_token)
         else:
             self._dhan = _DhanSDK(client_id, access_token)
+        # Route all outbound HTTP through the per-account proxy so this Dhan
+        # login uses its dedicated Lightsail IP (matches the OptionSelling
+        # multi-account isolation pattern).
+        if self.proxy_url:
+            try:
+                self._install_proxy_on_sdk_session(self.proxy_url)
+                logger.info(
+                    "DhanClient[%s] routing via proxy %s",
+                    self.client_id, _mask_dhan_proxy(self.proxy_url),
+                )
+            except Exception:
+                logger.exception("DhanClient: failed to install proxy on SDK session (proceeding without proxy)")
         self._instrument_cache: list[dict] = []
         self._instrument_cache_date: Optional[date] = None
+
+    def _install_proxy_on_sdk_session(self, proxy_url: str) -> None:
+        """Best-effort: locate the internal requests.Session on the dhanhq SDK
+        instance and attach a proxies dict. Structure varies across SDK
+        versions so we probe common attribute paths.
+        """
+        proxies = {"http": proxy_url, "https": proxy_url}
+        candidates: list = []
+        for obj in (self._dhan, getattr(self._dhan, "dhan_context", None),
+                    getattr(self._dhan, "context", None)):
+            if obj is None:
+                continue
+            candidates.append(obj)
+            # SDKs commonly hold the session on one of these attributes
+            for attr in ("session", "_session", "http_session", "_http", "api", "_api"):
+                child = getattr(obj, attr, None)
+                if child is not None:
+                    candidates.append(child)
+        for c in candidates:
+            sess = getattr(c, "session", None) if not hasattr(c, "proxies") else c
+            if sess is None:
+                sess = getattr(c, "_session", None)
+            if sess is not None and hasattr(sess, "proxies"):
+                try:
+                    sess.proxies.update(proxies)
+                except Exception:
+                    try:
+                        sess.proxies = proxies
+                    except Exception:
+                        continue
+        # Absolute fallback: process-wide env vars scoped to this call site.
+        # We deliberately do NOT set os.environ here — that would leak to
+        # every other broker's requests. The SDK-session patching above is
+        # the isolated per-account path.
 
     # ── Profile / health ─────────────────────────────────────────────
 

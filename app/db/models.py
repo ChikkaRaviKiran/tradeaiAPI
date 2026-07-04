@@ -447,6 +447,10 @@ async def init_db() -> None:
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS original_lot_size INTEGER DEFAULT 0",
             # Broker credentials store
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_broker_credentials_broker_key ON broker_credentials (broker, key)",
+            # Per-account proxy columns (Lightsail SOCKS5 provisioning)
+            "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_url VARCHAR(300) DEFAULT ''",
+            "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_ip VARCHAR(50) DEFAULT ''",
+            "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_instance_name VARCHAR(100) DEFAULT ''",
         ]
         for sql in migrations:
             try:

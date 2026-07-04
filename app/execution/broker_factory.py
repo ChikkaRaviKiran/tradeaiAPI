@@ -100,6 +100,7 @@ def _build_angel(row: dict):
         "mpin": row.get("mpin") or "",
         "password": row.get("password") or "",
         "totp_secret": row.get("totp_secret") or "",
+        "proxy_url": row.get("proxy_url") or "",
     }
     if not creds["api_key"] or not creds["client_id"]:
         logger.warning(
@@ -141,7 +142,11 @@ def _build_dhan(row: dict):
             row.get("id"),
         )
         return None
-    client = DhanClient(client_id=client_id, access_token=access_token)
+    client = DhanClient(
+        client_id=client_id,
+        access_token=access_token,
+        proxy_url=row.get("proxy_url") or "",
+    )
     return DhanBroker(client=client)
 
 

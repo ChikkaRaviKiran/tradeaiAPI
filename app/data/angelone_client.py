@@ -23,6 +23,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _mask_proxy(url: str) -> str:
+    """Return a proxy URL with credentials masked, for safe log output."""
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(url)
+        if p.username:
+            netloc = f"***:***@{p.hostname}"
+            if p.port:
+                netloc += f":{p.port}"
+            return urlunparse((p.scheme, netloc, p.path, "", "", ""))
+    except Exception:
+        pass
+    return url
+
+
 class AngelOneClient:
     """Wrapper around AngelOne SmartAPI for authentication and data retrieval."""
 
@@ -140,7 +155,16 @@ class AngelOneClient:
                 or settings.angelone_mpin
                 or settings.angelone_password
             )
-            self._smart_api = SmartConnect(api_key=api_key)
+            proxy_url = (creds.get("proxy_url") or "").strip()
+            proxies = None
+            if proxy_url:
+                proxies = {"http": proxy_url, "https": proxy_url}
+                logger.info("AngelOneClient routing via proxy %s", _mask_proxy(proxy_url))
+            try:
+                self._smart_api = SmartConnect(api_key=api_key, proxies=proxies)
+            except TypeError:
+                # Older smartapi-python versions don't accept 'proxies' kwarg
+                self._smart_api = SmartConnect(api_key=api_key)
             totp = pyotp.TOTP(totp_secret).now()
             data = self._smart_api.generateSession(
                 client_id,

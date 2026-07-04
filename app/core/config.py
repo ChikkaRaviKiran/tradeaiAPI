@@ -252,6 +252,17 @@ class Settings(BaseSettings):
         default=5.0, alias="ACCOUNT_KILL_SWITCH_POLL_SECONDS",
     )
 
+    # ── AWS Lightsail (per-account proxy provisioning) ─────────────
+    # When these are set, creating a broker account triggers a background
+    # Lightsail Nano ($5/mo) provisioning that gives that account its own
+    # outbound IP. Required for running >1 Kite/Angel account on the same
+    # main server (both brokers whitelist a single IP per app/api_key).
+    aws_access_key_id: str = Field(default="", alias="AWS_ACCESS_KEY_ID")
+    aws_secret_access_key: str = Field(default="", alias="AWS_SECRET_ACCESS_KEY")
+    aws_region: str = Field(default="ap-south-1", alias="AWS_REGION")
+    # Main server public IP — proxy firewalls lock inbound to only this IP.
+    main_server_ip: str = Field(default="", alias="MAIN_SERVER_IP")
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_active_instrument_list(self) -> list[str]:

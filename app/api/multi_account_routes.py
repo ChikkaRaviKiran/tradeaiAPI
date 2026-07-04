@@ -23,10 +23,11 @@ Strategy Instances
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import select
@@ -76,6 +77,18 @@ _VALID_TRADING_DAYS = {
 }
 
 
+def _compute_proxy_status(a: BrokerAccount) -> str:
+    """Match OptionSelling's proxy_status contract (active/provisioning/not_needed/none).
+    Dhan doesn't strictly require a proxy — but we still allow one, so we
+    never return 'not_needed' here; we simply say 'none' when no proxy is set.
+    """
+    if a.proxy_ip:
+        return "active"
+    if a.proxy_instance_name:
+        return "provisioning"
+    return "none"
+
+
 def _account_to_dict(a: BrokerAccount) -> dict[str, Any]:
     return {
         "id": a.id,
@@ -97,6 +110,7 @@ def _account_to_dict(a: BrokerAccount) -> dict[str, Any]:
         "proxy_url": a.proxy_url or "",
         "proxy_ip": a.proxy_ip or "",
         "proxy_instance_name": a.proxy_instance_name or "",
+        "proxy_status": _compute_proxy_status(a),
         "available_funds": a.available_funds or 0.0,
         "used_funds": a.used_funds or 0.0,
         "last_connection_status": a.last_connection_status or "unknown",
@@ -264,7 +278,29 @@ def register_multi_account_routes(app: FastAPI) -> None:
                     await _clear_other_data_feeds(s, keep_id=row.id)
             await s.refresh(row)
             _invalidate_broker_cache_safe(row.id)
-            return _account_to_dict(row)
+            new_id = row.id
+            result = _account_to_dict(row)
+
+        # Fire-and-forget proxy provisioning if AWS is configured and
+        # this broker benefits from a dedicated IP (Kite/Angel/Dhan all
+        # supported for IP isolation). Non-blocking — UI polls
+        # /api/proxy/status/{id} or the account list to watch progress.
+        try:
+            from app.core.config import settings as _s
+            if _s.aws_access_key_id and _s.aws_secret_access_key and not row.proxy_url:
+                # Mark as provisioning immediately so proxy_status='provisioning'
+                # shows up in the UI before AWS finishes.
+                async with AsyncSessionLocal() as s2:
+                    async with s2.begin():
+                        r2 = await s2.get(BrokerAccount, new_id)
+                        if r2 is not None and not r2.proxy_instance_name:
+                            r2.proxy_instance_name = f"tradeai-proxy-{new_id}"
+                asyncio.create_task(_provision_proxy_background(new_id))
+                result["proxy_provisioning"] = True
+                result["proxy_status"] = "provisioning"
+        except Exception:
+            logger.debug("proxy auto-provision skipped", exc_info=True)
+        return result
 
     @app.put("/api/accounts/{account_id}")
     async def update_account(account_id: int, body: dict) -> dict[str, Any]:
@@ -333,6 +369,14 @@ def register_multi_account_routes(app: FastAPI) -> None:
                 await s.delete(row)
             _invalidate_broker_cache_safe(account_id)
             _invalidate_settings_cache_safe()
+            # Best-effort delete of the Lightsail proxy instance.
+            try:
+                from app.core.config import settings as _s
+                if _s.aws_access_key_id and _s.aws_secret_access_key:
+                    from app.infra.proxy_manager import proxy_manager
+                    await asyncio.to_thread(proxy_manager.delete_proxy, account_id)
+            except Exception:
+                logger.exception("Failed to delete Lightsail proxy for account %s", account_id)
             return {"ok": True, "id": account_id, "detached_instances": len(instances)}
 
     @app.post("/api/accounts/{account_id}/set-primary")
@@ -378,6 +422,98 @@ def register_multi_account_routes(app: FastAPI) -> None:
                 row.last_connected_at = datetime.utcnow() if status == "connected" else row.last_connected_at
             await s.refresh(row)
             return {"ok": status == "connected", "status": status, "detail": detail, "account": _account_to_dict(row)}
+
+    # ---- Proxy management (Lightsail SOCKS5) ----------------------------
+    # Mirrors OptionSelling's endpoints. Returns {"status":"ok"|"error", ...}
+    # instead of raising HTTPException so the UI can reuse the same handlers.
+
+    @app.get("/api/proxy/list")
+    async def list_proxies() -> dict[str, Any]:
+        from app.core.config import settings as _s
+        if not _s.aws_access_key_id:
+            return {"status": "ok", "proxies": [], "message": "AWS not configured"}
+        try:
+            from app.infra.proxy_manager import proxy_manager
+            proxies = await asyncio.to_thread(proxy_manager.list_proxies)
+            return {"status": "ok", "proxies": proxies}
+        except Exception:
+            logger.exception("Failed to list proxies")
+            return {"status": "error", "message": "Failed to list proxies"}
+
+    @app.get("/api/proxy/status/{account_id}")
+    async def get_proxy_status(account_id: int) -> dict[str, Any]:
+        from app.core.config import settings as _s
+        if not _s.aws_access_key_id:
+            return {"status": "error", "message": "AWS not configured"}
+        try:
+            from app.infra.proxy_manager import proxy_manager
+            result = await asyncio.to_thread(proxy_manager.get_status, account_id)
+            return {"status": "ok", **result}
+        except Exception:
+            logger.exception("Failed to get proxy status")
+            return {"status": "error", "message": "Failed to get proxy status"}
+
+    @app.post("/api/proxy/provision/{account_id}")
+    async def provision_proxy(account_id: int) -> dict[str, Any]:
+        """(Re)provision the Lightsail proxy for an account and persist it.
+        Blocks until AWS reports the IP so the caller sees it immediately.
+        """
+        from app.core.config import settings as _s
+        if not _s.aws_access_key_id:
+            return {"status": "error", "message": "AWS not configured"}
+        try:
+            from app.infra.proxy_manager import proxy_manager
+            result = await asyncio.to_thread(proxy_manager.create_proxy, account_id)
+            proxy_url = result.get("proxy_url", "")
+            proxy_ip = result.get("public_ip", "")
+            proxy_instance_name = result.get("instance_name", "")
+            broker = ""
+            async with AsyncSessionLocal() as s:
+                async with s.begin():
+                    row = await s.get(BrokerAccount, account_id)
+                    if row is not None:
+                        row.proxy_url = proxy_url
+                        row.proxy_ip = proxy_ip
+                        row.proxy_instance_name = proxy_instance_name
+                        broker = row.broker or ""
+            _invalidate_broker_cache_safe(account_id)
+            whitelist_target = (
+                "Kite Connect developer console" if broker == "kite"
+                else "SmartAPI portal" if broker == "angel"
+                else "broker console"
+            )
+            return {
+                "status": "ok",
+                "proxy_ip": proxy_ip,
+                "message": (
+                    f"Proxy provisioned — whitelist IP {proxy_ip} in {whitelist_target}"
+                    + (" and re-do OAuth login" if broker == "kite" else "")
+                ),
+            }
+        except Exception:
+            logger.exception("Failed to provision proxy")
+            return {"status": "error", "message": "Failed to provision proxy"}
+
+    @app.delete("/api/proxy/{account_id}")
+    async def delete_proxy_endpoint(account_id: int) -> dict[str, Any]:
+        from app.core.config import settings as _s
+        if not _s.aws_access_key_id:
+            return {"status": "error", "message": "AWS not configured"}
+        try:
+            from app.infra.proxy_manager import proxy_manager
+            await asyncio.to_thread(proxy_manager.delete_proxy, account_id)
+            async with AsyncSessionLocal() as s:
+                async with s.begin():
+                    row = await s.get(BrokerAccount, account_id)
+                    if row is not None:
+                        row.proxy_url = ""
+                        row.proxy_ip = ""
+                        row.proxy_instance_name = ""
+            _invalidate_broker_cache_safe(account_id)
+            return {"status": "ok", "message": "Proxy deleted"}
+        except Exception:
+            logger.exception("Failed to delete proxy")
+            return {"status": "error", "message": "Failed to delete proxy"}
 
     # ---- StrategyInstance CRUD ------------------------------------------
 
@@ -571,6 +707,47 @@ def _normalize_instance_payload(body: dict) -> dict[str, Any]:
         "display_name": _clean_str(body.get("display_name")),
         "params_json": params_json or None,
     }
+
+
+def _require_aws_configured() -> None:
+    """Kept for internal helpers only — not raised from user-facing endpoints.
+    Public /api/proxy/* endpoints follow OptionSelling's pattern of returning
+    {'status': 'error', 'message': ...} instead of raising HTTPException.
+    """
+    from app.core.config import settings as _s
+    if not (_s.aws_access_key_id and _s.aws_secret_access_key):
+        raise RuntimeError("AWS credentials not configured")
+
+
+async def _provision_proxy_background(account_id: int) -> None:
+    """Provision a Lightsail SOCKS5 proxy for the given account and persist
+    the resulting proxy_url / proxy_ip / proxy_instance_name back onto the
+    BrokerAccount row. Safe to call from asyncio.create_task — catches
+    everything so a failed provision never crashes the request handler.
+    """
+    try:
+        from app.infra.proxy_manager import proxy_manager
+        logger.info("[Proxy] Provisioning proxy for account %s ...", account_id)
+        info = await asyncio.to_thread(proxy_manager.create_proxy, account_id)
+        proxy_url = info.get("proxy_url") or ""
+        public_ip = info.get("public_ip") or ""
+        name = info.get("instance_name") or ""
+        async with AsyncSessionLocal() as s:
+            async with s.begin():
+                row = await s.get(BrokerAccount, account_id)
+                if row is None:
+                    logger.warning("[Proxy] Account %s vanished before proxy could be saved", account_id)
+                    return
+                if proxy_url:
+                    row.proxy_url = proxy_url
+                if public_ip:
+                    row.proxy_ip = public_ip
+                if name:
+                    row.proxy_instance_name = name
+        _invalidate_broker_cache_safe(account_id)
+        logger.info("[Proxy] Account %s provisioned -> ip=%s", account_id, public_ip)
+    except Exception:
+        logger.exception("[Proxy] Provisioning failed for account %s", account_id)
 
 
 async def _probe_broker(broker: str) -> tuple[str, str]:

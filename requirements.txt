@@ -46,6 +46,9 @@ websockets>=13.0
 # SOCKS5 proxy support for `requests` (used by Kite client when KITE_PROXY_URL is set)
 PySocks==1.7.1
 
+# AWS Lightsail — per-account proxy provisioning for multi-broker isolation
+boto3>=1.34.0
+
 # Scheduling
 apscheduler==3.10.4
 
