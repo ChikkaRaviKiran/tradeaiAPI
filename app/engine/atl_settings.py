@@ -192,70 +192,96 @@ def make_instance_settings_loader(instance_id: int):
 
 
 def _load_instance_from_db_sync(instance_id: int) -> dict[str, Any] | None:
-    """Fetch a specific StrategyInstance row → ATL settings dict."""
-    import asyncio
+    """Fetch a specific StrategyInstance row → ATL settings dict.
 
-    async def _q() -> dict[str, Any] | None:
-        from sqlalchemy import select
-        from app.db.account_models import BrokerAccount, StrategyInstance
-        from app.db.models import AsyncSessionLocal
-
-        async with AsyncSessionLocal() as s:
-            row = await s.get(StrategyInstance, instance_id)
-            if row is None:
-                return None
-            account_label = "Primary"
-            if row.account_id is not None:
-                acct = await s.get(BrokerAccount, row.account_id)
-                if acct is not None:
-                    account_label = (
-                        f"Paper" if acct.paper_trading
-                        else f"Live ({acct.broker.title()})"
-                    )
-            return {
-                "enabled": bool(row.is_active),
-                "strategy_type": "ATM_STRADDLE",
-                "index": row.index,
-                "trading_day": row.trading_day,
-                "entry_time": row.entry_time,
-                "exit_time": row.exit_time,
-                "strike_mode": row.strike_mode,
-                "otm_strikes": row.otm_strikes,
-                "static_legs": bool(row.static_legs),
-                "lots": row.lots,
-                "strike_interval": row.strike_interval,
-                "rolling_points": row.rolling_points,
-                "adjustment_points": row.adjustment_points,
-                "sl_type": row.sl_type,
-                "sl_lower": row.sl_lower or 0,
-                "sl_upper": row.sl_upper or 0,
-                "first_straddle_sl_pct": row.first_straddle_sl_pct,
-                "reform_straddle_sl_pct": row.reform_straddle_sl_pct,
-                "hedge_mode": row.hedge_mode,
-                "hedge_premium": row.hedge_premium or 3,
-                "hedge_otm_points": row.hedge_otm_points or 500,
-                "hedge_lots": row.hedge_lots,
-                "execution_account": account_label,
-                "_source": "db",
-                "_instance_id": row.id,
-                "_account_id": row.account_id,
-            }
-
+    Uses a plain sync SQLAlchemy engine (built from the app's async
+    URL with ``+asyncpg`` stripped) so it works from inside the scanner's
+    running event loop without the ``asyncio.run`` + ThreadPoolExecutor
+    dance.  That dance would spin up a fresh asyncpg pool per call and
+    was observed to intermittently fail for one instance while
+    succeeding for another spawned in the same cycle, causing the
+    loader to silently fall back to defaults (``enabled=False``) — so
+    the NIFTY OTM STRANGLE instance idled every cycle while SENSEX ATM
+    STRADDLE placed orders correctly.
+    """
     try:
+        from sqlalchemy import create_engine, text
+        from app.core.config import settings
+
+        url = (
+            settings.database_url
+            .replace("postgresql+asyncpg://", "postgresql://")
+            .replace("sqlite+aiosqlite://", "sqlite://")
+        )
+        engine = create_engine(url, pool_pre_ping=True)
         try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(_q())
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        'SELECT id, account_id, "index", trading_day, '
+                        "entry_time, exit_time, lots, strike_interval, "
+                        "strike_mode, otm_strikes, static_legs, "
+                        "adjustment_points, rolling_points, sl_type, "
+                        "sl_lower, sl_upper, first_straddle_sl_pct, "
+                        "reform_straddle_sl_pct, hedge_mode, hedge_premium, "
+                        "hedge_otm_points, hedge_lots, is_active "
+                        "FROM strategy_instances WHERE id = :iid"
+                    ),
+                    {"iid": int(instance_id)},
+                ).mappings().first()
+                if row is None:
+                    return None
 
-        import concurrent.futures
+                account_label = "Primary"
+                account_id = row["account_id"]
+                if account_id is not None:
+                    acct = conn.execute(
+                        text(
+                            "SELECT broker, paper_trading FROM broker_accounts "
+                            "WHERE id = :aid"
+                        ),
+                        {"aid": int(account_id)},
+                    ).mappings().first()
+                    if acct is not None:
+                        account_label = (
+                            "Paper" if acct["paper_trading"]
+                            else f"Live ({(acct['broker'] or '').title()})"
+                        )
+        finally:
+            engine.dispose()
 
-        def _runner() -> dict[str, Any] | None:
-            return asyncio.run(_q())
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            return ex.submit(_runner).result(timeout=5)
+        return {
+            "enabled": bool(row["is_active"]),
+            "strategy_type": "ATM_STRADDLE",
+            "index": row["index"],
+            "trading_day": row["trading_day"],
+            "entry_time": row["entry_time"],
+            "exit_time": row["exit_time"],
+            "strike_mode": row["strike_mode"],
+            "otm_strikes": row["otm_strikes"],
+            "static_legs": bool(row["static_legs"]),
+            "lots": row["lots"],
+            "strike_interval": row["strike_interval"],
+            "rolling_points": row["rolling_points"],
+            "adjustment_points": row["adjustment_points"],
+            "sl_type": row["sl_type"],
+            "sl_lower": row["sl_lower"] or 0,
+            "sl_upper": row["sl_upper"] or 0,
+            "first_straddle_sl_pct": row["first_straddle_sl_pct"],
+            "reform_straddle_sl_pct": row["reform_straddle_sl_pct"],
+            "hedge_mode": row["hedge_mode"],
+            "hedge_premium": row["hedge_premium"] or 3,
+            "hedge_otm_points": row["hedge_otm_points"] or 500,
+            "hedge_lots": row["hedge_lots"],
+            "execution_account": account_label,
+            "_source": "db",
+            "_instance_id": row["id"],
+            "_account_id": account_id,
+        }
     except Exception:
-        logger.debug("Per-instance settings load failed for id=%s", instance_id, exc_info=True)
+        logger.warning(
+            "Per-instance settings load failed for id=%s", instance_id, exc_info=True,
+        )
         return None
 
 
