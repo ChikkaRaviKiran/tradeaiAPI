@@ -1766,9 +1766,23 @@ class Orchestrator:
                         self.atl_straddle_scanner = primary
                     for sc in registry_scanners:
                         try:
+                            # Registry-managed instances are bound to
+                            # their own dedicated broker account (via
+                            # account_id on the StrategyInstance row),
+                            # so they don't share order flow with the
+                            # legacy single-account MD / MDB / PDH
+                            # scanners.  Do NOT gate them on the shared
+                            # peer_in_trade flag — that mutex was
+                            # designed for the single-scanner
+                            # deployment where all scanners share one
+                            # account.  Blocking here means a stray
+                            # PDH/PDL trade indefinitely prevents the
+                            # user's per-account ATM straddle /
+                            # strangle from firing at its scheduled
+                            # entry_time.
                             await sc.run_cycle(
                                 df_today, instrument, cycle,
-                                peer_in_trade=atl_peer_in_trade,
+                                peer_in_trade=False,
                             )
                         except Exception:
                             logger.exception(
