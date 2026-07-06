@@ -35,9 +35,15 @@ from typing import Any, Callable, Optional
 
 from app.engine.atl_settings import make_instance_settings_loader
 from app.engine.atl_straddle_scanner import ATLStraddleScanner
-from app.execution.broker_factory import build_broker_from_account_id
+from app.execution.broker_factory import (
+    build_broker_from_account_id,
+    build_broker_from_account_id_async,
+)
 
 logger = logging.getLogger(__name__)
+
+# Sentinel for optional broker override on _spawn().
+_UNSET: Any = object()
 
 
 class StrategyInstanceRegistry:
@@ -76,8 +82,22 @@ class StrategyInstanceRegistry:
 
         Returns ``(created, updated, dropped)`` counts for diagnostics.
         Best-effort — logs and continues on any per-row failure.
+
+        If the DB fetch errors out (returns ``None``) we abort the sync
+        entirely and leave the current fleet intact.  Blindly dropping
+        every scanner on a transient asyncpg race — as the previous
+        implementation did when the fetch returned an empty list on
+        error — silently deleted per-instance state files and any
+        legs those scanners were tracking mid-day.
         """
         rows = await _fetch_active_instances()
+        if rows is None:
+            logger.warning(
+                "[Registry] sync_from_db skipped: DB fetch failed. "
+                "Keeping %d active scanner(s) as-is.",
+                len(self._scanners),
+            )
+            return (0, 0, 0)
         wanted_ids = {r["id"] for r in rows}
 
         created = 0
@@ -103,7 +123,11 @@ class StrategyInstanceRegistry:
             existing = self._scanners.get(iid)
             if existing is None:
                 try:
-                    self._spawn(iid, account_id, broker_name)
+                    # Async broker resolution: avoids the sync-in-async
+                    # asyncpg race that intermittently returned None on
+                    # the first call and left the scanner with broker=None.
+                    broker = await self._resolve_broker_async(account_id, broker_name)
+                    self._spawn(iid, account_id, broker_name, broker=broker)
                     self._binding[iid] = new_binding
                     created += 1
                 except Exception:
@@ -114,7 +138,7 @@ class StrategyInstanceRegistry:
             # account's credentials/broker changed.
             if self._binding.get(iid) != new_binding:
                 try:
-                    existing.broker = self._resolve_broker(account_id, broker_name)
+                    existing.broker = await self._resolve_broker_async(account_id, broker_name)
                     self._binding[iid] = new_binding
                     updated += 1
                     logger.info(
@@ -132,8 +156,19 @@ class StrategyInstanceRegistry:
             )
         return created, updated, dropped
 
-    def _spawn(self, instance_id: int, account_id: Optional[int], broker_name: Optional[str]) -> None:
-        broker = self._resolve_broker(account_id, broker_name)
+    def _spawn(
+        self,
+        instance_id: int,
+        account_id: Optional[int],
+        broker_name: Optional[str],
+        *,
+        broker: Any = _UNSET,
+    ) -> None:
+        # If the caller already resolved the broker asynchronously, use
+        # that — otherwise fall back to the legacy sync resolver so this
+        # method still works from tests / callers that don't await.
+        if broker is _UNSET:
+            broker = self._resolve_broker(account_id, broker_name)
         loader = make_instance_settings_loader(instance_id)
         scanner = ATLStraddleScanner(
             client=self._client,
@@ -151,7 +186,12 @@ class StrategyInstanceRegistry:
         )
 
     def _resolve_broker(self, account_id: Optional[int], broker_name: Optional[str]) -> Any:
-        """Return the broker for an instance.
+        """Return the broker for an instance (sync path).
+
+        Prefer :meth:`_resolve_broker_async` when called from an event
+        loop — the sync fetch spawns a background thread + fresh asyncpg
+        pool and has been observed to intermittently return None on the
+        first call under concurrent load, leaving the scanner unbound.
 
         When ``account_id`` is bound: MUST use the per-account broker built
         from that row's own credentials + proxy. If the factory can't build
@@ -166,6 +206,28 @@ class StrategyInstanceRegistry:
         """
         if account_id:
             broker = build_broker_from_account_id(account_id)
+            if broker is not None:
+                return broker
+            logger.error(
+                "[Registry] Cannot build account-scoped broker for "
+                "account_id=%s broker=%s — check that access_token / "
+                "credentials are set on the account row. Refusing to fall "
+                "back to env-based broker (would use wrong creds and skip "
+                "the account's proxy).",
+                account_id, broker_name,
+            )
+            return None
+        return self._broker_factory(broker_name)
+
+    async def _resolve_broker_async(
+        self, account_id: Optional[int], broker_name: Optional[str],
+    ) -> Any:
+        """Async variant of :meth:`_resolve_broker` — uses the shared
+        ``AsyncSessionLocal`` pool via ``build_broker_from_account_id_async``
+        to avoid the sync-in-async race that returned None intermittently.
+        """
+        if account_id:
+            broker = await build_broker_from_account_id_async(account_id)
             if broker is not None:
                 return broker
             logger.error(
@@ -202,9 +264,17 @@ def _state_path_for_instance(instance_id: int) -> str:
     return _atl_state_path(instance_id)
 
 
-async def _fetch_active_instances() -> list[dict]:
+async def _fetch_active_instances() -> list[dict] | None:
     """Return active ATM_STRADDLE / OTM_STRANGLE instances with their
-    bound broker name (if any).  Never raises — returns [] on any error.
+    bound broker name (if any).
+
+    Returns ``None`` on ANY error (DB timeout, asyncpg concurrency race,
+    missing table etc.) so callers can distinguish "legitimately no active
+    instances" (``[]``) from "couldn't reach DB" (``None``) and avoid
+    dropping the entire live scanner fleet on a transient blip.  Returning
+    ``[]`` here previously caused ``sync_from_db`` to treat every active
+    scanner as stale and delete it (along with its state file), so any
+    open leg lost its per-instance tracking.
     """
     try:
         from sqlalchemy import select
@@ -244,5 +314,5 @@ async def _fetch_active_instances() -> list[dict]:
                 for r in rows
             ]
     except Exception:
-        logger.debug("_fetch_active_instances failed", exc_info=True)
-        return []
+        logger.warning("_fetch_active_instances failed — keeping current scanner fleet", exc_info=True)
+        return None

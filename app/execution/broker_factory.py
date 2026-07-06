@@ -50,6 +50,33 @@ def build_broker_from_account_id(account_id: int) -> Optional[BaseBroker]:
     return _build_from_row(row)
 
 
+def build_broker_from_row(row: Optional[dict]) -> Optional[BaseBroker]:
+    """Public: build a broker from a pre-fetched BrokerAccount dict.
+
+    Prefer this over ``build_broker_from_account_id`` when the caller is
+    already in an async context and has the row on hand — it avoids the
+    sync-in-async ``_fetch_account_row_sync`` shim (which can transiently
+    return None under asyncpg concurrency).
+    """
+    if not row:
+        return None
+    return _build_from_row(row)
+
+
+async def build_broker_from_account_id_async(account_id: int) -> Optional[BaseBroker]:
+    """Async variant of ``build_broker_from_account_id`` — fetches the
+    row through the shared async session (safe under concurrent loads)
+    and then builds the broker.
+    """
+    if not account_id:
+        return None
+    row = await _fetch_account_row_async(int(account_id))
+    if row is None:
+        logger.warning("[BrokerFactory] account_id=%s not found (async)", account_id)
+        return None
+    return _build_from_row(row)
+
+
 def invalidate_account_cache(account_id: Optional[int] = None) -> None:
     """Drop cached brokers. Called after credential UI saves."""
     with _cache_lock:
@@ -209,3 +236,42 @@ def _fetch_account_row_sync(account_id: int) -> Optional[dict]:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             fut = ex.submit(_run_in_thread)
             return fut.result(timeout=15)
+
+
+async def _fetch_account_row_async(account_id: int) -> Optional[dict]:
+    """Async variant of ``_fetch_account_row_sync`` for callers that
+    are already inside an event loop (registry sync, etc.).  Reuses the
+    app's shared ``AsyncSessionLocal`` pool so we don't spawn a new
+    background thread + asyncpg pool per call.
+    """
+    try:
+        from sqlalchemy import select
+        from app.db.account_models import BrokerAccount
+        from app.db.models import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as s:
+            row = (
+                await s.execute(
+                    select(BrokerAccount).where(BrokerAccount.id == account_id)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "name": row.name,
+                "broker": row.broker,
+                "client_id": row.client_id,
+                "api_key": row.api_key,
+                "api_secret": row.api_secret,
+                "password": row.password,
+                "mpin": row.mpin,
+                "totp_secret": row.totp_secret,
+                "access_token": row.access_token,
+                "refresh_token": row.refresh_token,
+                "proxy_url": row.proxy_url,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+            }
+    except Exception:
+        logger.warning("_fetch_account_row_async failed for account %s", account_id, exc_info=True)
+        return None
