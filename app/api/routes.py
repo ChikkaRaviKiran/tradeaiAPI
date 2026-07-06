@@ -308,6 +308,28 @@ def _rearm_scanners_for_today() -> None:
         except Exception:
             logger.exception("Failed to re-arm ATM")
 
+    # Per-instance registry scanners — the legacy alias above only
+    # points at the "primary" instance, so without this loop only ONE
+    # of the user's per-account strategies would actually be re-armed.
+    # We call ``reset_halt`` on each so that (a) the circuit breaker is
+    # cleared, (b) the in-memory ``entered``/``phase``/leg state is
+    # wiped, and (c) the settings-change ``future_rearm_blocked`` guard
+    # in run_cycle() no longer fires — letting the scanner attempt a
+    # fresh entry when its ``entry_time`` is reached.
+    registry = getattr(orch, "strategy_registry", None)
+    if registry is not None:
+        try:
+            scanners = list(registry.scanners.items())
+        except Exception:
+            scanners = []
+        for iid, sc in scanners:
+            try:
+                sc.reset_halt()
+            except Exception:
+                logger.exception(
+                    "Failed to re-arm registry scanner instance %s", iid,
+                )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
