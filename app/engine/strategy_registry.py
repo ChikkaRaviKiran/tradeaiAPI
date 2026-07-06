@@ -151,18 +151,32 @@ class StrategyInstanceRegistry:
         )
 
     def _resolve_broker(self, account_id: Optional[int], broker_name: Optional[str]) -> Any:
-        """Prefer an account-scoped broker (real per-account credentials).
-        Fall back to the legacy env-based broker factory when no account
-        is bound or the factory can't build the account (missing creds).
+        """Return the broker for an instance.
+
+        When ``account_id`` is bound: MUST use the per-account broker built
+        from that row's own credentials + proxy. If the factory can't build
+        one (missing access_token, expired creds, unknown broker), we
+        return ``None`` — the scanner then records an ``order_error`` and
+        skips placement instead of silently routing through the shared env
+        credentials, which was the root cause of "orders never placed"
+        when a Dhan account was created without an access_token.
+
+        When ``account_id`` is unbound: fall back to the legacy env-based
+        factory (single-account deployments).
         """
         if account_id:
             broker = build_broker_from_account_id(account_id)
             if broker is not None:
                 return broker
-            logger.warning(
-                "[Registry] Falling back to env-based broker for account_id=%s "
-                "(factory returned None)", account_id,
+            logger.error(
+                "[Registry] Cannot build account-scoped broker for "
+                "account_id=%s broker=%s — check that access_token / "
+                "credentials are set on the account row. Refusing to fall "
+                "back to env-based broker (would use wrong creds and skip "
+                "the account's proxy).",
+                account_id, broker_name,
             )
+            return None
         return self._broker_factory(broker_name)
 
     def _drop(self, instance_id: int) -> None:

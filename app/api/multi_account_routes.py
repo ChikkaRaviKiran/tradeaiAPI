@@ -405,14 +405,27 @@ def register_multi_account_routes(app: FastAPI) -> None:
 
     @app.post("/api/accounts/{account_id}/test")
     async def test_account(account_id: int) -> dict[str, Any]:
-        """Best-effort connectivity probe. Records result on the row."""
+        """Best-effort connectivity probe using THIS account's own
+        credentials (not the process-wide env vars). Records result on
+        the row so the Settings UI reflects the true state.
+        """
         async with AsyncSessionLocal() as s:
             row = await s.get(BrokerAccount, account_id)
             if row is None:
                 raise HTTPException(status_code=404, detail="Account not found")
-            broker = row.broker
+            creds = {
+                "broker": (row.broker or "").lower(),
+                "client_id": row.client_id or "",
+                "api_key": row.api_key or "",
+                "api_secret": row.api_secret or "",
+                "password": row.password or "",
+                "mpin": row.mpin or "",
+                "totp_secret": row.totp_secret or "",
+                "access_token": row.access_token or "",
+                "proxy_url": row.proxy_url or "",
+            }
 
-        status, detail = await _probe_broker(broker)
+        status, detail = await _probe_broker_account(creds)
 
         async with AsyncSessionLocal() as s:
             async with s.begin():
@@ -750,13 +763,31 @@ async def _provision_proxy_background(account_id: int) -> None:
         logger.exception("[Proxy] Provisioning failed for account %s", account_id)
 
 
-async def _probe_broker(broker: str) -> tuple[str, str]:
-    """Best-effort broker health probe.
+async def _probe_broker_account(creds: dict) -> tuple[str, str]:
+    """Best-effort broker health probe using THIS account's own credentials.
 
-    Reuses the same authentication paths already exercised by the
-    per-broker ``/api/broker/*/status`` and ``/api/broker/test``
-    endpoints, so the result matches what the BrokerSettings page shows.
-    Never raises — always returns (status, human_readable_detail).
+    Unlike the legacy ``_probe_broker(broker)`` (which read process env
+    vars and lied to the UI when the account row was missing creds),
+    this uses the DB row's own client_id / access_token / proxy_url so
+    the "Connected" pill in Settings actually reflects whether THIS
+    account can trade. Never raises.
+    """
+    broker = (creds.get("broker") or "").lower()
+    try:
+        if broker == "angel":
+            return await _probe_angel_account(creds)
+        if broker == "kite":
+            return await _probe_kite_account(creds)
+        if broker == "dhan":
+            return await _probe_dhan_account(creds)
+    except Exception as exc:
+        return "error", f"{type(exc).__name__}: {exc}"
+    return "unknown", f"No probe implemented for broker '{broker}'"
+
+
+async def _probe_broker(broker: str) -> tuple[str, str]:
+    """Legacy env-based probe. Retained only so any external caller that
+    imports this name keeps working. Prefer ``_probe_broker_account``.
     """
     try:
         if broker == "angel":
@@ -768,6 +799,98 @@ async def _probe_broker(broker: str) -> tuple[str, str]:
     except Exception as exc:
         return "error", f"{type(exc).__name__}: {exc}"
     return "unknown", "No probe implemented"
+
+
+async def _probe_angel_account(creds: dict) -> tuple[str, str]:
+    api_key = creds.get("api_key") or ""
+    client_id = creds.get("client_id") or ""
+    credential = creds.get("mpin") or creds.get("password") or ""
+    totp_secret = creds.get("totp_secret") or ""
+
+    if not api_key:
+        return "disconnected", "api_key not set on this account"
+    if not client_id:
+        return "disconnected", "client_id not set on this account"
+    if not credential:
+        return "disconnected", "mpin / password not set on this account"
+    if not totp_secret:
+        return "disconnected", "totp_secret not set on this account"
+
+    try:
+        import pyotp
+        from SmartApi import SmartConnect
+
+        def _sync_login() -> tuple[str, str]:
+            smart_api = SmartConnect(api_key=api_key)
+            totp = pyotp.TOTP(totp_secret).now()
+            data = smart_api.generateSession(client_id, credential, totp)
+            if not data or data.get("status") is False:
+                msg = (data or {}).get("message", "Unknown error")
+                code = (data or {}).get("errorcode", "")
+                return "error", f"{msg} (code: {code})" if code else msg
+            return "connected", "AngelOne authenticated OK"
+
+        import asyncio
+        return await asyncio.to_thread(_sync_login)
+    except Exception as exc:
+        return "error", f"{type(exc).__name__}: {exc}"
+
+
+async def _probe_kite_account(creds: dict) -> tuple[str, str]:
+    api_key = creds.get("api_key") or ""
+    access_token = creds.get("access_token") or ""
+    proxy_url = creds.get("proxy_url") or ""
+    if not api_key:
+        return "disconnected", "api_key not set on this account"
+    if not access_token:
+        return "disconnected", "access_token not set on this account (Kite OAuth required daily)"
+
+    try:
+        from app.data.kite_client import KiteClient
+        client = KiteClient(
+            api_key=api_key,
+            access_token=access_token,
+            proxy_url=proxy_url or None,
+        )
+        profile = None
+        if hasattr(client, "get_profile"):
+            profile = await client.get_profile() if _is_coro(client.get_profile) else _to_coro(client.get_profile)
+        return "connected", f"Kite OK ({(profile or {}).get('user_id', 'unknown user')})"
+    except Exception as exc:
+        return "error", f"{type(exc).__name__}: {exc}"
+
+
+async def _probe_dhan_account(creds: dict) -> tuple[str, str]:
+    client_id = creds.get("client_id") or ""
+    access_token = creds.get("access_token") or ""
+    proxy_url = creds.get("proxy_url") or ""
+    if not client_id:
+        return "disconnected", "client_id not set on this account"
+    if not access_token:
+        return (
+            "disconnected",
+            "access_token not set on this account — paste it from "
+            "web.dhan.co → Profile → DhanHQ Trading APIs (rotates periodically)",
+        )
+
+    try:
+        from app.data.dhan_client import DhanClient
+        client = DhanClient(
+            client_id=client_id,
+            access_token=access_token,
+            proxy_url=proxy_url,
+        )
+        # get_fund_limits is the lightest available probe and matches what
+        # DhanBroker.authenticate() uses, so this "Connected" verdict is
+        # exactly what the trading path will see.
+        import asyncio
+        data = await asyncio.to_thread(client.get_fund_limits)
+        if data:
+            avail = data.get("availabelBalance") or data.get("availableBalance") or "?"
+            return "connected", f"Dhan OK (available={avail})"
+        return "error", "get_fund_limits returned empty — token likely expired or IP not whitelisted"
+    except Exception as exc:
+        return "error", f"{type(exc).__name__}: {exc}"
 
 
 async def _probe_angel() -> tuple[str, str]:

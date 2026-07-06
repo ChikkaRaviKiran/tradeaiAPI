@@ -386,13 +386,28 @@ class ATLStraddleScanner:
           'Kite' / 'Live (Kite)' / case-insensitive variants → Kite
           'Dhan' / 'Live (Dhan)'                              → Dhan
           'Angel' / 'AngelOne' / 'Live (Angel)'              → AngelOne
-        Falls back to self.broker on any failure.
+
+        For per-instance scanners (``instance_id != None``), ``self.broker``
+        is already the account-scoped broker built from the bound
+        ``BrokerAccount`` row (correct credentials + proxy). We must trust
+        it verbatim — building a fresh env-based broker here would silently
+        route orders through the shared DHAN/KITE env credentials and skip
+        the account's Lightsail proxy, which was the root cause of "orders
+        never placed" after adding a new account.
         """
         raw = str(self._settings.get("execution_account", "Primary")).strip().lower()
         if raw in ("", "paper"):
             return None
         if raw in ("primary", "live (primary)"):
             return self.broker
+
+        # Per-instance scanner: NEVER create env-based brokers. Either use
+        # the account-scoped one the registry injected, or return None so
+        # ``_place_leg_order`` records an ``order_error`` and skips instead
+        # of routing through wrong creds.
+        if self.instance_id is not None:
+            return self.broker
+
         # Extract the broker token from labels like "live (kite)"
         token = raw
         if "(" in raw and ")" in raw:
@@ -419,11 +434,25 @@ class ATLStraddleScanner:
 
     def get_runtime_state(self) -> dict:
         st = self._state
+        # Advertise whether the account-scoped broker is actually attached.
+        # ``broker_ready=False`` on a live-mode instance is the smoking gun
+        # for "orders never placed" — the bound BrokerAccount row is missing
+        # credentials (typically Dhan access_token) so the registry couldn't
+        # build a real client.
+        broker_name = ""
+        try:
+            if self.broker is not None:
+                broker_name = getattr(self.broker, "name", "") or self.broker.__class__.__name__
+        except Exception:
+            broker_name = ""
         return {
             "enabled": bool(self._settings.get("enabled", False)),
             "live_mode": self._is_live(),
             "global_live": not bool(getattr(settings, "paper_trading", True)),
             "execution_account": self._settings.get("execution_account", "Primary"),
+            "broker_ready": self.broker is not None,
+            "broker_name": broker_name,
+            "instance_id": self.instance_id,
             "strategy_type": self._settings.get("strategy_type", "ATM_STRADDLE"),
             "phase": st.phase,
             "in_trade": self.is_in_trade(),
@@ -1714,6 +1743,22 @@ class ATLStraddleScanner:
             return await self._place_leg_order_via_broker(
                 instrument, leg, side, qty, reason, broker=broker,
             )
+
+        # Per-instance scanners (multi-account UI) MUST have an account-scoped
+        # broker attached. If it's missing, the bound BrokerAccount row is
+        # missing credentials (typically Dhan access_token). Refuse to fall
+        # through to the process-wide Angel client — that would place orders
+        # against the wrong account and skip the account's proxy.
+        if self.instance_id is not None:
+            acct = self._settings.get("execution_account", "Primary")
+            msg = (
+                f"{side} {leg.symbol} skipped — no broker for account "
+                f"'{acct}'. Check that access_token / credentials are set "
+                f"on the BrokerAccount row bound to this strategy."
+            )
+            logger.error("[ATL] %s", msg)
+            self._record_event("order_error", msg)
+            return False
 
         try:
             self.client.ensure_authenticated()

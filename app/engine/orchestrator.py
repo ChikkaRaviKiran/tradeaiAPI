@@ -2510,18 +2510,86 @@ class Orchestrator:
             proven strategies run during market hours.
         If False or no evaluation data available:
           - Falls back to ACTIVE_INSTRUMENTS from config.
+
+        Regardless of which base path is used, any index that has an
+        active user-configured ``StrategyInstance`` row is unioned into
+        the final list.  Without this the multi-strategy Settings UI
+        would silently drop indices the auto-selector didn't pick
+        (e.g. user creates a SENSEX straddle but the evaluator only
+        recommends NIFTY → SENSEX scanner exists in the registry but
+        is never dispatched, so no SENSEX orders are ever placed).
         """
         # Manual override: if auto-select is off, use config
         if not settings.auto_select_instruments:
-            return self._resolve_from_config()
+            base = self._resolve_from_config()
+        else:
+            # Auto-select from evaluation data
+            recs = self.eval_scheduler.latest_recommendations
+            if not recs:
+                logger.info("No evaluation data yet — falling back to config / defaults")
+                base = self._resolve_from_config()
+            else:
+                base = self._resolve_from_recommendations(recs)
+        return self._union_with_instance_indices(base)
 
-        # Auto-select from evaluation data
-        recs = self.eval_scheduler.latest_recommendations
-        if not recs:
-            logger.info("No evaluation data yet — falling back to config / defaults")
-            return self._resolve_from_config()
+    def _union_with_instance_indices(
+        self, base: list[InstrumentConfig],
+    ) -> list[InstrumentConfig]:
+        """Append any enabled ``StrategyInstance`` indices missing from
+        ``base``.  Uses a direct sync SQLAlchemy read so this works from
+        the sync ``_resolve_instruments`` call path without needing an
+        active event loop.  Failures fall back silently to ``base`` —
+        this is a widening step, never a filter.
+        """
+        try:
+            from sqlalchemy import create_engine, text
 
-        return self._resolve_from_recommendations(recs)
+            # Build a sync URL from the app's async URL (drop +asyncpg /
+            # +aiosqlite drivers so create_engine can pick the sync one).
+            url = (
+                settings.database_url
+                .replace("postgresql+asyncpg://", "postgresql://")
+                .replace("sqlite+aiosqlite://", "sqlite://")
+            )
+            engine = create_engine(url, pool_pre_ping=True)
+            with engine.connect() as conn:
+                rows = conn.execute(text(
+                    'SELECT DISTINCT "index" FROM strategy_instances '
+                    "WHERE is_active = true"
+                )).all()
+            engine.dispose()
+
+            inst_syms = {(r[0] or "").upper() for r in rows if r[0]}
+            existing_syms = {i.symbol for i in base}
+
+            added: list[InstrumentConfig] = []
+            for sym in sorted(inst_syms - existing_syms):
+                inst = get_instrument(sym)
+                if inst and inst.enabled:
+                    added.append(inst)
+                elif inst:
+                    logger.warning(
+                        "StrategyInstance references disabled instrument %s — "
+                        "enable it in app/core/instruments.py to trade",
+                        sym,
+                    )
+                else:
+                    logger.warning(
+                        "StrategyInstance references unknown instrument '%s' — skipping",
+                        sym,
+                    )
+
+            if added:
+                logger.info(
+                    "Instrument widening: base=%s + strategy_instances=%s → %s",
+                    [i.symbol for i in base],
+                    [i.symbol for i in added],
+                    [i.symbol for i in base + added],
+                )
+            return base + added
+        except Exception:
+            logger.debug("_union_with_instance_indices failed; using base list", exc_info=True)
+            return base
 
     def _resolve_from_config(self) -> list[InstrumentConfig]:
         """Resolve instruments from ACTIVE_INSTRUMENTS config."""

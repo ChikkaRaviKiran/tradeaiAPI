@@ -2458,6 +2458,94 @@ async def reset_atm():
     return {"ok": True, "message": "ATL scanner halt cleared"}
 
 
+@app.get("/api/atm/instances")
+async def get_atm_instances():
+    """Per-instance runtime state for every StrategyInstance the registry
+    is running. The legacy ``/api/atm/runtime`` only surfaces the primary
+    (first) scanner — so when a user has 2+ strategies bound to different
+    accounts / indices, the others are invisible in the UI and their
+    ``order_error`` events are hidden. This endpoint returns them all.
+
+    Always returns 200 with a stable shape so the UI can render even while
+    the orchestrator is still warming up.
+    """
+    orch = _state.get("orchestrator")
+    registry = getattr(orch, "strategy_registry", None) if orch else None
+    if registry is None or not registry.scanners:
+        return {"instances": []}
+    out = []
+    for iid, sc in sorted(registry.scanners.items()):
+        try:
+            rt = sc.get_runtime_state()
+        except Exception:
+            logger.exception("[ATL] runtime snapshot failed for instance %s", iid)
+            rt = {"error": "runtime snapshot failed"}
+        rt["instance_id"] = iid
+        out.append(rt)
+    return {"instances": out}
+
+
+@app.post("/api/atm/instances/{instance_id}/force-close")
+async def force_close_instance(instance_id: int):
+    """Force-close a specific instance's legs (not just the primary)."""
+    orch = _state.get("orchestrator")
+    registry = getattr(orch, "strategy_registry", None) if orch else None
+    scanner = registry.scanners.get(instance_id) if registry else None
+    if scanner is None:
+        raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
+    if not scanner.is_in_trade():
+        return {"ok": True, "message": "No open trade for this instance"}
+    df_today = None
+    instrument = None
+    try:
+        idx = (scanner._settings.get("index") or "NIFTY").upper()
+        for inst in getattr(orch, "_active_instruments", []) or []:
+            if inst.symbol == idx:
+                instrument = inst
+                df_today = getattr(orch, "_df_today_cache", {}).get(idx)
+                break
+    except Exception:
+        logger.exception("[ATL] force-close instance: could not assemble live frame")
+    if df_today is None or instrument is None:
+        raise HTTPException(status_code=409, detail=f"Live frame for {instance_id} index not available")
+    try:
+        await scanner.force_close(df_today, instrument)
+        return {"ok": True}
+    except Exception as exc:
+        logger.exception("[ATL] force_close for instance %s failed", instance_id)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/atm/instances/{instance_id}/place-now")
+async def place_now_instance(instance_id: int):
+    """Force a specific instance to attempt entry on its next cycle."""
+    orch = _state.get("orchestrator")
+    registry = getattr(orch, "strategy_registry", None) if orch else None
+    scanner = registry.scanners.get(instance_id) if registry else None
+    if scanner is None:
+        raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
+    try:
+        scanner.request_force_entry()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True, "message": f"Instance {instance_id} will attempt entry on next cycle"}
+
+
+@app.post("/api/atm/instances/{instance_id}/reset")
+async def reset_instance(instance_id: int):
+    """Clear the per-day circuit breaker for a specific instance."""
+    orch = _state.get("orchestrator")
+    registry = getattr(orch, "strategy_registry", None) if orch else None
+    scanner = registry.scanners.get(instance_id) if registry else None
+    if scanner is None:
+        raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
+    try:
+        scanner.reset_halt()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True, "message": f"Instance {instance_id} halt cleared"}
+
+
 # ── Research Multi-Index Straddle (new live modes) ────────────────────────
 # Single-index time-based mode keeps using the legacy /api/atm/* endpoints
 # above. Anything multi-index OR indicator-gated runs through this scanner.
