@@ -174,7 +174,7 @@ def _build_dhan(row: dict):
         access_token=access_token,
         proxy_url=row.get("proxy_url") or "",
     )
-    return DhanBroker(client=client)
+    return DhanBroker(client=client, account_id=int(row.get("id") or 0))
 
 
 def _fetch_account_row_sync(account_id: int) -> Optional[dict]:

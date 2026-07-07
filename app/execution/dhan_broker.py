@@ -106,7 +106,7 @@ def _supports_fresh_kw() -> bool:
 class DhanBroker(BaseBroker):
     """DhanHQ broker implementation."""
 
-    def __init__(self, client: Optional[DhanClient] = None) -> None:
+    def __init__(self, client: Optional[DhanClient] = None, account_id: int = 0) -> None:
         # When ``client`` is supplied (multi-account path) it is used
         # verbatim — the credential self-heal check is skipped, since
         # account-scoped clients must be rebuilt via a fresh factory call
@@ -121,6 +121,10 @@ class DhanBroker(BaseBroker):
         # ``True`` when this broker owns a per-account injected client and
         # must NOT auto-refresh from the shared credentials cache.
         self._account_scoped: bool = client is not None
+        # BrokerAccount.id this broker is bound to (0 = legacy env-based
+        # singleton). Passed into the kill-switch gate so only the tripped
+        # account's orders are blocked.
+        self._account_id: int = int(account_id or 0)
         if client is None:
             self._init_client()
 
@@ -282,6 +286,7 @@ class DhanBroker(BaseBroker):
             security_id=security_id,
             side=request.side.value,
             quantity=int(request.quantity),
+            account_id=self._account_id,
         )
         if not gate.allowed:
             logger.warning(
@@ -611,6 +616,15 @@ class DhanBroker(BaseBroker):
     def _resolve_security_id(self, request: OrderRequest, exchange: str) -> str:
         if not self._client:
             return ""
+
+        # Fast path: caller (manual exit from PositionsPage) already knows
+        # the broker-native securityId — use it as-is instead of trying to
+        # reparse the display trading_symbol (which for Dhan is formatted
+        # like ``NIFTY-Jul2026-24100-PE`` and never matches the Angel
+        # regex).
+        native = str(request.broker_security_id or "").strip()
+        if native and native.isdigit():
+            return native
 
         underlying = request.underlying or (
             request.instrument.option_symbol_prefix or request.instrument.symbol

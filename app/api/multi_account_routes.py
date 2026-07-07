@@ -113,6 +113,8 @@ def _account_to_dict(a: BrokerAccount) -> dict[str, Any]:
         "proxy_status": _compute_proxy_status(a),
         "available_funds": a.available_funds or 0.0,
         "used_funds": a.used_funds or 0.0,
+        "kill_switch_enabled": bool(a.kill_switch_enabled) if a.kill_switch_enabled is not None else True,
+        "daily_loss_limit": float(a.daily_loss_limit) if a.daily_loss_limit is not None else 6000.0,
         "last_connection_status": a.last_connection_status or "unknown",
         "last_connection_error": a.last_connection_error or "",
         "last_connected_at": a.last_connected_at.isoformat()

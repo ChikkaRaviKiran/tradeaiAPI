@@ -451,6 +451,9 @@ async def init_db() -> None:
             "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_url VARCHAR(300) DEFAULT ''",
             "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_ip VARCHAR(50) DEFAULT ''",
             "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_instance_name VARCHAR(100) DEFAULT ''",
+            # Per-account daily-loss kill switch
+            "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS kill_switch_enabled BOOLEAN NOT NULL DEFAULT TRUE",
+            "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS daily_loss_limit FLOAT NOT NULL DEFAULT 6000.0",
         ]
         for sql in migrations:
             try:

@@ -1,25 +1,33 @@
-"""Account-level daily-loss kill switch.
+"""Account-level daily-loss kill switch (per BrokerAccount).
 
 A background watchdog polls broker positions every few seconds and
 computes the total realised + unrealised PnL across **every** open
-position in the trading account (including ones placed manually
-through the broker's web/app). When PnL crosses below the configured
-loss limit:
+position for each active broker account (including ones placed
+manually through the broker's web/app). When PnL crosses below the
+per-account loss limit for a given account:
 
-* All open positions are force-closed via MARKET orders.
-* A process-wide ``_locked`` flag is set.
-* Every subsequent :py:meth:`DhanBroker.place_order` call is evaluated:
-  orders that REDUCE an existing position (squareoff / partial reduce)
-  are allowed; orders that open or grow a position are rejected.
+* Only THAT account's open positions are force-closed via MARKET orders.
+* A per-account ``locked`` flag is set.
+* Every subsequent :py:meth:`DhanBroker.place_order` call routed to that
+  account is evaluated: orders that REDUCE an existing position
+  (squareoff / partial reduce) are allowed; orders that open or grow a
+  position are rejected.
 
 The lock resets automatically at IST midnight and can be released
-manually via :py:func:`reset_kill_switch`.
+manually per-account via :py:func:`reset_kill_switch`.
 
 Profit side is intentionally uncapped.
 
-The watchdog only activates when ``TRADING_ACCOUNT=dhan`` because it
-depends on :py:class:`DhanClient.get_positions` for the per-position
-PnL feed. Adding Angel/Kite is a future extension.
+Multi-account
+-------------
+State is keyed by ``account_id`` (int). ``account_id == 0`` is reserved
+for the legacy env-based singleton used when ``TRADING_ACCOUNT=dhan``
+is set but no ``BrokerAccount`` rows exist. Real accounts use their DB
+primary key.
+
+Currently only Dhan is wired for the watchdog — Angel/Kite adapters
+don't yet expose a positions feed comparable to
+:py:meth:`DhanClient.get_positions`.
 """
 
 from __future__ import annotations
@@ -38,11 +46,17 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 _IST = pytz.timezone("Asia/Kolkata")
 
+# Sentinel account_id for the legacy env-based Dhan singleton (no DB row).
+ENV_ACCOUNT_ID = 0
+
 
 @dataclass
 class KillSwitchState:
-    """Snapshot of the kill switch — exposed via API for the UI."""
+    """Snapshot of a single account's kill switch — exposed via API for the UI."""
 
+    account_id: int = ENV_ACCOUNT_ID
+    account_name: str = ""
+    broker: str = "dhan"
     enabled: bool = True
     limit: float = 6000.0
     locked: bool = False
@@ -69,6 +83,9 @@ class KillSwitchState:
 
     def to_dict(self) -> dict:
         return {
+            "account_id": self.account_id,
+            "account_name": self.account_name,
+            "broker": self.broker,
             "enabled": self.enabled,
             "limit": self.limit,
             "locked": self.locked,
@@ -81,92 +98,143 @@ class KillSwitchState:
         }
 
 
-# ── Module-level state (process-wide singleton) ─────────────────────
-_state = KillSwitchState(
-    enabled=settings.account_kill_switch_enabled,
-    limit=float(settings.account_max_daily_loss),
-)
+# ── Module-level state (process-wide, keyed by account_id) ──────────
+_states: dict[int, KillSwitchState] = {}
 _state_lock = threading.RLock()  # Hot path is sync (place_order gate).
 _watchdog_task: Optional[asyncio.Task] = None
+
+
+def _get_or_create_state(
+    account_id: int,
+    *,
+    account_name: str = "",
+    broker: str = "dhan",
+    enabled: Optional[bool] = None,
+    limit: Optional[float] = None,
+) -> KillSwitchState:
+    """Return the state row for ``account_id``, creating it lazily. Caller must hold ``_state_lock``."""
+    st = _states.get(int(account_id))
+    if st is None:
+        st = KillSwitchState(
+            account_id=int(account_id),
+            account_name=account_name or ("env" if account_id == ENV_ACCOUNT_ID else f"account-{account_id}"),
+            broker=broker or "dhan",
+            enabled=bool(enabled) if enabled is not None else settings.account_kill_switch_enabled,
+            limit=float(limit) if limit is not None and float(limit) > 0 else float(settings.account_max_daily_loss),
+        )
+        _states[int(account_id)] = st
+    else:
+        # Keep the display metadata in sync when the DB row changes.
+        if account_name:
+            st.account_name = account_name
+        if broker:
+            st.broker = broker
+    return st
 
 
 # ── Public read API ─────────────────────────────────────────────────
 
 
-def get_state() -> KillSwitchState:
-    """Return a snapshot copy of the current kill switch state."""
+def _snapshot(st: KillSwitchState) -> KillSwitchState:
+    """Shallow copy — safe for read-only callers."""
+    return KillSwitchState(
+        account_id=st.account_id,
+        account_name=st.account_name,
+        broker=st.broker,
+        enabled=st.enabled,
+        limit=st.limit,
+        locked=st.locked,
+        current_pnl=st.current_pnl,
+        tripped_at=st.tripped_at,
+        tripped_pnl=st.tripped_pnl,
+        last_poll_at=st.last_poll_at,
+        last_error=st.last_error,
+        state_date=st.state_date,
+        net_qty_by_security=dict(st.net_qty_by_security),
+        pending_exit_qty=dict(st.pending_exit_qty),
+        last_force_close_at=st.last_force_close_at,
+    )
+
+
+def get_state(account_id: int = ENV_ACCOUNT_ID) -> KillSwitchState:
+    """Return a snapshot of a single account's kill switch state."""
     with _state_lock:
-        # Shallow copy — dataclass fields are primitives / dict that we
-        # rebuild on every poll, so this is safe for read-only callers.
-        return KillSwitchState(
-            enabled=_state.enabled,
-            limit=_state.limit,
-            locked=_state.locked,
-            current_pnl=_state.current_pnl,
-            tripped_at=_state.tripped_at,
-            tripped_pnl=_state.tripped_pnl,
-            last_poll_at=_state.last_poll_at,
-            last_error=_state.last_error,
-            state_date=_state.state_date,
-            net_qty_by_security=dict(_state.net_qty_by_security),
-            pending_exit_qty=dict(_state.pending_exit_qty),
-            last_force_close_at=_state.last_force_close_at,
-        )
+        st = _get_or_create_state(int(account_id))
+        return _snapshot(st)
 
 
-def is_locked() -> bool:
+def get_all_states() -> list[KillSwitchState]:
+    """Return a snapshot of every tracked account's kill switch state."""
     with _state_lock:
-        if _state.locked:
-            _maybe_auto_reset_locked()
-        return _state.locked
+        return [_snapshot(st) for st in _states.values()]
 
 
-def is_enabled() -> bool:
+def is_locked(account_id: int = ENV_ACCOUNT_ID) -> bool:
     with _state_lock:
-        return bool(_state.enabled)
+        st = _states.get(int(account_id))
+        if st is None:
+            return False
+        if st.locked:
+            _maybe_auto_reset_locked(st)
+        return st.locked
+
+
+def is_enabled(account_id: int = ENV_ACCOUNT_ID) -> bool:
+    with _state_lock:
+        st = _states.get(int(account_id))
+        if st is None:
+            return bool(settings.account_kill_switch_enabled)
+        return bool(st.enabled)
 
 
 # ── Public mutation API ─────────────────────────────────────────────
 
 
-def update_settings(*, enabled: Optional[bool] = None, limit: Optional[float] = None) -> KillSwitchState:
-    """Update enable/limit at runtime. Settings UI calls this."""
+def update_settings(
+    account_id: int = ENV_ACCOUNT_ID,
+    *,
+    enabled: Optional[bool] = None,
+    limit: Optional[float] = None,
+) -> KillSwitchState:
+    """Update enable/limit at runtime for a single account. Settings UI calls this."""
     with _state_lock:
+        st = _get_or_create_state(int(account_id))
         if enabled is not None:
-            _state.enabled = bool(enabled)
+            st.enabled = bool(enabled)
         if limit is not None and float(limit) > 0:
-            _state.limit = float(limit)
+            st.limit = float(limit)
         # Note: changing the limit does NOT unlock a tripped switch within
         # the same IST day — the explicit reset is required so this can't
         # be used to escape a losing session.
-        # Seed state_date so the IST-rollover auto-reset has a baseline
-        # even if the user changes settings before the watchdog's first
-        # poll completes.
-        if _state.state_date is None:
-            _state.state_date = datetime.now(_IST).date()
+        if st.state_date is None:
+            st.state_date = datetime.now(_IST).date()
         logger.info(
-            "Kill switch settings updated: enabled=%s limit=%.2f locked=%s",
-            _state.enabled, _state.limit, _state.locked,
+            "Kill switch settings updated: account_id=%s enabled=%s limit=%.2f locked=%s",
+            st.account_id, st.enabled, st.limit, st.locked,
         )
-        return get_state()
+        return _snapshot(st)
 
 
-def reset_kill_switch(reason: str = "manual_reset") -> KillSwitchState:
-    """Clear a tripped lock for the current IST day."""
+def reset_kill_switch(
+    account_id: int = ENV_ACCOUNT_ID,
+    reason: str = "manual_reset",
+) -> KillSwitchState:
+    """Clear a tripped lock for the current IST day for one account."""
     with _state_lock:
-        was_locked = _state.locked
-        _state.locked = False
-        _state.tripped_at = None
-        _state.tripped_pnl = 0.0
-        _state.last_error = ""
+        st = _get_or_create_state(int(account_id))
+        was_locked = st.locked
+        st.locked = False
+        st.tripped_at = None
+        st.tripped_pnl = 0.0
+        st.last_error = ""
         # Clearing pending exits ensures a re-trip later in the day will
         # cleanly fire fresh force-close orders on any positions that
         # have since been re-opened.
-        _state.pending_exit_qty = {}
-        _state.last_force_close_at = None
+        st.pending_exit_qty = {}
+        st.last_force_close_at = None
         if was_locked:
-            logger.warning("Kill switch RESET (%s)", reason)
-        return get_state()
+            logger.warning("Kill switch RESET account_id=%s (%s)", st.account_id, reason)
+        return _snapshot(st)
 
 
 # ── place_order gate (hot path — runs on every order) ───────────────
@@ -181,18 +249,25 @@ class GateDecision:
     new_qty: int = 0
 
 
-def evaluate_order(security_id: str, side: str, quantity: int) -> GateDecision:
+def evaluate_order(
+    security_id: str,
+    side: str,
+    quantity: int,
+    account_id: int = ENV_ACCOUNT_ID,
+) -> GateDecision:
     """Decide whether to allow an order while the switch is locked.
 
     The rule: an order is allowed iff it REDUCES the absolute value of
-    the net signed position for ``security_id``. New entries, flips
-    that would result in a larger absolute position, and pyramiding
-    are blocked.
+    the net signed position for ``security_id`` within the given
+    ``account_id``. New entries, flips that would result in a larger
+    absolute position, and pyramiding are blocked. Only the tripped
+    account's orders are affected — other accounts continue trading.
 
-    When the switch is NOT locked (the common case), this returns
-    ``allowed=True`` immediately so the broker hot path stays fast.
+    When the account's switch is NOT locked (the common case), this
+    returns ``allowed=True`` immediately so the broker hot path stays
+    fast.
     """
-    if not is_enabled() or not is_locked():
+    if not is_enabled(account_id) or not is_locked(account_id):
         return GateDecision(allowed=True, reason="not_locked")
 
     sid = str(security_id)
@@ -200,7 +275,8 @@ def evaluate_order(security_id: str, side: str, quantity: int) -> GateDecision:
     incoming = sgn * abs(int(quantity))
 
     with _state_lock:
-        current = int(_state.net_qty_by_security.get(sid, 0))
+        st = _get_or_create_state(int(account_id))
+        current = int(st.net_qty_by_security.get(sid, 0))
         new_qty = current + incoming
         if abs(new_qty) < abs(current):
             # Apply the delta locally so the very next order sees the
@@ -208,7 +284,7 @@ def evaluate_order(security_id: str, side: str, quantity: int) -> GateDecision:
             # poll refreshes the snapshot. Without this, several reducing
             # orders fired within one poll window could collectively
             # over-reduce and flip the position to the opposite side.
-            _state.net_qty_by_security[sid] = new_qty
+            st.net_qty_by_security[sid] = new_qty
             return GateDecision(
                 allowed=True,
                 reason="reducing_position",
@@ -228,19 +304,19 @@ def evaluate_order(security_id: str, side: str, quantity: int) -> GateDecision:
 # ── Internal: watchdog loop ─────────────────────────────────────────
 
 
-def _maybe_auto_reset_locked() -> None:
-    """Called under lock. Reset state on IST day rollover."""
+def _maybe_auto_reset_locked(st: KillSwitchState) -> None:
+    """Called under lock. Reset state on IST day rollover for one account."""
     today = datetime.now(_IST).date()
-    if _state.state_date is not None and _state.state_date != today:
+    if st.state_date is not None and st.state_date != today:
         logger.info(
-            "Kill switch auto-reset on IST day rollover (%s → %s)",
-            _state.state_date, today,
+            "Kill switch auto-reset on IST day rollover account_id=%s (%s → %s)",
+            st.account_id, st.state_date, today,
         )
-        _state.locked = False
-        _state.tripped_at = None
-        _state.tripped_pnl = 0.0
-        _state.last_error = ""
-        _state.state_date = today
+        st.locked = False
+        st.tripped_at = None
+        st.tripped_pnl = 0.0
+        st.last_error = ""
+        st.state_date = today
 
 
 def _compute_pnl_and_qty(positions: list[dict]) -> tuple[float, dict[str, int], list[dict]]:
@@ -271,10 +347,14 @@ def _compute_pnl_and_qty(positions: list[dict]) -> tuple[float, dict[str, int], 
     return total, by_sec, open_positions
 
 
-async def _force_close_all(dhan_client, positions: list[dict]) -> int:
-    """MARKET-squareoff every open position. Returns the number of
-    squareoff orders attempted. Each call is wrapped so one failure
-    doesn't stop the rest.
+async def _force_close_all(
+    dhan_client,
+    positions: list[dict],
+    st: KillSwitchState,
+) -> int:
+    """MARKET-squareoff every open position of one account. Returns the
+    number of squareoff orders attempted. Each call is wrapped so one
+    failure doesn't stop the rest.
     """
     closed = 0
     now = datetime.now(_IST)
@@ -290,20 +370,20 @@ async def _force_close_all(dhan_client, positions: list[dict]) -> int:
             # Skip positions that already have a pending squareoff with
             # the same sign — the previous tick's exit is still settling.
             with _state_lock:
-                pending = int(_state.pending_exit_qty.get(sec_id, 0))
+                pending = int(st.pending_exit_qty.get(sec_id, 0))
             if pending != 0 and ((pending > 0) == (net_qty > 0)):
                 logger.info(
-                    "KILL SWITCH skip duplicate force-close: security_id=%s "
+                    "KILL SWITCH skip duplicate force-close: account_id=%s security_id=%s "
                     "net_qty=%d pending_exit=%d",
-                    sec_id, net_qty, pending,
+                    st.account_id, sec_id, net_qty, pending,
                 )
                 continue
 
             side = "SELL" if net_qty > 0 else "BUY"
             qty = abs(net_qty)
             logger.warning(
-                "KILL SWITCH FORCE-CLOSE: security_id=%s qty=%d side=%s seg=%s",
-                sec_id, qty, side, seg,
+                "KILL SWITCH FORCE-CLOSE account_id=%s: security_id=%s qty=%d side=%s seg=%s",
+                st.account_id, sec_id, qty, side, seg,
             )
             resp = await asyncio.to_thread(
                 dhan_client.place_order,
@@ -319,11 +399,14 @@ async def _force_close_all(dhan_client, positions: list[dict]) -> int:
             logger.info("KILL SWITCH force-close response: %s", resp)
             # Mark the in-flight exit so we don't duplicate next tick.
             with _state_lock:
-                _state.pending_exit_qty[sec_id] = net_qty
-                _state.last_force_close_at = now
+                st.pending_exit_qty[sec_id] = net_qty
+                st.last_force_close_at = now
             closed += 1
         except Exception:
-            logger.exception("Kill switch force-close failed for position %s", p)
+            logger.exception(
+                "Kill switch force-close failed account_id=%s position=%s",
+                st.account_id, p,
+            )
     return closed
 
 
@@ -337,115 +420,223 @@ async def _send_telegram_alert(text: str) -> None:
 
 
 async def _watchdog_loop() -> None:
-    """Poll positions, compute account PnL, trip the switch if breached."""
+    """Poll positions per Dhan BrokerAccount, compute PnL, trip switches."""
     logger.info(
-        "Account kill switch watchdog started (enabled=%s limit=%.2f interval=%.1fs)",
-        _state.enabled, _state.limit, settings.account_kill_switch_poll_seconds,
+        "Account kill switch watchdog started (interval=%.1fs)",
+        settings.account_kill_switch_poll_seconds,
     )
     while True:
         try:
             await asyncio.sleep(max(1.0, float(settings.account_kill_switch_poll_seconds)))
-            if not is_enabled():
-                continue
             if settings.paper_trading:
                 # No real positions in paper mode; nothing to enforce.
                 continue
-            if (settings.trading_account or "").lower() != "dhan":
-                # Currently only Dhan is wired — Angel/Kite would need
-                # their own positions adapter.
+
+            targets = await _resolve_dhan_targets()
+            if not targets:
                 continue
 
-            # Lazy import to avoid a circular import at module load.
-            from app.execution.dhan_broker import DhanBroker
-
-            broker = _get_or_build_dhan_broker(DhanBroker)
-            # Pick up rotated access tokens (UI save / .env edit) without
-            # needing a process restart — the order path does this too.
-            try:
-                broker._ensure_fresh_client()  # type: ignore[attr-defined]
-            except Exception:
-                logger.debug("Kill switch: broker token refresh failed", exc_info=True)
-            if broker is None or broker.client is None:
-                continue
-
-            positions = await asyncio.to_thread(broker.client.get_positions)
-            pnl, by_sec, open_positions = _compute_pnl_and_qty(positions)
-
-            now = datetime.now(_IST)
-            with _state_lock:
-                _state.last_poll_at = now
-                _state.current_pnl = pnl
-                _state.net_qty_by_security = by_sec
-                _state.last_error = ""
-                if _state.state_date is None:
-                    _state.state_date = now.date()
-                _maybe_auto_reset_locked()
-                # Drop stale pending-exit entries that the latest snapshot
-                # proves are already settled (position closed, or sign
-                # flipped — meaning the prior exit clearly filled).
-                if _state.pending_exit_qty:
-                    cleaned: dict[str, int] = {}
-                    for sid, pending_qty in _state.pending_exit_qty.items():
-                        cur = by_sec.get(sid, 0)
-                        if cur == 0:
-                            continue
-                        if (pending_qty > 0) != (cur > 0):
-                            continue
-                        # Cap pending at observed net qty.
-                        cleaned[sid] = cur if abs(cur) < abs(pending_qty) else pending_qty
-                    _state.pending_exit_qty = cleaned
-                already_locked = _state.locked
-                should_trip = (
-                    _state.enabled
-                    and not already_locked
-                    and pnl <= -abs(_state.limit)
-                )
-                if should_trip:
-                    _state.locked = True
-                    _state.tripped_at = now
-                    _state.tripped_pnl = pnl
-                    _state.state_date = now.date()
-
-            if should_trip:
-                logger.error(
-                    "ACCOUNT KILL SWITCH TRIPPED: pnl=%.2f limit=-%.2f → "
-                    "force-closing %d open positions",
-                    pnl, _state.limit, len(open_positions),
-                )
-                await _send_telegram_alert(
-                    f"🛑 ACCOUNT KILL SWITCH TRIPPED\n"
-                    f"PnL: ₹{pnl:,.2f} (limit ₹-{_state.limit:,.0f})\n"
-                    f"Force-closing {len(open_positions)} open position(s). "
-                    f"New entries blocked for the rest of the IST day."
-                )
-                await _force_close_all(broker.client, open_positions)
-            elif already_locked and open_positions:
-                # Lock was already active from a prior tick but positions
-                # are still open (manual re-entries on the broker app,
-                # partial fills, late hedge legs, etc). Keep squaring off
-                # — _force_close_all dedupes via pending_exit_qty so this
-                # is safe to call every tick.
-                logger.warning(
-                    "KILL SWITCH still active with %d open positions → "
-                    "continuing force-close pass",
-                    len(open_positions),
-                )
-                await _force_close_all(broker.client, open_positions)
+            # Poll accounts in parallel so a slow account can't stall the
+            # rest of the watchdog cycle.
+            await asyncio.gather(
+                *(_watchdog_poll_one(t) for t in targets),
+                return_exceptions=True,
+            )
         except asyncio.CancelledError:
             logger.info("Account kill switch watchdog cancelled")
             raise
-        except Exception as exc:
-            logger.exception("Kill switch watchdog iteration failed")
+        except Exception:
+            logger.exception("Kill switch watchdog outer iteration failed")
+
+
+async def _watchdog_poll_one(target: dict) -> None:
+    """Poll a single (broker, state) pair. Isolated so per-account errors
+    never trip other accounts.
+    """
+    st: KillSwitchState = target["state"]
+    broker = target["broker"]
+    try:
+        if not is_enabled(st.account_id):
+            return
+        if broker is None or getattr(broker, "client", None) is None:
+            return
+
+        positions = await asyncio.to_thread(broker.client.get_positions)
+        pnl, by_sec, open_positions = _compute_pnl_and_qty(positions)
+
+        now = datetime.now(_IST)
+        with _state_lock:
+            st.last_poll_at = now
+            st.current_pnl = pnl
+            st.net_qty_by_security = by_sec
+            st.last_error = ""
+            if st.state_date is None:
+                st.state_date = now.date()
+            _maybe_auto_reset_locked(st)
+            # Drop stale pending-exit entries that the latest snapshot
+            # proves are already settled.
+            if st.pending_exit_qty:
+                cleaned: dict[str, int] = {}
+                for sid, pending_qty in st.pending_exit_qty.items():
+                    cur = by_sec.get(sid, 0)
+                    if cur == 0:
+                        continue
+                    if (pending_qty > 0) != (cur > 0):
+                        continue
+                    cleaned[sid] = cur if abs(cur) < abs(pending_qty) else pending_qty
+                st.pending_exit_qty = cleaned
+            already_locked = st.locked
+            should_trip = (
+                st.enabled
+                and not already_locked
+                and pnl <= -abs(st.limit)
+            )
+            if should_trip:
+                st.locked = True
+                st.tripped_at = now
+                st.tripped_pnl = pnl
+                st.state_date = now.date()
+
+        if should_trip:
+            logger.error(
+                "ACCOUNT KILL SWITCH TRIPPED account_id=%s (%s): pnl=%.2f limit=-%.2f → "
+                "force-closing %d open positions",
+                st.account_id, st.account_name, pnl, st.limit, len(open_positions),
+            )
+            await _send_telegram_alert(
+                f"🛑 KILL SWITCH TRIPPED — {st.account_name}\n"
+                f"PnL: ₹{pnl:,.2f} (limit ₹-{st.limit:,.0f})\n"
+                f"Force-closing {len(open_positions)} position(s). "
+                f"New entries on this account are blocked for the rest of the IST day."
+            )
+            await _force_close_all(broker.client, open_positions, st)
+        elif already_locked and open_positions:
+            logger.warning(
+                "KILL SWITCH still active account_id=%s with %d open positions → "
+                "continuing force-close pass",
+                st.account_id, len(open_positions),
+            )
+            await _force_close_all(broker.client, open_positions, st)
+    except Exception as exc:
+        logger.exception("Kill switch poll failed for account_id=%s", st.account_id)
+        with _state_lock:
+            st.last_error = str(exc)
+
+
+async def _resolve_dhan_targets() -> list[dict]:
+    """Return the list of ``{state, broker}`` pairs to poll this tick.
+
+    Enumerates active Dhan ``BrokerAccount`` rows first. When there are
+    none, falls back to the env-based singleton (``account_id=0``) so
+    legacy single-account setups keep working.
+    """
+    targets: list[dict] = []
+    seen_ids: set[int] = set()
+
+    try:
+        rows = await _fetch_active_dhan_accounts()
+    except Exception:
+        logger.exception("Failed to fetch Dhan broker accounts for kill switch")
+        rows = []
+
+    if rows:
+        from app.execution.broker_factory import build_broker_from_row
+
+        for row in rows:
+            account_id = int(row.get("id") or 0)
+            if not account_id or account_id in seen_ids:
+                continue
+            seen_ids.add(account_id)
+            try:
+                broker = build_broker_from_row(row)
+            except Exception:
+                logger.exception(
+                    "Kill switch: failed to build broker for account_id=%s", account_id,
+                )
+                broker = None
             with _state_lock:
-                _state.last_error = str(exc)
+                st = _get_or_create_state(
+                    account_id,
+                    account_name=str(row.get("name") or f"account-{account_id}"),
+                    broker=str(row.get("broker") or "dhan"),
+                )
+                # Adopt DB-persisted enabled/limit as source of truth when set.
+                db_enabled = row.get("kill_switch_enabled")
+                db_limit = row.get("daily_loss_limit")
+                if db_enabled is not None:
+                    st.enabled = bool(db_enabled)
+                if db_limit is not None:
+                    try:
+                        v = float(db_limit)
+                        if v > 0:
+                            st.limit = v
+                    except (TypeError, ValueError):
+                        pass
+            targets.append({"state": st, "broker": broker})
+
+    # Legacy env-based fallback: keep the old singleton working when no
+    # BrokerAccount rows exist and TRADING_ACCOUNT=dhan is configured.
+    if not rows and (settings.trading_account or "").lower() == "dhan":
+        try:
+            from app.execution.dhan_broker import DhanBroker
+
+            broker = _get_or_build_env_dhan_broker(DhanBroker)
+            try:
+                broker._ensure_fresh_client()  # type: ignore[attr-defined]
+            except Exception:
+                logger.debug("Kill switch: env broker refresh failed", exc_info=True)
+            with _state_lock:
+                st = _get_or_create_state(ENV_ACCOUNT_ID, account_name="env", broker="dhan")
+            targets.append({"state": st, "broker": broker})
+        except Exception:
+            logger.exception("Kill switch: env-based Dhan fallback failed")
+
+    return targets
 
 
-# Tiny singleton wrapper so the watchdog reuses the same DhanBroker
+async def _fetch_active_dhan_accounts() -> list[dict]:
+    """Return active Dhan BrokerAccount rows as plain dicts (async-safe)."""
+    from sqlalchemy import select
+    from app.db.account_models import BrokerAccount
+    from app.db.models import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as s:
+        rows = (
+            await s.execute(
+                select(BrokerAccount).where(
+                    BrokerAccount.is_active == True,  # noqa: E712
+                    BrokerAccount.broker == "dhan",
+                ).order_by(BrokerAccount.id.asc())
+            )
+        ).scalars().all()
+        return [
+            {
+                "id": r.id,
+                "name": r.name,
+                "broker": r.broker,
+                "client_id": r.client_id,
+                "api_key": r.api_key,
+                "api_secret": r.api_secret,
+                "password": r.password,
+                "mpin": r.mpin,
+                "totp_secret": r.totp_secret,
+                "access_token": r.access_token,
+                "refresh_token": r.refresh_token,
+                "proxy_url": r.proxy_url,
+                "kill_switch_enabled": r.kill_switch_enabled if r.kill_switch_enabled is not None else True,
+                "daily_loss_limit": r.daily_loss_limit if r.daily_loss_limit is not None else 6000.0,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else "",
+            }
+            for r in rows
+        ]
+
+
+# Tiny singleton wrapper so the watchdog reuses the same env-based DhanBroker
 # instance as the order path (and therefore picks up token rotations).
 _dhan_broker_singleton = None
 
 
-def _get_or_build_dhan_broker(broker_cls):
+def _get_or_build_env_dhan_broker(broker_cls):
     global _dhan_broker_singleton
     if _dhan_broker_singleton is None:
         _dhan_broker_singleton = broker_cls()

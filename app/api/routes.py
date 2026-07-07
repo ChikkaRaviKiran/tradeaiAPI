@@ -11,7 +11,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Optional
 
 import pyotp
 import pytz
@@ -97,7 +97,89 @@ def _get_active_broker():
     return AngelOneBroker(), "angel"
 
 
-def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict], dict]:
+async def _list_all_active_brokers() -> list[dict]:
+    """Return every wired-up broker adapter (multi-account aware).
+
+    Each entry: ``{"broker", "account_id", "account_name", "broker_type"}``.
+
+    Falls back to the legacy env-based single broker (``account_id=0``)
+    when no BrokerAccount rows exist so existing single-account setups
+    keep working unchanged.
+    """
+    out: list[dict] = []
+    try:
+        from sqlalchemy import select
+        from app.db.account_models import BrokerAccount
+        from app.db.models import AsyncSessionLocal
+        from app.execution.broker_factory import build_broker_from_row
+
+        async with AsyncSessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(BrokerAccount).where(
+                        BrokerAccount.is_active == True  # noqa: E712
+                    ).order_by(BrokerAccount.id.asc())
+                )
+            ).scalars().all()
+            row_dicts = [
+                {
+                    "id": r.id,
+                    "name": r.name,
+                    "broker": r.broker,
+                    "client_id": r.client_id,
+                    "api_key": r.api_key,
+                    "api_secret": r.api_secret,
+                    "password": r.password,
+                    "mpin": r.mpin,
+                    "totp_secret": r.totp_secret,
+                    "access_token": r.access_token,
+                    "refresh_token": r.refresh_token,
+                    "proxy_url": r.proxy_url,
+                    "updated_at": r.updated_at.isoformat() if r.updated_at else "",
+                }
+                for r in rows
+            ]
+    except Exception:
+        logger.exception("Failed to enumerate BrokerAccount rows")
+        row_dicts = []
+
+    for row in row_dicts:
+        try:
+            broker = build_broker_from_row(row)
+        except Exception:
+            logger.exception("Failed to build broker for account_id=%s", row.get("id"))
+            broker = None
+        if broker is None:
+            continue
+        out.append({
+            "broker": broker,
+            "account_id": int(row.get("id") or 0),
+            "account_name": str(row.get("name") or f"account-{row.get('id')}"),
+            "broker_type": (row.get("broker") or "").lower(),
+        })
+
+    if not out:
+        # Env-based fallback (legacy single-account setups).
+        broker, account_type = _get_active_broker()
+        out.append({
+            "broker": broker,
+            "account_id": 0,
+            "account_name": account_type.upper(),
+            "broker_type": account_type,
+        })
+    return out
+
+
+async def _find_broker_for_account_id(account_id: int) -> Optional[dict]:
+    """Return the broker entry matching ``account_id`` or ``None``."""
+    all_brokers = await _list_all_active_brokers()
+    for entry in all_brokers:
+        if int(entry["account_id"]) == int(account_id or 0):
+            return entry
+    return None
+
+
+def _extract_positions_for_ui(broker: Any, account_name: str, account_id: int = 0) -> tuple[list[dict], dict]:
     """Read raw broker positions and normalize shape used by PositionsPage."""
     positions: list[dict] = []
     realised_sum = 0.0
@@ -114,7 +196,7 @@ def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict
             unrealised = _safe_num(p.get("unrealised") or p.get("unrealized") or p.get("m2m"), 0.0)
             pnl = _safe_num(p.get("pnl"), realised + unrealised)
             item = {
-                "id": f"{account_name}:{p.get('exchange', '')}:{p.get('tradingsymbol', '')}",
+                "id": f"{account_id}:{account_name}:{p.get('exchange', '')}:{p.get('tradingsymbol', '')}",
                 "tradingsymbol": p.get("tradingsymbol", ""),
                 "symboltoken": str(p.get("instrument_token", "") or ""),
                 "exchange": p.get("exchange", "NFO"),
@@ -128,6 +210,7 @@ def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict
                 "pnl": pnl,
                 "realised": realised,
                 "unrealised": unrealised,
+                "account_id": account_id,
                 "account_name": account_name,
             }
             positions.append(item)
@@ -144,7 +227,10 @@ def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict
             raw = []
         else:
             raw = broker._client.get_positions() or []
-            logger.info("Positions: Dhan returned %d raw position rows", len(raw))
+            logger.info(
+                "Positions: Dhan account=%s (id=%s) returned %d raw rows",
+                account_name, account_id, len(raw),
+            )
         for p in raw:
             buy_qty = _safe_int(p.get("buyQty") or p.get("buyQuantity"), 0)
             sell_qty = _safe_int(p.get("sellQty") or p.get("sellQuantity"), 0)
@@ -153,7 +239,7 @@ def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict
             unrealised = _safe_num(p.get("unrealizedProfit") or p.get("unrealised"), 0.0)
             pnl = _safe_num(p.get("pnl"), realised + unrealised)
             item = {
-                "id": f"{account_name}:{p.get('exchangeSegment', '')}:{p.get('tradingSymbol', '')}",
+                "id": f"{account_id}:{account_name}:{p.get('exchangeSegment', '')}:{p.get('tradingSymbol', '')}",
                 "tradingsymbol": p.get("tradingSymbol", ""),
                 "symboltoken": str(p.get("securityId", "") or ""),
                 "exchange": p.get("exchangeSegment", "NFO"),
@@ -167,6 +253,7 @@ def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict
                 "pnl": pnl,
                 "realised": realised,
                 "unrealised": unrealised,
+                "account_id": account_id,
                 "account_name": account_name,
             }
             positions.append(item)
@@ -189,7 +276,7 @@ def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict
             pnl = _safe_num(p.get("pnl"), 0.0)
             unrealised = _safe_num(p.get("unrealised") or p.get("unrealized"), pnl - realised)
             item = {
-                "id": f"{account_name}:{p.get('exchange', '')}:{p.get('tradingsymbol', '')}",
+                "id": f"{account_id}:{account_name}:{p.get('exchange', '')}:{p.get('tradingsymbol', '')}",
                 "tradingsymbol": p.get("tradingsymbol", ""),
                 "symboltoken": str(p.get("symboltoken", "") or ""),
                 "exchange": p.get("exchange", "NFO"),
@@ -203,6 +290,7 @@ def _extract_positions_for_ui(broker: Any, account_name: str) -> tuple[list[dict
                 "pnl": pnl,
                 "realised": realised,
                 "unrealised": unrealised,
+                "account_id": account_id,
                 "account_name": account_name,
             }
             positions.append(item)
@@ -1013,25 +1101,62 @@ async def get_full_day_data(target_date: str):
 
 @app.get("/api/positions")
 async def get_broker_positions():
-    """Return active broker positions in UI-friendly shape (replica-style)."""
-    broker, account = _get_active_broker()
-    cache_key = f"positions:{account}"
+    """Return active broker positions in UI-friendly shape (multi-account)."""
+    cache_key = "positions:all"
 
     cached_payload = await cache.get_json(cache_key)
     if cached_payload is not None:
         return cached_payload
 
     try:
-        positions, broker_day = await asyncio.to_thread(_extract_positions_for_ui, broker, account.upper())
+        brokers = await _list_all_active_brokers()
+
+        async def _fetch_one(entry: dict) -> tuple[list[dict], dict]:
+            try:
+                return await asyncio.to_thread(
+                    _extract_positions_for_ui,
+                    entry["broker"],
+                    entry["account_name"].upper(),
+                    int(entry["account_id"]),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to fetch broker positions for account_id=%s",
+                    entry.get("account_id"),
+                )
+                return [], {"realised": 0.0, "unrealised": 0.0, "total": 0.0}
+
+        results = await asyncio.gather(*(_fetch_one(e) for e in brokers))
     except Exception as exc:
-        logger.exception("Failed to fetch broker positions")
+        logger.exception("Failed to fetch broker positions (multi-account)")
         raise HTTPException(status_code=500, detail=str(exc))
+
+    all_positions: list[dict] = []
+    total_realised = 0.0
+    total_unrealised = 0.0
+    per_account: list[dict] = []
+    for entry, (pos, day) in zip(brokers, results):
+        all_positions.extend(pos)
+        total_realised += float(day.get("realised") or 0.0)
+        total_unrealised += float(day.get("unrealised") or 0.0)
+        per_account.append({
+            "account_id": int(entry["account_id"]),
+            "account_name": entry["account_name"].upper(),
+            "broker_type": entry["broker_type"],
+            "realised": day.get("realised", 0.0),
+            "unrealised": day.get("unrealised", 0.0),
+            "total": day.get("total", 0.0),
+        })
 
     payload = {
         "status": "ok",
-        "account": account,
-        "positions": positions,
-        "broker_day_pnl": broker_day,
+        "positions": all_positions,
+        "broker_day_pnl": {
+            "realised": round(total_realised, 2),
+            "unrealised": round(total_unrealised, 2),
+            "total": round(total_realised + total_unrealised, 2),
+        },
+        "accounts": per_account,
     }
     # Short TTL: dashboard polls every 10s, broker call typically 200-500ms.
     # 3s cap keeps positions essentially live while collapsing duplicate hits
@@ -1042,25 +1167,55 @@ async def get_broker_positions():
 
 @app.post("/api/positions/exit")
 async def exit_broker_positions(body: dict):
-    """Exit selected broker positions and mark strategy done for the day."""
+    """Exit selected broker positions and mark strategy done for the day.
+
+    Each position item MUST carry its ``account_id`` and either
+    ``security_id`` (Dhan) or ``symboltoken`` so the exit is routed to
+    the correct account's broker without re-resolving the display
+    trading symbol.
+    """
     from app.execution.broker_base import OrderRequest, OrderSide, OrderType
 
     items = (body or {}).get("positions") or []
     if not isinstance(items, list) or not items:
         raise HTTPException(status_code=400, detail="No positions provided")
 
-    broker, account = _get_active_broker()
+    all_brokers = await _list_all_active_brokers()
+    brokers_by_id: dict[int, dict] = {
+        int(e["account_id"]): e for e in all_brokers
+    }
+
     results: list[dict] = []
+    used_accounts: set[int] = set()
 
     for p in items:
         qty = abs(_safe_int(p.get("net_qty"), 0))
         if qty <= 0:
             continue
+        account_id = int(_safe_int(p.get("account_id"), 0))
+        entry = brokers_by_id.get(account_id)
+        if entry is None:
+            # Fall back to the sole active broker when the caller didn't
+            # send an account_id (legacy single-account clients).
+            if len(all_brokers) == 1:
+                entry = all_brokers[0]
+                account_id = int(entry["account_id"])
+            else:
+                results.append({
+                    "tradingsymbol": str(p.get("tradingsymbol", "") or ""),
+                    "quantity": qty,
+                    "ok": False,
+                    "order_id": "",
+                    "message": f"account_id={account_id} not found among active brokers",
+                })
+                continue
+        broker = entry["broker"]
         side = OrderSide.SELL if _safe_int(p.get("net_qty"), 0) > 0 else OrderSide.BUY
+        symbol_token = str(p.get("symboltoken", "") or "")
         req = OrderRequest(
             instrument=None,
             trading_symbol=str(p.get("tradingsymbol", "") or ""),
-            symbol_token=str(p.get("symboltoken", "") or ""),
+            symbol_token=symbol_token,
             exchange=str(p.get("exchange", "NFO") or "NFO"),
             side=side,
             order_type=OrderType.MARKET,
@@ -1068,34 +1223,44 @@ async def exit_broker_positions(body: dict):
             quantity=qty,
             price=0.0,
             trigger_price=0.0,
+            # Dhan-native identifiers so the broker skips symbol
+            # re-resolution (display symbol is broker-formatted and
+            # cannot be reparsed back to strike/expiry).
+            broker_security_id=str(p.get("security_id") or symbol_token) or None,
+            broker_exchange_segment=str(p.get("exchange", "") or "") or None,
         )
         try:
             resp = await asyncio.to_thread(broker.place_order, req)
             ok = bool(resp and str(getattr(resp, "status", "")).upper() != "REJECTED")
-            results.append(
-                {
-                    "tradingsymbol": req.trading_symbol,
-                    "quantity": qty,
-                    "side": side.value,
-                    "ok": ok,
-                    "order_id": getattr(resp, "order_id", "") if resp else "",
-                    "message": getattr(resp, "message", "") if resp else "",
-                }
-            )
+            results.append({
+                "account_id": account_id,
+                "account_name": entry["account_name"],
+                "tradingsymbol": req.trading_symbol,
+                "quantity": qty,
+                "side": side.value,
+                "ok": ok,
+                "order_id": getattr(resp, "order_id", "") if resp else "",
+                "message": getattr(resp, "message", "") if resp else "",
+            })
+            if ok:
+                used_accounts.add(account_id)
         except Exception as exc:
-            logger.exception("Manual exit failed for %s", req.trading_symbol)
-            results.append(
-                {
-                    "tradingsymbol": req.trading_symbol,
-                    "quantity": qty,
-                    "side": side.value,
-                    "ok": False,
-                    "order_id": "",
-                    "message": str(exc),
-                }
+            logger.exception(
+                "Manual exit failed account_id=%s symbol=%s",
+                account_id, req.trading_symbol,
             )
+            results.append({
+                "account_id": account_id,
+                "account_name": entry["account_name"],
+                "tradingsymbol": req.trading_symbol,
+                "quantity": qty,
+                "side": side.value,
+                "ok": False,
+                "order_id": "",
+                "message": str(exc),
+            })
 
-    if any(r.get("ok") for r in results):
+    if used_accounts:
         _mark_scanners_completed_for_today()
 
     # Bust positions cache so the next poll reflects the exit immediately.
@@ -1103,9 +1268,9 @@ async def exit_broker_positions(body: dict):
 
     return {
         "status": "ok",
-        "account": account,
         "results": results,
-        "completed_for_today": any(r.get("ok") for r in results),
+        "accounts_hit": sorted(used_accounts),
+        "completed_for_today": bool(used_accounts),
     }
 
 
@@ -1122,30 +1287,49 @@ async def capture_broker_eod_snapshot():
     """Persist current broker PnL/positions snapshot for history calendar."""
     from app.db.models import AsyncSessionLocal, BrokerEODSnapshot
 
-    broker, account = _get_active_broker()
-    positions, broker_day = await asyncio.to_thread(_extract_positions_for_ui, broker, account.upper())
+    brokers = await _list_all_active_brokers()
     today = datetime.now(_IST).strftime("%Y-%m-%d")
 
-    async with AsyncSessionLocal() as session:
-        async with session.begin():
-            session.add(
-                BrokerEODSnapshot(
-                    date=today,
-                    account_name=account.upper(),
-                    broker_pnl=float(broker_day.get("total", 0.0) or 0.0),
-                    realised=float(broker_day.get("realised", 0.0) or 0.0),
-                    unrealised=float(broker_day.get("unrealised", 0.0) or 0.0),
-                    positions_count=len(positions),
-                    payload_json=json.dumps(positions),
-                )
+    per_account: list[dict] = []
+    for entry in brokers:
+        try:
+            positions, broker_day = await asyncio.to_thread(
+                _extract_positions_for_ui,
+                entry["broker"],
+                entry["account_name"].upper(),
+                int(entry["account_id"]),
             )
+        except Exception:
+            logger.exception(
+                "EOD snapshot: extract failed account_id=%s",
+                entry.get("account_id"),
+            )
+            continue
+
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    BrokerEODSnapshot(
+                        date=today,
+                        account_name=entry["account_name"].upper(),
+                        broker_pnl=float(broker_day.get("total", 0.0) or 0.0),
+                        realised=float(broker_day.get("realised", 0.0) or 0.0),
+                        unrealised=float(broker_day.get("unrealised", 0.0) or 0.0),
+                        positions_count=len(positions),
+                        payload_json=json.dumps(positions),
+                    )
+                )
+        per_account.append({
+            "account_id": int(entry["account_id"]),
+            "account_name": entry["account_name"].upper(),
+            "positions_count": len(positions),
+            "broker_day_pnl": broker_day,
+        })
 
     return {
         "status": "ok",
         "date": today,
-        "account": account,
-        "positions_count": len(positions),
-        "broker_day_pnl": broker_day,
+        "accounts": per_account,
     }
 
 
@@ -2214,46 +2398,112 @@ async def refresh_dhan_instruments():
         return {"ok": False, "error": str(exc)}
 
 
-# ── Account-level kill switch ─────────────────────────────────────────
+# ── Account-level kill switch (per BrokerAccount) ──────────────────────
 
 @app.get("/api/risk/kill-switch")
 async def get_kill_switch_state():
-    """Return the current account-level kill-switch state for the UI."""
-    from app.execution.account_kill_switch import get_state
+    """Return the current kill-switch state for every wired account.
 
-    return {"ok": True, "state": get_state().to_dict()}
+    Response shape::
+
+        {
+          "ok": true,
+          "states": [
+             {"account_id": 3, "account_name": "primary", "broker": "dhan",
+              "enabled": true, "limit": 6000.0, "locked": false, ...},
+             ...
+          ],
+          # Backwards-compat: first (or env) account's state
+          "state": { ... }
+        }
+    """
+    from app.execution.account_kill_switch import get_all_states, ENV_ACCOUNT_ID
+
+    # Warm the state cache by touching the DB for active Dhan accounts —
+    # ensures the UI can render freshly-created accounts before the first
+    # watchdog tick lands.
+    try:
+        await _refresh_kill_switch_states_from_db()
+    except Exception:
+        logger.debug("kill switch DB warmup failed (non-fatal)", exc_info=True)
+
+    states = get_all_states()
+    # Sort so ENV_ACCOUNT_ID (0) is last; real accounts first.
+    states.sort(key=lambda s: (s.account_id == ENV_ACCOUNT_ID, s.account_id))
+    state_dicts = [s.to_dict() for s in states]
+    return {
+        "ok": True,
+        "states": state_dicts,
+        # Legacy compat: many old callers still read `data.state.limit`.
+        "state": state_dicts[0] if state_dicts else None,
+    }
 
 
 @app.put("/api/risk/kill-switch")
 async def update_kill_switch(body: dict):
-    """Update the kill-switch enable flag and/or daily loss limit.
+    """Update kill-switch enable flag and/or daily loss limit for one account.
 
-    The new values are mutated in-memory **and** persisted to ``.env``
-    so they survive a backend container restart. Without persistence,
-    a container recreate (e.g. ``docker compose up -d backend``) would
-    silently revert to ``ACCOUNT_KILL_SWITCH_ENABLED`` /
-    ``ACCOUNT_MAX_DAILY_LOSS`` defaults and the UI would appear to
-    "forget" the user's change.
+    Body::
 
-    Note: bumping the limit does NOT release a tripped lock within the
-    same IST day — use POST /api/risk/kill-switch/reset explicitly.
+        { "account_id": 3, "enabled": true, "limit": 8000 }
+
+    ``account_id`` is required whenever more than one BrokerAccount row
+    exists. For legacy env-based single-account setups, ``account_id=0``
+    (or omitted) is accepted and the value is also persisted to ``.env``
+    so it survives a container restart.
     """
-    from app.execution.account_kill_switch import update_settings
+    from app.execution.account_kill_switch import ENV_ACCOUNT_ID, update_settings
 
     enabled = body.get("enabled")
     limit = body.get("limit")
+    account_id = int(body.get("account_id") or 0)
     try:
         limit_f = float(limit) if limit is not None else None
     except (TypeError, ValueError):
         return {"ok": False, "error": "limit must be a number"}
-    state = update_settings(enabled=enabled, limit=limit_f)
 
-    # Persist to .env so the new values survive backend restarts.
+    if account_id and account_id != ENV_ACCOUNT_ID:
+        # Persist to DB so it survives restarts and the watchdog picks up
+        # the new value on its next tick.
+        try:
+            from sqlalchemy import select
+            from app.db.account_models import BrokerAccount
+            from app.db.models import AsyncSessionLocal
+
+            async with AsyncSessionLocal() as s:
+                async with s.begin():
+                    row = await s.get(BrokerAccount, account_id)
+                    if row is None:
+                        return {"ok": False, "error": f"account_id={account_id} not found"}
+                    if enabled is not None:
+                        row.kill_switch_enabled = bool(enabled)
+                    if limit_f is not None and limit_f > 0:
+                        row.daily_loss_limit = float(limit_f)
+                    await s.refresh(row, ["name", "broker", "kill_switch_enabled", "daily_loss_limit"])
+                    account_name = row.name
+                    broker_type = row.broker
+        except Exception:
+            logger.exception("Failed to persist kill-switch settings for account %s", account_id)
+            return {"ok": False, "error": "database write failed"}
+
+        # Seed / update in-memory state so the UI reflects the change
+        # immediately (before the next watchdog tick).
+        from app.execution.account_kill_switch import _get_or_create_state, _state_lock, _snapshot
+        with _state_lock:
+            st = _get_or_create_state(account_id, account_name=account_name, broker=broker_type)
+            if enabled is not None:
+                st.enabled = bool(enabled)
+            if limit_f is not None and limit_f > 0:
+                st.limit = float(limit_f)
+            snap = _snapshot(st)
+        return {"ok": True, "state": snap.to_dict()}
+
+    # Env-based path (account_id=0)
+    state = update_settings(ENV_ACCOUNT_ID, enabled=enabled, limit=limit_f)
     env_updates: dict[str, str] = {}
     if enabled is not None:
         env_updates["ACCOUNT_KILL_SWITCH_ENABLED"] = "true" if bool(enabled) else "false"
     if limit_f is not None and limit_f > 0:
-        # Match the .env style used elsewhere (no trailing .0 for ints).
         env_updates["ACCOUNT_MAX_DAILY_LOSS"] = (
             str(int(limit_f)) if float(limit_f).is_integer() else str(limit_f)
         )
@@ -2262,21 +2512,62 @@ async def update_kill_switch(body: dict):
             _persist_env_vars(env_updates)
         except Exception:
             logger.exception("Failed to persist kill-switch settings to .env")
-
     return {"ok": True, "state": state.to_dict()}
 
 
 @app.post("/api/risk/kill-switch/reset")
 async def reset_kill_switch_route(body: dict | None = None):
-    """Manually clear a tripped lock so the bot can place new entries
-    again. Typically used after the user resolves the underlying
-    issue (added funds, reviewed the loss, etc.).
-    """
-    from app.execution.account_kill_switch import reset_kill_switch
+    """Manually clear a tripped lock for one account so the bot can place
+    new entries again. Typically used after the user resolves the
+    underlying issue (added funds, reviewed the loss, etc.).
 
+    Body: ``{ "account_id": 3, "reason": "manual_reset_via_ui" }``. When
+    ``account_id`` is missing, the env-based (legacy) singleton is
+    reset.
+    """
+    from app.execution.account_kill_switch import ENV_ACCOUNT_ID, reset_kill_switch
+
+    account_id = int((body or {}).get("account_id") or 0) or ENV_ACCOUNT_ID
     reason = (body or {}).get("reason") or "manual_reset_via_ui"
-    state = reset_kill_switch(reason=str(reason))
+    state = reset_kill_switch(account_id, reason=str(reason))
     return {"ok": True, "state": state.to_dict()}
+
+
+async def _refresh_kill_switch_states_from_db() -> None:
+    """Warm the in-memory kill-switch state cache from active Dhan rows
+    so newly-added accounts appear in ``GET /api/risk/kill-switch``
+    before the watchdog has run its first poll.
+    """
+    from sqlalchemy import select
+    from app.db.account_models import BrokerAccount
+    from app.db.models import AsyncSessionLocal
+    from app.execution.account_kill_switch import _get_or_create_state, _state_lock
+
+    async with AsyncSessionLocal() as s:
+        rows = (
+            await s.execute(
+                select(BrokerAccount).where(
+                    BrokerAccount.is_active == True,  # noqa: E712
+                    BrokerAccount.broker == "dhan",
+                ).order_by(BrokerAccount.id.asc())
+            )
+        ).scalars().all()
+        with _state_lock:
+            for r in rows:
+                st = _get_or_create_state(
+                    int(r.id),
+                    account_name=str(r.name or f"account-{r.id}"),
+                    broker=str(r.broker or "dhan"),
+                )
+                if r.kill_switch_enabled is not None:
+                    st.enabled = bool(r.kill_switch_enabled)
+                if r.daily_loss_limit is not None:
+                    try:
+                        v = float(r.daily_loss_limit)
+                        if v > 0:
+                            st.limit = v
+                    except (TypeError, ValueError):
+                        pass
 
 
 # ── Strategy Settings (per-scanner exec params + ATL straddle) ────────────

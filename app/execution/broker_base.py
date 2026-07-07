@@ -80,6 +80,14 @@ class OrderRequest:
     # accepts the order) leaves the strategy with naked positions and
     # no chance to roll back.
     wait_for_terminal: bool = False
+    # ── Broker-native identifiers (optional) ─────────────────────────
+    # When the caller already has the broker-native security id / segment
+    # (e.g. from a broker /positions response), pass them here so the
+    # adapter can skip symbol resolution entirely. Used by the manual
+    # exit path where the display ``trading_symbol`` is broker-formatted
+    # (``NIFTY-Jul2026-24100-PE``) and cannot be reparsed.
+    broker_security_id: Optional[str] = None
+    broker_exchange_segment: Optional[str] = None
 
 
 @dataclass

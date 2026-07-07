@@ -58,6 +58,13 @@ class BrokerAccount(Base):
     proxy_instance_name = Column(String(100), nullable=True, default="")
     available_funds = Column(Float, nullable=True, default=0.0)
     used_funds = Column(Float, nullable=True, default=0.0)
+    # Per-account daily-loss kill switch. When ``kill_switch_enabled`` is
+    # True and the account's realised+unrealised PnL drops below
+    # ``-daily_loss_limit``, the watchdog force-closes only this account's
+    # open positions and blocks new-entry orders routed through it until
+    # midnight IST (or an explicit reset via the UI).
+    kill_switch_enabled = Column(Boolean, nullable=False, default=True)
+    daily_loss_limit = Column(Float, nullable=False, default=6000.0)
     last_connection_status = Column(String(30), nullable=True, default="unknown")  # connected | disconnected | error
     last_connection_error = Column(Text, nullable=True)
     last_connected_at = Column(DateTime, nullable=True)
