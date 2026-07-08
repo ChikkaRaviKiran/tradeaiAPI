@@ -2479,9 +2479,18 @@ async def update_kill_switch(body: dict):
                         row.kill_switch_enabled = bool(enabled)
                     if limit_f is not None and limit_f > 0:
                         row.daily_loss_limit = float(limit_f)
-                    await s.refresh(row, ["name", "broker", "kill_switch_enabled", "daily_loss_limit"])
+                    # Capture display metadata BEFORE the transaction
+                    # commits. Do NOT call s.refresh(..., [cols]) here —
+                    # it expires+re-reads those columns from the DB and
+                    # SILENTLY DISCARDS the pending assignments above,
+                    # so the UPDATE never fires and the row stays at
+                    # its old values.
                     account_name = row.name
                     broker_type = row.broker
+                    # Force the UPDATE onto the wire inside this
+                    # transaction so the outer `async with s.begin()`
+                    # exit performs a real COMMIT of the new values.
+                    await s.flush()
         except Exception:
             logger.exception("Failed to persist kill-switch settings for account %s", account_id)
             return {"ok": False, "error": "database write failed"}
