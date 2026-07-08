@@ -1752,6 +1752,19 @@ class Orchestrator:
                         await self.strategy_registry.sync_from_db()
                     except Exception:
                         logger.exception("[Registry] sync_from_db failed")
+                    # After every sync, make sure every index referenced
+                    # by a live strategy row is in _active_instruments
+                    # (so its scanner actually receives candles) and has
+                    # an expiry resolved (so option-quote fetches don't
+                    # silently short-circuit). Without this a strategy
+                    # created after startup — or one whose index was
+                    # swapped mid-session — never places orders.
+                    try:
+                        await self._ensure_registry_indices_active()
+                    except Exception:
+                        logger.exception(
+                            "[Registry] _ensure_registry_indices_active failed",
+                        )
                     self._registry_last_sync_cycle[symbol] = cycle
 
                 # Multi-instance path: dispatch to every registry scanner.
@@ -2604,6 +2617,127 @@ class Orchestrator:
         except Exception:
             logger.debug("_union_with_instance_indices failed; using base list", exc_info=True)
             return base
+
+    async def _ensure_registry_indices_active(self) -> None:
+        """Ensure every index configured on a live ``StrategyInstance`` is
+        present in ``_active_instruments`` with its expiry resolved.
+
+        ``_active_instruments`` is otherwise only computed at startup, so
+        a strategy created (or having its ``index`` swapped) mid-session
+        would have a scanner in the registry but never receive a
+        matching-index candle — the scanner would silently record
+        ``wrong_index_...`` diagnostics and never place any order.
+
+        Called once per registry ``sync_from_db()``. Idempotent and cheap
+        after the first resolution (instrument master + expiry are cached).
+        """
+        registry = getattr(self, "strategy_registry", None)
+        if not registry or not registry.scanners:
+            return
+
+        # Which indices do the currently-registered scanners want?
+        wanted_indices: set[str] = set()
+        for sc in registry.scanners.values():
+            try:
+                cfg = sc._settings_loader() or {}
+            except Exception:
+                continue
+            idx = str(cfg.get("index") or "").upper()
+            if idx:
+                wanted_indices.add(idx)
+
+        if not wanted_indices:
+            return
+
+        existing = {i.symbol for i in self._active_instruments}
+        missing = wanted_indices - existing
+
+        for sym in sorted(missing):
+            inst = get_instrument(sym)
+            if inst is None or not inst.enabled:
+                logger.warning(
+                    "[Registry] Strategy references index %s but it is "
+                    "unknown/disabled in instruments.py — scanner will never "
+                    "see matching candles and no orders will place",
+                    sym,
+                )
+                continue
+            self._active_instruments.append(inst)
+            logger.info(
+                "[Registry] Activated index %s for strategy — active "
+                "instruments now: %s",
+                sym, [i.symbol for i in self._active_instruments],
+            )
+
+        # For every wanted index (new or pre-existing), make sure we have
+        # an expiry cached. Without this the scanner's expiry_provider
+        # returns "" and _fetch_option_quote silently short-circuits,
+        # so no orders ever fire even after candles start flowing.
+        for sym in wanted_indices:
+            if not self._expiries.get(sym):
+                await self._resolve_and_push_expiry(sym)
+
+    async def _resolve_and_push_expiry(self, index_symbol: str) -> None:
+        """Resolve the nearest option expiry for ``index_symbol`` and
+        push it to every registry scanner configured on that index.
+
+        Caches into ``self._expiries`` / ``self._expiry_dates`` so the
+        ``expiry_provider`` callback works for subsequent refreshes.
+        """
+        inst = get_instrument(index_symbol)
+        inst_name = (
+            (inst.option_symbol_prefix or inst.symbol)
+            if inst else index_symbol
+        )
+        try:
+            expiry = await asyncio.to_thread(
+                self.client.get_nearest_weekly_expiry,
+                instrument_name=inst_name,
+            )
+        except Exception:
+            logger.exception(
+                "[Registry] Expiry resolution failed for %s", index_symbol,
+            )
+            return
+        if not expiry:
+            logger.warning(
+                "[Registry] No expiry found for %s — option quotes will MISS "
+                "and no orders can place until it resolves",
+                index_symbol,
+            )
+            return
+
+        parsed = None
+        try:
+            parsed = datetime.strptime(expiry, "%d%b%y").date()
+        except ValueError:
+            logger.warning(
+                "[Registry] Could not parse expiry '%s' for %s",
+                expiry, index_symbol,
+            )
+
+        self._expiries[index_symbol] = expiry
+        if parsed is not None:
+            self._expiry_dates[index_symbol] = parsed
+        logger.info(
+            "[Registry] Resolved expiry for %s: %s", index_symbol, expiry,
+        )
+
+        # Push directly to every scanner on this index so it doesn't
+        # have to wait for its own periodic settings refresh cycle.
+        registry = getattr(self, "strategy_registry", None)
+        if not registry:
+            return
+        for sc in registry.scanners.values():
+            try:
+                cfg = sc._settings_loader() or {}
+                if str(cfg.get("index") or "").upper() == index_symbol:
+                    sc.set_expiry(expiry, parsed)
+            except Exception:
+                logger.exception(
+                    "[Registry] Failed pushing expiry to scanner %s",
+                    getattr(sc, "instance_id", "?"),
+                )
 
     def _resolve_from_config(self) -> list[InstrumentConfig]:
         """Resolve instruments from ACTIVE_INSTRUMENTS config."""
