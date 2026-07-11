@@ -1334,21 +1334,60 @@ async def capture_broker_eod_snapshot():
 
 
 @app.get("/api/trade-history")
-async def get_trade_history(date: str | None = None, month: str | None = None):
-    """Unified history API consumed by new HistoryPage.
+async def get_trade_history(
+    date: str | None = None,
+    month: str | None = None,
+    account_id: int = 0,
+):
+    """Unified history API consumed by HistoryPage.
 
     Query params:
-      - date=YYYY-MM-DD  -> day detail
-      - month=YYYY-MM    -> month summary calendar
+      - date=YYYY-MM-DD   -> day detail (with per-account broker snapshots)
+      - month=YYYY-MM     -> month summary calendar + per-account rollup
+      - account_id=<int>  -> filter to a specific BrokerAccount (0/omit = all)
     """
-    from sqlalchemy import func, select
+    from collections import defaultdict
+    from sqlalchemy import select
+    from app.db.account_models import BrokerAccount
     from app.db.models import AsyncSessionLocal, BrokerEODSnapshot, TradeRecord
 
     target_date = (date or "").strip()
     target_month = (month or "").strip()
 
+    # ── Helpers ────────────────────────────────────────────────────
+    def _snap_matches(snap: "BrokerEODSnapshot", acct: "BrokerAccount") -> bool:
+        """Best-effort snapshot ↔ account matcher.
+
+        Current EOD snapshot code stores account_name as UPPER(broker) e.g.
+        "DHAN" (one row per broker type). Match by either broker or name.
+        """
+        got = (snap.account_name or "").strip().upper()
+        candidates = {
+            (acct.broker or "").strip().upper(),
+            (acct.name or "").strip().upper(),
+        }
+        candidates.discard("")
+        return got in candidates
+
+    def _friendly_name(snap: "BrokerEODSnapshot", accts: list["BrokerAccount"]) -> str:
+        for a in accts:
+            if _snap_matches(snap, a):
+                return a.name or (a.broker or "").upper() or "Primary"
+        return snap.account_name or "Primary"
+
+    def _account_id_for(name: str, accts: list["BrokerAccount"]) -> int | None:
+        up = (name or "").strip().upper()
+        for a in accts:
+            if up and (up == (a.name or "").strip().upper() or up == (a.broker or "").strip().upper()):
+                return a.id
+        return None
+
+    # ── Day detail ────────────────────────────────────────────────
     if target_date:
         async with AsyncSessionLocal() as session:
+            accts = (await session.execute(select(BrokerAccount))).scalars().all()
+            filter_acct = next((a for a in accts if a.id == account_id), None) if account_id else None
+
             trade_rows = (
                 await session.execute(
                     select(TradeRecord).where(TradeRecord.date == target_date)
@@ -1361,8 +1400,21 @@ async def get_trade_history(date: str | None = None, month: str | None = None):
                 )
             ).scalars().all()
 
+        if filter_acct is not None:
+            snap_rows = [s for s in snap_rows if _snap_matches(s, filter_acct)]
+
         trade_pnl = round(sum(_safe_num(t.pnl, 0.0) for t in trade_rows), 2)
         broker_pnl = round(sum(_safe_num(s.broker_pnl, 0.0) for s in snap_rows), 2)
+
+        broker_accounts = [
+            {
+                "account_id": _account_id_for(_friendly_name(s, accts), accts),
+                "account_name": _friendly_name(s, accts),
+                "broker_pnl": round(_safe_num(s.broker_pnl, 0.0), 2),
+                "positions": _safe_int(s.positions_count, 0),
+            }
+            for s in snap_rows
+        ]
 
         return {
             "status": "ok",
@@ -1370,16 +1422,10 @@ async def get_trade_history(date: str | None = None, month: str | None = None):
             "total_trades": len(trade_rows),
             "month_pnl": trade_pnl,
             "broker_pnl": broker_pnl if snap_rows else trade_pnl,
-            "broker_accounts": [
-                {
-                    "account_name": s.account_name or "Primary",
-                    "broker_pnl": _safe_num(s.broker_pnl, 0.0),
-                    "positions": _safe_int(s.positions_count, 0),
-                }
-                for s in snap_rows
-            ],
+            "broker_accounts": broker_accounts,
         }
 
+    # ── Month calendar ────────────────────────────────────────────
     if not target_month:
         target_month = datetime.now(_IST).strftime("%Y-%m")
 
@@ -1387,65 +1433,111 @@ async def get_trade_history(date: str | None = None, month: str | None = None):
         year, mon = target_month.split("-")
         start_date = f"{int(year):04d}-{int(mon):02d}-01"
         dt = datetime(int(year), int(mon), 1)
-        next_month_dt = datetime(dt.year + (1 if dt.month == 12 else 0), 1 if dt.month == 12 else dt.month + 1, 1)
+        next_month_dt = datetime(
+            dt.year + (1 if dt.month == 12 else 0),
+            1 if dt.month == 12 else dt.month + 1,
+            1,
+        )
         end_date = next_month_dt.strftime("%Y-%m-%d")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM")
 
     async with AsyncSessionLocal() as session:
+        accts = (await session.execute(select(BrokerAccount))).scalars().all()
+        filter_acct = next((a for a in accts if a.id == account_id), None) if account_id else None
+
         trade_rows = (
             await session.execute(
-                select(
-                    TradeRecord.date,
-                    func.count(TradeRecord.id).label("trades"),
-                    func.coalesce(func.sum(TradeRecord.pnl), 0.0).label("trade_pnl"),
+                select(TradeRecord).where(
+                    TradeRecord.date >= start_date,
+                    TradeRecord.date < end_date,
                 )
-                .where(TradeRecord.date >= start_date, TradeRecord.date < end_date)
-                .group_by(TradeRecord.date)
-                .order_by(TradeRecord.date)
             )
-        ).all()
+        ).scalars().all()
 
-        snap_rows = (
+        snap_rows_all = (
             await session.execute(
-                select(
-                    BrokerEODSnapshot.date,
-                    func.coalesce(func.sum(BrokerEODSnapshot.broker_pnl), 0.0).label("broker_pnl"),
+                select(BrokerEODSnapshot).where(
+                    BrokerEODSnapshot.date >= start_date,
+                    BrokerEODSnapshot.date < end_date,
                 )
-                .where(BrokerEODSnapshot.date >= start_date, BrokerEODSnapshot.date < end_date)
-                .group_by(BrokerEODSnapshot.date)
-                .order_by(BrokerEODSnapshot.date)
             )
-        ).all()
+        ).scalars().all()
 
-    trade_map = {
-        r.date: {
-            "trades": int(r.trades or 0),
-            "trade_pnl": float(r.trade_pnl or 0.0),
-        }
-        for r in trade_rows
-    }
-    snap_map = {r.date: float(r.broker_pnl or 0.0) for r in snap_rows}
+    if filter_acct is not None:
+        snap_rows_all = [s for s in snap_rows_all if _snap_matches(s, filter_acct)]
 
-    all_dates = sorted(set(trade_map.keys()) | set(snap_map.keys()))
+    # Aggregate trade rows per date
+    trade_map: dict[str, dict] = defaultdict(lambda: {"trades": 0, "trade_pnl": 0.0})
+    for t in trade_rows:
+        d = t.date
+        trade_map[d]["trades"] += 1
+        trade_map[d]["trade_pnl"] += _safe_num(t.pnl, 0.0)
+
+    # Group snapshots by date
+    snap_by_date: dict[str, list] = defaultdict(list)
+    for s in snap_rows_all:
+        snap_by_date[s.date].append(s)
+
+    # Per-account monthly rollup
+    acct_monthly_pnl: dict[str, float] = defaultdict(float)
+    acct_monthly_days: dict[str, set] = defaultdict(set)
+
+    all_dates = sorted(set(trade_map.keys()) | set(snap_by_date.keys()))
     days: list[dict] = []
     for d in all_dates:
-        trades = trade_map.get(d, {}).get("trades", 0)
-        t_pnl = trade_map.get(d, {}).get("trade_pnl", 0.0)
-        b_pnl = snap_map.get(d)
-        days.append(
-            {
-                "date": d,
-                "trades": trades,
-                "pnl": round(t_pnl, 2),
-                "broker_pnl": round(b_pnl, 2) if b_pnl is not None else round(t_pnl, 2),
-                "source": "eod_snapshot" if b_pnl is not None else "trades",
-            }
-        )
+        trades = int(trade_map[d]["trades"])
+        t_pnl = float(trade_map[d]["trade_pnl"])
+        d_snaps = snap_by_date.get(d, [])
 
-    month_pnl = round(sum((d.get("broker_pnl") if d.get("source") == "eod_snapshot" else d.get("pnl", 0.0)) for d in days), 2)
-    winning_days = len([d for d in days if (d.get("broker_pnl", d.get("pnl", 0.0)) or 0.0) > 0])
-    losing_days = len([d for d in days if (d.get("broker_pnl", d.get("pnl", 0.0)) or 0.0) < 0])
+        day_accounts: list[dict] = []
+        b_pnl_total = 0.0
+        for s in d_snaps:
+            name = _friendly_name(s, accts)
+            pnl_val = _safe_num(s.broker_pnl, 0.0)
+            b_pnl_total += pnl_val
+            day_accounts.append({
+                "account_id": _account_id_for(name, accts),
+                "account_name": name,
+                "pnl": round(pnl_val, 2),
+                "positions": _safe_int(s.positions_count, 0),
+            })
+            acct_monthly_pnl[name] += pnl_val
+            acct_monthly_days[name].add(d)
+
+        has_snap = bool(d_snaps)
+        days.append({
+            "date": d,
+            "trades": trades,
+            "pnl": round(t_pnl, 2),
+            "broker_pnl": round(b_pnl_total, 2) if has_snap else round(t_pnl, 2),
+            "source": "eod_snapshot" if has_snap else "trades",
+            "accounts": day_accounts,
+        })
+
+    month_pnl = round(
+        sum(
+            (d.get("broker_pnl") if d.get("source") == "eod_snapshot" else d.get("pnl", 0.0))
+            for d in days
+        ),
+        2,
+    )
+    winning_days = len(
+        [d for d in days if (d.get("broker_pnl") if d.get("source") == "eod_snapshot" else d.get("pnl", 0.0)) > 0]
+    )
+    losing_days = len(
+        [d for d in days if (d.get("broker_pnl") if d.get("source") == "eod_snapshot" else d.get("pnl", 0.0)) < 0]
+    )
+
+    accounts_summary = [
+        {
+            "account_id": _account_id_for(name, accts),
+            "account_name": name,
+            "pnl": round(pnl, 2),
+            "trading_days": len(acct_monthly_days[name]),
+        }
+        for name, pnl in sorted(acct_monthly_pnl.items())
+    ]
 
     return {
         "status": "ok",
@@ -1456,6 +1548,7 @@ async def get_trade_history(date: str | None = None, month: str | None = None):
         "losing_days": losing_days,
         "month_trades": int(sum(d.get("trades", 0) for d in days)),
         "days": days,
+        "accounts": accounts_summary,
     }
 
 
