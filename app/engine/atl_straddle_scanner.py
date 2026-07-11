@@ -1448,6 +1448,15 @@ class ATLStraddleScanner:
         a ₹5–10 premium when spot is far from ATM; the previous 20-strike
         cap returned strikes still ~₹30–40 above target.
         """
+        # Illiquid-strike floor: Dhan (and other brokers) reject MARKET orders
+        # on deep-OTM BSE_FNO options whose bid side is empty. Symptom seen in
+        # prod on 2026-07-10 09:45:18 IST: hedge PE strike 73700 (spot ~77500,
+        # LTP ~₹0.05–0.30) → DH-906 "Invalid Price" → other hedge leg was
+        # already filled → _close_hedges wash-traded the accepted CE. Any
+        # strike whose LTP is below MIN_HEDGE_LTP is considered untradeable
+        # and skipped, even if it matches target_premium more closely.
+        MIN_HEDGE_LTP = 0.5
+
         best: Optional[ATLLeg] = None
         best_diff: Optional[float] = None
         for step in range(1, 81):
@@ -1456,8 +1465,15 @@ class ATLStraddleScanner:
             if not q:
                 continue
             ltp = float(q.get("ltp", 0) or 0)
-            if ltp <= 0:
-                continue
+            if ltp < MIN_HEDGE_LTP:
+                # Once LTP drops below the liquidity floor walking further OTM
+                # only makes it worse — abort the walk so we return the last
+                # tradeable candidate instead of picking a zero-bid strike.
+                logger.info(
+                    "[ATL] %s walk stopped at strike %.0f (ltp=%.2f < %.2f); returning best candidate seen",
+                    option_type, strike, ltp, MIN_HEDGE_LTP,
+                )
+                break
             # First strike at or below target wins outright — no need to
             # keep walking further OTM where LTP only gets smaller and
             # liquidity disappears.
@@ -1474,8 +1490,8 @@ class ATLStraddleScanner:
                     best = candidate
         if best is None:
             logger.warning(
-                "[ATL] No %s hedge candidate found within 80 strikes of %.0f (target=%.2f)",
-                option_type, ref_strike, target_premium,
+                "[ATL] No %s hedge candidate found within 80 strikes of %.0f (target=%.2f, min_ltp=%.2f)",
+                option_type, ref_strike, target_premium, MIN_HEDGE_LTP,
             )
         return best
 
