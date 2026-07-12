@@ -107,6 +107,10 @@ class DhanClient:
         self.client_id = client_id
         self.access_token = access_token
         self.proxy_url = (proxy_url or "").strip()
+        # Populated by wrapper methods on API-level failure so callers can
+        # distinguish "no data" from "auth expired". Cleared at the start of
+        # every wrapped call. Shape: {"code": "DH-901", "message": "..."}.
+        self.last_error: Optional[dict] = None
         # SDK shape changed in v3.x: dhanhq(client_id, token) → dhanhq(DhanContext(...))
         # Try the new style first, fall back to legacy positional args.
         if _DhanContext is not None:
@@ -300,12 +304,30 @@ class DhanClient:
         return []
 
     def get_positions(self) -> list[dict]:
+        self.last_error = None
         try:
             resp = self._dhan.get_positions()
-            if isinstance(resp, dict) and resp.get("status") == "success":
-                data = resp.get("data") or []
-                return data if isinstance(data, list) else []
-        except Exception:
+            if isinstance(resp, dict):
+                if resp.get("status") == "success":
+                    data = resp.get("data") or []
+                    return data if isinstance(data, list) else []
+                # Explicit API-level failure — record it so callers (e.g. EOD
+                # snapshot writer) can distinguish auth expiry from a real
+                # "zero positions" day and skip destructive writes.
+                remarks = resp.get("remarks") or {}
+                if isinstance(remarks, dict):
+                    err_code = str(remarks.get("error_code") or "")
+                    err_msg = str(remarks.get("error_message") or "")
+                else:
+                    err_code, err_msg = "", str(remarks)
+                self.last_error = {"code": err_code, "message": err_msg}
+                logger.error(
+                    "Dhan get_positions returned failure status: %s - %s",
+                    err_code or "?",
+                    err_msg or "?",
+                )
+        except Exception as e:
+            self.last_error = {"code": "SDK_EXCEPTION", "message": str(e)}
             logger.exception("Dhan get_positions failed")
         return []
 

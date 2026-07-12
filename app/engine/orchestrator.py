@@ -3721,6 +3721,37 @@ class Orchestrator:
             # Dhan adapter
             elif cls_name.startswith("dhan") and hasattr(broker, "_client"):
                 raw = broker._client.get_positions() or []
+                # Guard against silent auth failure: if the Dhan API returned
+                # an error status (e.g. DH-901 expired token), get_positions()
+                # yields [] AND populates ``last_error``. Writing zeros in that
+                # case would clobber a previously-good snapshot and hide the
+                # real problem from the History UI. Abort with an alert
+                # instead — a subsequent run (after token refresh) will fill it in.
+                last_err = getattr(broker._client, "last_error", None)
+                if not raw and last_err:
+                    err_code = last_err.get("code", "?")
+                    err_msg = last_err.get("message", "?")
+                    logger.error(
+                        "EOD snapshot ABORTED for %s (%s): Dhan API error %s - %s. "
+                        "Not overwriting existing snapshot with zeros. Refresh Dhan token.",
+                        target_date, account_name, err_code, err_msg,
+                    )
+                    try:
+                        from app.alerts.alert_manager import AlertManager
+                        am = AlertManager()
+                        await am.telegram.send(
+                            f"\u26a0\ufe0f TradeAI EOD snapshot SKIPPED for {target_date} "
+                            f"({account_name}): Dhan auth failure "
+                            f"[{err_code}] {err_msg}. Refresh the access token "
+                            f"in Settings and re-run the manual capture."
+                        )
+                    except Exception:
+                        logger.debug("EOD auth-failure alert send failed", exc_info=True)
+                    # Mark this date as "attempted" so we don't retry repeatedly
+                    # within the same minute, but leave off the ``if
+                    # self._last_eod_snapshot_date == target_date`` short-circuit
+                    # on tomorrow's run by only setting it after successful writes.
+                    return
                 payload = raw
                 positions_count = len(raw)
                 for p in raw:

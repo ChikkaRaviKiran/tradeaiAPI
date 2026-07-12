@@ -145,12 +145,49 @@ def invalidate(broker: Optional[str] = None) -> None:
 # ── Convenience wrappers ─────────────────────────────────────────────────
 
 def get_dhan_credentials(*, fresh: bool = False) -> Dict[str, str]:
-    """Return ``{"client_id": ..., "access_token": ...}`` falling back to env.
+    """Return ``{"client_id": ..., "access_token": ...}`` for Dhan.
 
-    Pass ``fresh=True`` to bypass the in-process cache (used after a token
-    rotation when the broker wants to be 100% certain it has the latest
-    value, even within the cache window).
+    Lookup order (first non-empty wins):
+
+    1. ``broker_accounts`` — the multi-account table the UI writes to when
+       the user updates a token. Freshest by construction, so preferred.
+    2. ``broker_credentials`` — legacy single-broker credential store.
+    3. ``settings.dhan_*`` — bootstrap fallback from ``.env``.
+
+    Pass ``fresh=True`` to bypass the in-process cache for step 2 (used
+    after a token rotation via ``set_dhan_credentials`` when the caller
+    wants to be 100% certain it has the latest value).
     """
+    # Step 1: prefer broker_accounts (freshest — UI target)
+    try:
+        eng = _get_engine()
+        with eng.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT client_id, access_token
+                      FROM broker_accounts
+                     WHERE LOWER(broker) = 'dhan'
+                       AND is_active = TRUE
+                       AND access_token IS NOT NULL
+                       AND access_token <> ''
+                       AND client_id IS NOT NULL
+                       AND client_id <> ''
+                     ORDER BY updated_at DESC NULLS LAST, id DESC
+                     LIMIT 1
+                    """
+                )
+            ).fetchone()
+        if row and row[0] and row[1]:
+            return {"client_id": str(row[0]), "access_token": str(row[1])}
+    except Exception:
+        # Table might not exist yet (fresh install) — silently fall through
+        logger.debug(
+            "get_dhan_credentials: broker_accounts lookup failed, falling back",
+            exc_info=True,
+        )
+
+    # Step 2: legacy broker_credentials table
     creds = get_credentials("dhan", fresh=fresh)
     client_id = creds.get("client_id") or settings.dhan_client_id or ""
     access_token = creds.get("access_token") or settings.dhan_access_token or ""
