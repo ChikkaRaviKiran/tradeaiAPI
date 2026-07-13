@@ -1680,6 +1680,11 @@ class ATLStraddleScanner:
             expiry_date=self._expiry_date,
             strike=float(leg.strike),
             option_type=leg.option_type,
+            # Pass the LTP from the leg (fetched via AngelOne during leg-build)
+            # so the Dhan adapter can use it as the BFO MARKET-as-LIMIT base
+            # price when Dhan's own get_ltp() returns None for deep-OTM BFO
+            # strikes (root cause of Jul-13 SENSEX PE hedge DH-906 rejection).
+            known_ltp=float(leg.premium) if leg.premium and leg.premium > 0 else 0.0,
             # ATL must know the FINAL order outcome before moving on. With
             # fast-ack mode, the broker returns OPEN as soon as it accepts
             # the order — but exchange-side rejections (insufficient

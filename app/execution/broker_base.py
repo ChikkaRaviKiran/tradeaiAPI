@@ -88,6 +88,11 @@ class OrderRequest:
     # (``NIFTY-Jul2026-24100-PE``) and cannot be reparsed.
     broker_security_id: Optional[str] = None
     broker_exchange_segment: Optional[str] = None
+    # Caller-supplied LTP (e.g. from AngelOne quote). Used by the Dhan adapter
+    # as a fallback protection-band base price for BFO MARKET-as-LIMIT orders
+    # when Dhan's own get_ltp() returns None (deep-OTM strikes can be in the
+    # AngelOne master but absent from Dhan's live quote stream).
+    known_ltp: float = 0.0
 
 
 @dataclass

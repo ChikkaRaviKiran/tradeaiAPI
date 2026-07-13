@@ -342,6 +342,16 @@ class DhanBroker(BaseBroker):
                 ltp = self._client.get_ltp(exchange_segment, security_id) or 0.0
             except Exception:
                 ltp = 0.0
+            # Fallback: use caller-supplied known_ltp (e.g. AngelOne quote
+            # fetched by the scanner) when Dhan's own quote API returns nothing.
+            # Deep-OTM BFO strikes (e.g. SENSEX PE 5000+ pts OTM) may be in
+            # the AngelOne master but absent from Dhan's live quote cache.
+            if not ltp and getattr(request, 'known_ltp', 0.0) > 0:
+                ltp = float(request.known_ltp)
+                logger.info(
+                    "DHAN BFO using caller-supplied LTP %.2f for %s (Dhan quote unavailable)",
+                    ltp, request.trading_symbol,
+                )
             if ltp and ltp > 0:
                 buffer = 0.20  # ±20% market-protection band
                 if request.side.value.upper() == "BUY":
