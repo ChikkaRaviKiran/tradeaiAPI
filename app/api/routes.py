@@ -449,6 +449,15 @@ async def lifespan(app: FastAPI):
         except Exception as _cs_e:
             logger.warning("condor_setup startup hook failed: %s", _cs_e)
 
+    # Level Zones: weekly/monthly breakout PAPER-TRADE Telegram alert poller
+    # (isolated, paper-trade-only subsystem — never places a live order).
+    if os.environ.get("LEVEL_ZONE_ALERTS_SCHEDULER", "1") != "0":
+        try:
+            from app.level_zones.alert_scheduler import start_scheduler as _lza_start
+            _lza_start()
+        except Exception as _lza_e:
+            logger.warning("level_zones alert scheduler startup hook failed: %s", _lza_e)
+
     if os.environ.get("SKIP_ORCHESTRATOR") == "1":
         logger.info("SKIP_ORCHESTRATOR=1 — skipping orchestrator (backtest-only mode)")
         yield
@@ -490,6 +499,12 @@ async def lifespan(app: FastAPI):
     try:
         from app.condor_setup.scheduler import stop_scheduler as _cs_stop
         _cs_stop()
+    except Exception:
+        pass
+    # Stop the level-zones alert poller if running
+    try:
+        from app.level_zones.alert_scheduler import stop_scheduler as _lza_stop
+        _lza_stop()
     except Exception:
         pass
     # Stop the kill-switch watchdog.
