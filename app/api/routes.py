@@ -440,6 +440,15 @@ async def lifespan(app: FastAPI):
         except Exception as _pe_e:
             logger.warning("pattern_engine startup hook failed: %s", _pe_e)
 
+    # Condor Setup: pre-market confluence-based condor levels job (isolated,
+    # read-only, informational subsystem — never places live orders).
+    if os.environ.get("CONDOR_SETUP_SCHEDULER", "1") != "0":
+        try:
+            from app.condor_setup.scheduler import start_scheduler as _cs_start
+            _cs_start()
+        except Exception as _cs_e:
+            logger.warning("condor_setup startup hook failed: %s", _cs_e)
+
     if os.environ.get("SKIP_ORCHESTRATOR") == "1":
         logger.info("SKIP_ORCHESTRATOR=1 — skipping orchestrator (backtest-only mode)")
         yield
@@ -475,6 +484,12 @@ async def lifespan(app: FastAPI):
     try:
         from app.pattern_engine.scheduler import stop_scheduler
         stop_scheduler()
+    except Exception:
+        pass
+    # Stop the condor-setup scheduler if running
+    try:
+        from app.condor_setup.scheduler import stop_scheduler as _cs_stop
+        _cs_stop()
     except Exception:
         pass
     # Stop the kill-switch watchdog.
@@ -514,6 +529,14 @@ app.add_middleware(
 
 trade_logger = TradeLogger()
 history_logger = HistoryLogger()
+
+
+# ── Condor Setup routes (isolated, read-only subsystem) ─────────────────
+try:
+    from app.condor_setup.routes import register_routes as _register_cs_routes
+    _register_cs_routes(app)
+except Exception as _cs_err:  # pragma: no cover
+    logger.warning("condor_setup routes not registered: %s", _cs_err)
 
 
 # ── Pattern Engine routes (isolated subsystem) ───────────────────────────
