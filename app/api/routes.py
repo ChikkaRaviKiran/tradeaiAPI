@@ -539,6 +539,14 @@ except Exception as _cs_err:  # pragma: no cover
     logger.warning("condor_setup routes not registered: %s", _cs_err)
 
 
+# ── Level Zones routes (isolated, read-only, informational-only subsystem) ──
+try:
+    from app.level_zones.routes import register_routes as _register_lz_routes
+    _register_lz_routes(app)
+except Exception as _lz_err:  # pragma: no cover
+    logger.warning("level_zones routes not registered: %s", _lz_err)
+
+
 # ── Pattern Engine routes (isolated subsystem) ───────────────────────────
 try:
     from app.pattern_engine.routes import register_routes as _register_pe_routes
