@@ -108,12 +108,22 @@ class CondorLegs:
 def build_condor(resistance_strike: float, support_strike: float, wing_width: int, strike_step: int) -> CondorLegs:
     """Short strikes placed at the confluence resistance/support levels
     (rounded to the nearest tradable strike); long wings further out for
-    defined risk."""
+    defined risk.
+
+    wing_width is a fixed point distance (250) that is only a clean multiple
+    of NIFTY's 50-point strike step, not SENSEX's 100-point step (250/100 =
+    2.5) - naively adding/subtracting it would land on a non-tradable strike
+    (e.g. 76550, 77150). Instead we round the wing OUTWARD (away from the
+    short strike) to the nearest valid strike, which guarantees a tradable
+    strike that gives AT LEAST wing_width points of protection (never less).
+    """
+    import math
+
     def round_to_step(x: float) -> float:
         return round(x / strike_step) * strike_step
 
     short_ce = round_to_step(resistance_strike)
     short_pe = round_to_step(support_strike)
-    long_ce = short_ce + wing_width
-    long_pe = short_pe - wing_width
+    long_ce = math.ceil((short_ce + wing_width) / strike_step) * strike_step
+    long_pe = math.floor((short_pe - wing_width) / strike_step) * strike_step
     return CondorLegs(short_ce_strike=short_ce, short_pe_strike=short_pe, long_ce_strike=long_ce, long_pe_strike=long_pe)
