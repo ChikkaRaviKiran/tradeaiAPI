@@ -3063,7 +3063,7 @@ class Orchestrator:
             quote = await asyncio.wait_for(
                 asyncio.to_thread(
                     self.client.get_option_quote,
-                    "NFO",
+                    instrument.option_exchange.value,
                     token_info.get("tradingsymbol", ""),
                     token_info.get("symboltoken", ""),
                 ),

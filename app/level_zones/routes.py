@@ -10,6 +10,7 @@ support/resistance zones for planning manual directional (buy) trades.
 """
 from __future__ import annotations
 
+import json
 import logging
 
 from fastapi import FastAPI
@@ -33,15 +34,18 @@ def _trade_to_dict(row: LevelZonePaperTrade) -> dict:
         "direction": row.direction,
         "zone_price": row.zone_price,
         "zone_confidence": row.zone_confidence,
+        "zone_sources": json.loads(row.zone_sources) if row.zone_sources else None,
         "strike": row.strike,
         "expiry": row.expiry,
         "entry_price": row.entry_price,
         "sl_price": row.sl_price,
         "target_price": row.target_price,
         "entry_time": row.entry_time.isoformat() if row.entry_time else None,
+        "spot_at_entry": row.spot_at_entry,
         "status": row.status,
         "exit_price": row.exit_price,
         "exit_time": row.exit_time.isoformat() if row.exit_time else None,
+        "spot_at_exit": row.spot_at_exit,
         "pnl_points": row.pnl_points,
     }
 

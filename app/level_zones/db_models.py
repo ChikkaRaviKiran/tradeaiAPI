@@ -8,7 +8,7 @@ alert can be sent at entry and at exit.
 """
 from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, Float, Integer, String
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text
 
 from app.db.models import Base, _now_ist
 
@@ -23,6 +23,7 @@ class LevelZonePaperTrade(Base):
 
     zone_price = Column(Float, nullable=False)                     # the S/R zone that broke
     zone_confidence = Column(Integer, nullable=False)
+    zone_sources = Column(Text, nullable=True)                     # JSON list of contributing pivot/swing sources
 
     strike = Column(Float, nullable=False)
     expiry = Column(String(10), nullable=False)                    # DDMMMYY
@@ -31,10 +32,12 @@ class LevelZonePaperTrade(Base):
     sl_price = Column(Float, nullable=False)                       # option premium stop-loss
     target_price = Column(Float, nullable=False)                   # option premium target
     entry_time = Column(DateTime, nullable=False)
+    spot_at_entry = Column(Float, nullable=True)                   # underlying spot when the trade was opened
 
     status = Column(String(20), nullable=False, default="open")    # open / target_hit / sl_hit / eod_close
     exit_price = Column(Float, nullable=True)
     exit_time = Column(DateTime, nullable=True)
+    spot_at_exit = Column(Float, nullable=True)                    # underlying spot when the trade was closed
     pnl_points = Column(Float, nullable=True)                      # exit_price - entry_price (per unit, x lot_size = rupees)
 
     created_at = Column(DateTime, default=_now_ist)

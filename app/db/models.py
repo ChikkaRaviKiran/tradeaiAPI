@@ -454,6 +454,11 @@ async def init_db() -> None:
             # Per-account daily-loss kill switch
             "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS kill_switch_enabled BOOLEAN NOT NULL DEFAULT TRUE",
             "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS daily_loss_limit FLOAT NOT NULL DEFAULT 6000.0",
+            # Level Zones paper-trade analysis columns
+            "ALTER TABLE level_zone_paper_trades ADD COLUMN IF NOT EXISTS zone_sources TEXT",
+            "ALTER TABLE level_zone_paper_trades ADD COLUMN IF NOT EXISTS spot_at_entry FLOAT",
+            "ALTER TABLE level_zone_paper_trades ADD COLUMN IF NOT EXISTS spot_at_exit FLOAT",
+            "CREATE INDEX IF NOT EXISTS ix_level_zone_paper_trades_status ON level_zone_paper_trades (status)",
         ]
         for sql in migrations:
             try:

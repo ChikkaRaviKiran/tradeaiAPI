@@ -21,6 +21,7 @@ Never touches order placement, account state, or the live execution path.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -149,18 +150,22 @@ async def _fire_breakout(session, orch, symbol: str, direction: str, zone_price:
         further = sorted((z["price"] for z in zones if z["price"] < zone_price), reverse=True)
     next_zone_price = further[0] if further else None
 
+    zone_sources = next((z.get("sources") for z in zones if abs(z["price"] - zone_price) < 0.01), None)
+
     row = LevelZonePaperTrade(
         date=today_str,
         symbol=symbol,
         direction=direction,
         zone_price=zone_price,
         zone_confidence=zone_confidence,
+        zone_sources=json.dumps(zone_sources) if zone_sources else None,
         strike=strike,
         expiry=expiry_str,
         entry_price=entry_price,
         sl_price=sl_price,
         target_price=target_price,
         entry_time=_now().replace(tzinfo=None),
+        spot_at_entry=spot,
         status="open",
     )
     session.add(row)
@@ -263,6 +268,7 @@ async def _monitor_open_trades(session, orch) -> None:
         trade.status = exit_reason
         trade.exit_price = exit_price
         trade.exit_time = now.replace(tzinfo=None)
+        trade.spot_at_exit = _get_live_spot(trade.symbol)
         trade.pnl_points = round(exit_price - trade.entry_price, 2)
         await session.commit()
 
