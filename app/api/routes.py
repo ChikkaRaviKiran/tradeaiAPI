@@ -458,6 +458,16 @@ async def lifespan(app: FastAPI):
         except Exception as _lza_e:
             logger.warning("level_zones alert scheduler startup hook failed: %s", _lza_e)
 
+    # Expiry Levels: weekly (every Wednesday) + monthly (start of month)
+    # Classic-pivot 3R/3S snapshot job (isolated, read-only, informational
+    # subsystem — never places live orders).
+    if os.environ.get("EXPIRY_LEVELS_SCHEDULER", "1") != "0":
+        try:
+            from app.expiry_levels.scheduler import start_scheduler as _el_start
+            _el_start()
+        except Exception as _el_e:
+            logger.warning("expiry_levels startup hook failed: %s", _el_e)
+
     if os.environ.get("SKIP_ORCHESTRATOR") == "1":
         logger.info("SKIP_ORCHESTRATOR=1 — skipping orchestrator (backtest-only mode)")
         yield
@@ -507,6 +517,12 @@ async def lifespan(app: FastAPI):
         _lza_stop()
     except Exception:
         pass
+    # Stop the expiry-levels scheduler if running
+    try:
+        from app.expiry_levels.scheduler import stop_scheduler as _el_stop
+        _el_stop()
+    except Exception:
+        pass
     # Stop the kill-switch watchdog.
     try:
         from app.execution.account_kill_switch import stop_watchdog as _aks_stop
@@ -552,6 +568,14 @@ try:
     _register_cs_routes(app)
 except Exception as _cs_err:  # pragma: no cover
     logger.warning("condor_setup routes not registered: %s", _cs_err)
+
+
+# ── Expiry Levels routes (isolated, read-only, informational-only subsystem) ──
+try:
+    from app.expiry_levels.routes import register_routes as _register_el_routes
+    _register_el_routes(app)
+except Exception as _el_err:  # pragma: no cover
+    logger.warning("expiry_levels routes not registered: %s", _el_err)
 
 
 # ── Level Zones routes (isolated, read-only, informational-only subsystem) ──

@@ -107,11 +107,14 @@ def _period_ohlc(daily: pd.DataFrame, start: date, end: date) -> Optional[dict]:
 
 
 def _prior_week_bounds(today: date, weeks_back: int = 1) -> tuple:
-    """Mon-Fri bounds of the week `weeks_back` weeks before the current one."""
-    this_week_monday = today - timedelta(days=today.weekday())
-    friday = this_week_monday - timedelta(days=3 + 7 * (weeks_back - 1))
-    monday = friday - timedelta(days=4)
-    return monday, friday
+    """Wed-Tue bounds of the week `weeks_back` weeks before the current one —
+    NIFTY/SENSEX's trading week runs Wednesday -> following Tuesday (matching
+    the weekly options expiry cycle), NOT the calendar Mon-Fri week."""
+    days_since_wed = (today.weekday() - 2) % 7  # Mon=0..Sun=6, Wed=2
+    this_week_wed = today - timedelta(days=days_since_wed)
+    start = this_week_wed - timedelta(days=7 * weeks_back)
+    end = start + timedelta(days=6)  # Wed + 6 days = following Tue
+    return start, end
 
 
 def _prior_month_bounds(today: date, months_back: int = 1) -> tuple:
