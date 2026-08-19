@@ -22,7 +22,7 @@ from app.db.models import Base, _now_ist
 
 # Public constants — imported by API + UI validation paths.
 SUPPORTED_BROKERS = ("angel", "kite", "dhan")
-SUPPORTED_STRATEGY_TYPES = ("ATM_STRADDLE", "OTM_STRANGLE")
+SUPPORTED_STRATEGY_TYPES = ("ATM_STRADDLE", "OTM_STRANGLE", "MAXPAIN_ROLL")
 
 
 class BrokerAccount(Base):

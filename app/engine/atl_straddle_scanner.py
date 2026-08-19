@@ -381,6 +381,9 @@ class ATLStraddleScanner:
         return "LIVE" if self._is_live() else "PAPER"
 
     def _strike_mode(self) -> str:
+        stype = str(self._settings.get("strategy_type", "ATM_STRADDLE")).upper()
+        if stype == "MAXPAIN_ROLL":
+            return "MAXPAIN"
         mode = str(self._settings.get("strike_mode", "ATM")).upper()
         return mode if mode in {"ATM", "STRANGLE", "ITM", "MAXPAIN"} else "ATM"
 

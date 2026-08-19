@@ -1,4 +1,4 @@
-"""Multi-instance registry for ATM Straddle / OTM Strangle scanners.
+"""Multi-instance registry for ATM Straddle / OTM Strangle / MaxPain Roll scanners.
 
 Owns the lifecycle of N ``ATLStraddleScanner`` instances, one per
 active ``StrategyInstance`` row in the DB.  Each scanner has:
@@ -265,7 +265,7 @@ def _state_path_for_instance(instance_id: int) -> str:
 
 
 async def _fetch_active_instances() -> list[dict] | None:
-    """Return active ATM_STRADDLE / OTM_STRANGLE instances with their
+    """Return active ATM_STRADDLE / OTM_STRANGLE / MAXPAIN_ROLL instances with their
     bound broker name (if any).
 
     Returns ``None`` on ANY error (DB timeout, asyncpg concurrency race,
@@ -287,7 +287,7 @@ async def _fetch_active_instances() -> list[dict] | None:
                     select(StrategyInstance)
                     .where(StrategyInstance.is_active.is_(True))
                     .where(StrategyInstance.strategy_type.in_(
-                        ("ATM_STRADDLE", "OTM_STRANGLE")
+                        ("ATM_STRADDLE", "OTM_STRANGLE", "MAXPAIN_ROLL")
                     ))
                     .order_by(StrategyInstance.id.asc())
                 )

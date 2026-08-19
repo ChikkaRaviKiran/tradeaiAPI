@@ -218,7 +218,7 @@ def _load_instance_from_db_sync(instance_id: int) -> dict[str, Any] | None:
             with engine.connect() as conn:
                 row = conn.execute(
                     text(
-                        'SELECT id, account_id, "index", trading_day, '
+                        'SELECT id, account_id, strategy_type, "index", trading_day, '
                         "entry_time, exit_time, lots, strike_interval, "
                         "strike_mode, otm_strikes, static_legs, "
                         "adjustment_points, rolling_points, sl_type, "
@@ -252,7 +252,7 @@ def _load_instance_from_db_sync(instance_id: int) -> dict[str, Any] | None:
 
         return {
             "enabled": bool(row["is_active"]),
-            "strategy_type": "ATM_STRADDLE",
+            "strategy_type": row.get("strategy_type") or "ATM_STRADDLE",
             "index": row["index"],
             "trading_day": row["trading_day"],
             "entry_time": row["entry_time"],
@@ -331,7 +331,7 @@ def _load_from_db_sync() -> dict[str, Any] | None:
                         select(StrategyInstance)
                         .where(StrategyInstance.is_active.is_(True))
                         .where(StrategyInstance.strategy_type.in_(
-                            ("ATM_STRADDLE", "OTM_STRANGLE")
+                            ("ATM_STRADDLE", "OTM_STRANGLE", "MAXPAIN_ROLL")
                         ))
                         .order_by(StrategyInstance.id.asc())
                         .limit(1)
@@ -346,7 +346,7 @@ def _load_from_db_sync() -> dict[str, Any] | None:
                         account_label = f"Live ({acct.broker.title()})" if not acct.paper_trading else "Paper"
                 return {
                     "enabled": bool(row.is_active),
-                    "strategy_type": "ATM_STRADDLE",  # scanner always thinks ATM_STRADDLE
+                    "strategy_type": row.strategy_type,
                     "index": row.index,
                     "trading_day": row.trading_day,
                     "entry_time": row.entry_time,
@@ -397,7 +397,6 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
     out.update(payload or {})
 
     out["enabled"] = bool(out.get("enabled", False))
-    out["strategy_type"] = "ATM_STRADDLE"
     out["index"] = str(out.get("index", "NIFTY")).upper()
     if out["index"] not in {"NIFTY", "BANKNIFTY", "SENSEX"}:
         out["index"] = "NIFTY"
@@ -412,6 +411,25 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
     mode = str(out.get("strike_mode", "ATM")).upper()
     if mode not in {"ATM", "ITM", "STRANGLE", "MAXPAIN"}:
         mode = "ATM"
+
+    stype = str(out.get("strategy_type", "")).upper()
+    if stype not in {"ATM_STRADDLE", "OTM_STRANGLE", "MAXPAIN_ROLL"}:
+        if mode == "MAXPAIN":
+            stype = "MAXPAIN_ROLL"
+        elif mode == "STRANGLE":
+            stype = "OTM_STRANGLE"
+        else:
+            stype = "ATM_STRADDLE"
+
+    # Strategy type is the primary behavior selector.
+    if stype == "MAXPAIN_ROLL":
+        mode = "MAXPAIN"
+    elif stype == "OTM_STRANGLE":
+        mode = "STRANGLE"
+    elif stype == "ATM_STRADDLE":
+        mode = "ATM"
+
+    out["strategy_type"] = stype
     out["strike_mode"] = mode
     out["lots"] = max(1, int(out.get("lots", 1)))
     out["strike_interval"] = max(1, int(out.get("strike_interval", 50)))
@@ -552,7 +570,7 @@ def _mirror_to_db_sync(payload: dict[str, Any]) -> None:
                     await s.execute(
                         select(StrategyInstance)
                         .where(StrategyInstance.strategy_type.in_(
-                            ("ATM_STRADDLE", "OTM_STRANGLE")
+                            ("ATM_STRADDLE", "OTM_STRANGLE", "MAXPAIN_ROLL")
                         ))
                         .order_by(StrategyInstance.id.asc())
                         .limit(1)
@@ -581,8 +599,12 @@ def _mirror_to_db_sync(payload: dict[str, Any]) -> None:
                 row.hedge_premium = float(payload.get("hedge_premium", row.hedge_premium or 3))
                 row.hedge_otm_points = int(payload.get("hedge_otm_points", row.hedge_otm_points or 500))
                 row.hedge_lots = int(payload.get("hedge_lots", row.hedge_lots))
-                if row.strike_mode == "STRANGLE":
+                if row.strike_mode == "MAXPAIN":
+                    row.strategy_type = "MAXPAIN_ROLL"
+                elif row.strike_mode == "STRANGLE":
                     row.strategy_type = "OTM_STRANGLE"
+                else:
+                    row.strategy_type = "ATM_STRADDLE"
 
     try:
         asyncio.get_running_loop()

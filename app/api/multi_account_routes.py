@@ -662,10 +662,15 @@ def _normalize_instance_payload(body: dict) -> dict[str, Any]:
         day = "Daily"
 
     strike_mode = _clean_str(body.get("strike_mode"), "ATM").upper()
-    # OTM_STRANGLE allows STRANGLE or MAXPAIN anchoring.
-    if strategy_type == "OTM_STRANGLE" and strike_mode not in {"STRANGLE", "MAXPAIN"}:
+    # Strategy-type canonical strike-mode mapping:
+    # - ATM_STRADDLE  -> ATM
+    # - OTM_STRANGLE  -> STRANGLE
+    # - MAXPAIN_ROLL  -> MAXPAIN
+    if strategy_type == "OTM_STRANGLE":
         strike_mode = "STRANGLE"
-    elif strategy_type == "ATM_STRADDLE" and strike_mode == "STRANGLE":
+    elif strategy_type == "MAXPAIN_ROLL":
+        strike_mode = "MAXPAIN"
+    elif strategy_type == "ATM_STRADDLE":
         strike_mode = "ATM"
     if strike_mode not in _VALID_STRIKE_MODES:
         strike_mode = "ATM"

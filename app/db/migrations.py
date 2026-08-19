@@ -153,7 +153,12 @@ async def _ensure_strategy_instances(session, primary: BrokerAccount | None) -> 
 
     snap = _load_atl_settings_snapshot() or {}
     strike_mode = str(snap.get("strike_mode", "ATM")).upper()
-    strategy_type = "OTM_STRANGLE" if strike_mode == "STRANGLE" else "ATM_STRADDLE"
+    if strike_mode == "MAXPAIN":
+        strategy_type = "MAXPAIN_ROLL"
+    elif strike_mode == "STRANGLE":
+        strategy_type = "OTM_STRANGLE"
+    else:
+        strategy_type = "ATM_STRADDLE"
     hedge_mode = str(snap.get("hedge_mode", "none")).lower()
     if hedge_mode not in {"none", "premium", "otm_points"}:
         hedge_mode = "none"
