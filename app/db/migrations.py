@@ -167,7 +167,7 @@ async def _ensure_strategy_instances(session, primary: BrokerAccount | None) -> 
         exit_time=str(snap.get("exit_time", "15:15")),
         lots=int(snap.get("lots", 1) or 1),
         strike_interval=int(snap.get("strike_interval", 50) or 50),
-        strike_mode=strike_mode if strike_mode in {"ATM", "STRANGLE", "ITM"} else "ATM",
+        strike_mode=strike_mode if strike_mode in {"ATM", "STRANGLE", "ITM", "MAXPAIN"} else "ATM",
         otm_strikes=int(snap.get("otm_strikes", 0) or 0),
         static_legs=bool(snap.get("static_legs", False)),
         adjustment_points=int(snap.get("adjustment_points", 1) or 1),

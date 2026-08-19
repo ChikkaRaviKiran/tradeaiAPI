@@ -410,7 +410,7 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
     out["entry_time"] = str(out.get("entry_time", "09:20"))
     out["exit_time"] = str(out.get("exit_time", "15:15"))
     mode = str(out.get("strike_mode", "ATM")).upper()
-    if mode not in {"ATM", "ITM", "STRANGLE"}:
+    if mode not in {"ATM", "ITM", "STRANGLE", "MAXPAIN"}:
         mode = "ATM"
     out["strike_mode"] = mode
     out["lots"] = max(1, int(out.get("lots", 1)))
@@ -422,6 +422,8 @@ def normalize_atl_settings(payload: dict[str, Any]) -> dict[str, Any]:
     out["static_legs"] = bool(out.get("static_legs", False))
     if mode == "STRANGLE" and out["otm_strikes"] > 0:
         out["offset_points"] = out["otm_strikes"] * out["strike_interval"]
+    elif mode == "MAXPAIN":
+        out["offset_points"] = out["otm_strikes"] * out["strike_interval"] if out["otm_strikes"] > 0 else 0
     elif mode == "ATM":
         out["offset_points"] = 0
     else:

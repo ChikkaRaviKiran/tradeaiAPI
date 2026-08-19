@@ -68,7 +68,7 @@ def _invalidate_broker_cache_safe(account_id: Optional[int] = None) -> None:
 
 # ── Serialisation helpers ────────────────────────────────────────────────
 
-_VALID_STRIKE_MODES = {"ATM", "STRANGLE", "ITM"}
+_VALID_STRIKE_MODES = {"ATM", "STRANGLE", "ITM", "MAXPAIN"}
 _VALID_HEDGE_MODES = {"none", "premium", "otm_points"}
 _VALID_SL_TYPES = {"none", "premium_pct", "spot", "amount"}
 _VALID_INDICES = {"NIFTY", "BANKNIFTY", "SENSEX"}
@@ -662,8 +662,8 @@ def _normalize_instance_payload(body: dict) -> dict[str, Any]:
         day = "Daily"
 
     strike_mode = _clean_str(body.get("strike_mode"), "ATM").upper()
-    # OTM_STRANGLE implies STRANGLE mode regardless of what UI sent.
-    if strategy_type == "OTM_STRANGLE":
+    # OTM_STRANGLE allows STRANGLE or MAXPAIN anchoring.
+    if strategy_type == "OTM_STRANGLE" and strike_mode not in {"STRANGLE", "MAXPAIN"}:
         strike_mode = "STRANGLE"
     elif strategy_type == "ATM_STRADDLE" and strike_mode == "STRANGLE":
         strike_mode = "ATM"

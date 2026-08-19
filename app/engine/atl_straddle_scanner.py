@@ -209,6 +209,10 @@ class ATLStraddleScanner:
         # cooldown's safety value is small compared to the cost of a buggy
         # persisted clock.
         self._last_reform_at: Optional[datetime] = None
+        # Latest options max-pain snapshot for the configured index. This is
+        # fed by the orchestrator each cycle and used only when
+        # strike_mode=MAXPAIN.
+        self._last_max_pain: Optional[float] = None
         # Recover prior intraday state from disk if it's from today.
         self._load_state_from_disk()
 
@@ -223,6 +227,7 @@ class ATLStraddleScanner:
         self._manual_exit_misses = 0
         self._last_legs_changed_at = None
         self._last_reform_at = None
+        self._last_max_pain = None
         self._save_state_to_disk()
 
     # ── State persistence ────────────────────────────────────────────
@@ -375,6 +380,31 @@ class ATLStraddleScanner:
     def _mode_label(self) -> str:
         return "LIVE" if self._is_live() else "PAPER"
 
+    def _strike_mode(self) -> str:
+        mode = str(self._settings.get("strike_mode", "ATM")).upper()
+        return mode if mode in {"ATM", "STRANGLE", "ITM", "MAXPAIN"} else "ATM"
+
+    def _round_to_interval(self, value: float, interval: int) -> float:
+        return round(float(value) / max(1, int(interval))) * max(1, int(interval))
+
+    def _anchor_strike(self, spot: float, interval: int, strict: bool = False) -> Optional[float]:
+        """Resolve the strike anchor for this cycle.
+
+        strike_mode=MAXPAIN: use the latest options max-pain level.
+        all other modes      : use rounded spot (legacy behavior).
+
+        When strict=True and MAXPAIN is unavailable, return None so caller
+        can skip the action instead of silently falling back to ATM.
+        """
+        mode = self._strike_mode()
+        if mode != "MAXPAIN":
+            return self._round_to_interval(spot, interval)
+
+        mp = self._last_max_pain
+        if mp is None or float(mp) <= 0:
+            return None if strict else self._round_to_interval(spot, interval)
+        return self._round_to_interval(float(mp), interval)
+
     def _resolve_broker(self):
         """Pick the broker for this cycle based on the strategy's
         execution_account setting. Allows per-strategy override of the
@@ -467,6 +497,8 @@ class ATLStraddleScanner:
             "strike_interval": self._settings.get("strike_interval", 50),
             "offset_points": self._settings.get("offset_points", 500),
             "rolling_points": self._settings.get("rolling_points", 300),
+            "strike_mode": self._strike_mode(),
+            "last_max_pain": self._last_max_pain,
             "sl_type": self._settings.get("sl_type", "premium_pct"),
             "sl_lower": self._settings.get("sl_lower", 0),
             "sl_upper": self._settings.get("sl_upper", 0),
@@ -517,10 +549,26 @@ class ATLStraddleScanner:
     def is_in_trade(self) -> bool:
         return self._state.phase in {"STRANGLE", "STRADDLE"} and not self._state.done_for_day
 
-    async def run_cycle(self, df_today: pd.DataFrame, instrument: InstrumentConfig, cycle: int, peer_in_trade: bool = False) -> None:
+    async def run_cycle(
+        self,
+        df_today: pd.DataFrame,
+        instrument: InstrumentConfig,
+        cycle: int,
+        peer_in_trade: bool = False,
+        options_metrics: Optional[Any] = None,
+    ) -> None:
         if df_today is None or df_today.empty:
             self._record_diag("no_data", f"No 1-min candles for {instrument.symbol}; data feed empty")
             return
+
+        # Keep a fresh max-pain snapshot for MAXPAIN strike mode.
+        mp = getattr(options_metrics, "max_pain", None) if options_metrics is not None else None
+        try:
+            self._last_max_pain = float(mp) if mp is not None else None
+            if self._last_max_pain is not None and self._last_max_pain <= 0:
+                self._last_max_pain = None
+        except Exception:
+            self._last_max_pain = None
 
         now = datetime.now(IST)
         today = now.strftime("%Y-%m-%d")
@@ -788,6 +836,7 @@ class ATLStraddleScanner:
         spot = float(df_today.iloc[-1]["close"])
         interval = max(1, int(self._settings.get("strike_interval", 50)))
         offset = max(0, int(self._settings.get("offset_points", 500)))
+        strike_mode = self._strike_mode()
         rolling = max(1, int(self._settings.get("rolling_points", 300)))
         # ATM-straddle adjustment trigger:
         #   adjustment_points > 0  → legacy fixed-distance rule (when
@@ -847,9 +896,16 @@ class ATLStraddleScanner:
                 )
                 self._force_entry = False
             self._state.entry_in_progress = True
-            rounded = round(spot / interval) * interval
-            ce_strike = rounded + offset
-            pe_strike = rounded - offset
+            anchor_strike = self._anchor_strike(spot, interval, strict=True)
+            if anchor_strike is None:
+                self._state.entry_in_progress = False
+                self._record_diag(
+                    "maxpain_unavailable_entry",
+                    "MAXPAIN mode is enabled but max pain is unavailable; waiting for options-chain refresh",
+                )
+                return
+            ce_strike = anchor_strike + offset
+            pe_strike = anchor_strike - offset
             # Parallelize CE+PE quote fetches (independent broker calls).
             ce_q, pe_q = await asyncio.gather(
                 self._fetch_option_quote(instrument, ce_strike, "CE"),
@@ -890,7 +946,7 @@ class ATLStraddleScanner:
             hedges_required = False
             if self._settings.get("hedge_enabled", False):
                 hedges_required = True
-                await self._ensure_hedges(instrument, rounded)
+                await self._ensure_hedges(instrument, anchor_strike)
                 hedges_placed = bool(self._state.hedge_ce and self._state.hedge_pe)
                 if not hedges_placed:
                     # Hedge failure: flatten whatever was placed and finish for the day.
@@ -929,11 +985,17 @@ class ATLStraddleScanner:
             else:
                 self._state.phase = "STRANGLE"
             self._state.ref_spot = spot
-            self._record_event("entry", f"STRANGLE CE {int(ce_strike)} PE {int(pe_strike)} @ spot {spot:.2f}")
+            anchor_name = "MAXPAIN" if strike_mode == "MAXPAIN" else "ATM"
+            self._record_event(
+                "entry",
+                f"STRANGLE CE {int(ce_strike)} PE {int(pe_strike)} @ spot {spot:.2f} "
+                f"(anchor={anchor_name} {int(anchor_strike)})",
+            )
             await self.alert_manager.telegram.send(
                 f"⚡ ATL ENTRY ({self._mode_label()})\n"
                 f"Index: {instrument.symbol}\n"
                 f"Spot: {spot:.2f}\n"
+                f"Anchor: {anchor_name} {int(anchor_strike)}\n"
                 f"SELL CE {int(ce_strike)} @ ₹{self._state.ce.premium:.2f}\n"
                 f"SELL PE {int(pe_strike)} @ ₹{self._state.pe.premium:.2f}"
             )
@@ -960,6 +1022,42 @@ class ATLStraddleScanner:
             # at-touch conversion). All Phase-3a / sweep PnLs assume this.
             if bool(self._settings.get("static_legs", False)):
                 return
+
+            # MAXPAIN mode: anchor both sell legs to max pain (with configured
+            # offset). When max pain shifts to a new strike, close only the
+            # current shorts and open new shorts at the new anchor; hedges stay.
+            if strike_mode == "MAXPAIN":
+                anchor = self._anchor_strike(spot, interval, strict=True)
+                if anchor is None:
+                    self._record_diag(
+                        "maxpain_unavailable_strangle",
+                        "MAXPAIN mode active but max pain unavailable; holding current shorts",
+                    )
+                    return
+                target_ce = anchor + offset
+                target_pe = anchor - offset
+                cur_ce = self._state.ce.strike if self._state.ce else None
+                cur_pe = self._state.pe.strike if self._state.pe else None
+                if cur_ce != target_ce or cur_pe != target_pe:
+                    if not await self._roll_strangle(
+                        instrument,
+                        target_ce,
+                        target_pe,
+                        reason="maxpain_shift",
+                    ):
+                        return
+                    self._state.ref_spot = spot
+                    self._state.phase = "STRADDLE" if target_ce == target_pe else "STRANGLE"
+                    if self._state.phase == "STRADDLE":
+                        self._state.straddle_strike = anchor
+                    await self.alert_manager.telegram.send(
+                        f"🔁 ATL MAXPAIN SHIFT ({self._mode_label()})\n"
+                        f"Spot: {spot:.2f}\n"
+                        f"MaxPain: {int(anchor)}\n"
+                        f"SELL CE {int(target_ce)} / PE {int(target_pe)}"
+                    )
+                return
+
             # At-strike conversion
             if spot >= self._state.ce.strike:
                 await self._convert_to_straddle(instrument, self._state.ce.strike, spot)
@@ -1028,6 +1126,23 @@ class ATLStraddleScanner:
             # static_legs mode: hold the entered straddle untouched until
             # exit_time. Matches the backtest simulator (no reform/adjustment).
             if bool(self._settings.get("static_legs", False)):
+                return
+            if strike_mode == "MAXPAIN":
+                anchor = self._anchor_strike(spot, interval, strict=True)
+                if anchor is None:
+                    self._record_diag(
+                        "maxpain_unavailable_straddle",
+                        "MAXPAIN mode active but max pain unavailable; holding current straddle",
+                    )
+                    return
+                if anchor != self._state.straddle_strike:
+                    self._state.reform_count += 1
+                    self._state.is_first_straddle = False
+                    self._record_event(
+                        "reform_trigger",
+                        f"[MAXPAIN] {int(self._state.straddle_strike)} -> {int(anchor)} (hedges kept)",
+                    )
+                    await self._convert_to_straddle(instrument, anchor, spot, reform=True)
                 return
             if smart_mode:
                 await self._maybe_reform_smart(
