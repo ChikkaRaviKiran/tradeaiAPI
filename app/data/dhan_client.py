@@ -242,6 +242,26 @@ class DhanClient:
         response["expiry"] = selected_expiry
         return response
 
+    def calculate_multi_order_margin(self, legs: list[dict]) -> dict:
+        """Calculate combined margin for a basket of Dhan orders."""
+        scripts = [{
+            "exchangeSegment": "NSE_FNO",
+            "transactionType": str(leg["side"]).upper(),
+            "quantity": int(leg["quantity"]),
+            "productType": "MARGIN",
+            "securityId": str(leg["security_id"]),
+            "price": float(leg.get("premium") or 0),
+            "triggerPrice": 0,
+        } for leg in legs if leg.get("security_id")]
+        if not scripts:
+            raise RuntimeError("No Dhan security IDs available for margin calculation")
+        return self._data_api_post("margincalculator/multi", {
+            "includePosition": True,
+            "includeOrders": True,
+            "dhanClientId": self.client_id,
+            "scripts": scripts,
+        })
+
     # ── Orders ───────────────────────────────────────────────────────
 
     def place_order(

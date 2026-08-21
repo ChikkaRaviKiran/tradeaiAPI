@@ -99,6 +99,28 @@ def _payoff(legs: list[dict], price: float, lot_size: int, lots: int) -> float:
     return round(total * lot_size * lots, 2)
 
 
+async def _add_broker_margin(preview: dict, data_entry: dict | None) -> dict:
+    """Attach the authoritative Dhan basket margin when available."""
+    if not data_entry or data_entry.get("broker_type") != "dhan":
+        return preview
+    client = getattr(data_entry["broker"], "client", None) or getattr(data_entry["broker"], "_client", None)
+    if client is None or not hasattr(client, "calculate_multi_order_margin"):
+        return preview
+    try:
+        response = await asyncio.to_thread(client.calculate_multi_order_margin, preview["legs"])
+        data = response.get("data") if isinstance(response.get("data"), dict) else response
+        margin = data.get("total_margin", data.get("totalMargin"))
+        if margin is not None:
+            total_margin = float(margin)
+            preview["metrics"]["broker_margin_required"] = round(total_margin, 2)
+            preview["metrics"]["broker_margin_required_per_lot"] = round(total_margin / max(1, preview["lots"]), 2)
+            preview["metrics"]["margin_source"] = "Dhan multi-order margin calculator"
+            preview["metrics"]["pricing_note"] = "Payoff risk uses live premiums; margin is returned by Dhan for this basket."
+    except Exception as exc:
+        logger.warning("Dhan basket margin unavailable: %s", exc)
+    return preview
+
+
 def _build_preview(body: dict, chain: list[OptionsChainRow], spot: float, support: float, resistance: float, expiry: str, max_pain: float | None = None) -> dict:
     strategy = str(body.get("strategy") or "").upper()
     if strategy not in STRATEGIES: raise HTTPException(400, "Unknown OI strategy")
@@ -171,6 +193,11 @@ async def _levels(symbol: str) -> tuple[float, float, float, str, list[OptionsCh
     raise HTTPException(503, "Dhan data-feed account is not available")
 
 
+async def _data_feed_entry() -> dict | None:
+    brokers = await _list_all_active_brokers()
+    return next((x for x in brokers if x.get("is_data_feed") and x.get("broker_type") == "dhan"), None)
+
+
 def register_routes(app: FastAPI) -> None:
     @app.get("/api/oi-strategies/market")
     async def market(symbol: str = "NIFTY"):
@@ -185,7 +212,8 @@ def register_routes(app: FastAPI) -> None:
     @app.post("/api/oi-strategies/preview")
     async def preview(body: dict):
         spot, support, resistance, expiry, chain, max_pain = await _levels(str(body.get("symbol") or "NIFTY").upper())
-        return _build_preview(body, chain, spot, support, resistance, expiry, max_pain)
+        result = _build_preview(body, chain, spot, support, resistance, expiry, max_pain)
+        return await _add_broker_margin(result, await _data_feed_entry())
 
     @app.post("/api/oi-strategies/place")
     async def place(body: dict):
@@ -194,6 +222,7 @@ def register_routes(app: FastAPI) -> None:
         if not entry: raise HTTPException(404, "Selected trade account is not active")
         spot, support, resistance, expiry, chain, max_pain = await _levels(str(body.get("symbol") or "NIFTY").upper())
         preview_data = _build_preview(body, chain, spot, support, resistance, expiry, max_pain)
+        preview_data = await _add_broker_margin(preview_data, await _data_feed_entry())
         if body.get("confirm") is not True: raise HTTPException(400, "Explicit order confirmation is required")
         instrument = get_instrument(preview_data["symbol"])
         broker = entry["broker"]
