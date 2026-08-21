@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +15,8 @@ from app.core.models import OptionsChainRow
 from app.execution.broker_base import OrderRequest, OrderSide, OrderStatus, OrderType, ProductType
 
 logger = logging.getLogger(__name__)
+_dhan_chain_cache: dict[str, tuple[float, dict]] = {}
+_DHAN_CHAIN_CACHE_SECONDS = 15.0
 
 STRATEGIES = {
     "BULL_CALL_SPREAD": {
@@ -124,7 +127,15 @@ async def _levels(symbol: str) -> tuple[float, float, float, str, list[OptionsCh
         dhan_client = getattr(broker, "client", None) or getattr(broker, "_client", None)
         if dhan_client is not None and hasattr(dhan_client, "get_dhan_option_chain"):
             try:
-                response = await asyncio.to_thread(dhan_client.get_dhan_option_chain, symbol)
+                cached = _dhan_chain_cache.get(symbol)
+                if cached and time.monotonic() - cached[0] < _DHAN_CHAIN_CACHE_SECONDS:
+                    response = cached[1]
+                else:
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(dhan_client.get_dhan_option_chain, symbol),
+                        timeout=45,
+                    )
+                    _dhan_chain_cache[symbol] = (time.monotonic(), response)
                 data = response.get("data") or {}
                 oc = data.get("oc") or {}
                 chain = []
@@ -134,24 +145,19 @@ async def _levels(symbol: str) -> tuple[float, float, float, str, list[OptionsCh
                     chain.append({"strike_price": strike, "call_ltp": ce.get("last_price"), "put_ltp": pe.get("last_price"),
                                   "call_oi": int(ce.get("oi") or 0), "put_oi": int(pe.get("oi") or 0),
                                   "call_security_id": ce.get("security_id"), "put_security_id": pe.get("security_id")})
-                if chain:
+                if chain and float(data.get("last_price") or 0) > 0:
                     support = max(chain, key=lambda x: x["put_oi"])["strike_price"]
                     resistance = max(chain, key=lambda x: x["call_oi"])["strike_price"]
                     pain_by_strike = {strike: sum(max(strike - row["strike_price"], 0) * row["put_oi"] + max(row["strike_price"] - strike, 0) * row["call_oi"] for row in chain) for strike in [x["strike_price"] for x in chain]}
                     max_pain = min(pain_by_strike, key=pain_by_strike.get)
                     return float(data.get("last_price") or 0), float(support), float(resistance), str(response.get("expiry") or ""), chain, float(max_pain)
+            except asyncio.TimeoutError as exc:
+                logger.error("Dhan OI chain request timed out for %s", symbol)
+                raise HTTPException(504, "Dhan option-chain request timed out. Check the Dhan Data API entitlement and proxy.") from exc
             except Exception as exc:
                 logger.exception("Dhan OI chain fetch failed: %s", exc)
-    orch = _state.get("orchestrator")
-    snap = _state.get("snapshots", {}).get(symbol) or _state.get("snapshot")
-    if not orch or not snap: raise HTTPException(503, "Live market data is not available")
-    metrics = snap.options_metrics
-    support, resistance = metrics.put_oi_cluster, metrics.call_oi_cluster
-    if not support or not resistance: raise HTTPException(503, "OI support/resistance is not available yet")
-    expiry = getattr(orch, "_expiries", {}).get(symbol, "")
-    chain = getattr(orch, "_last_option_chain", {}).get(symbol, [])
-    if not expiry or not chain: raise HTTPException(503, "Option chain is not available yet")
-    return float(snap.price or snap.nifty_price), float(support), float(resistance), expiry, chain, float(metrics.max_pain or spot)
+                raise HTTPException(502, f"Dhan option-chain request failed: {exc}") from exc
+    raise HTTPException(503, "Dhan data-feed account is not available")
 
 
 def register_routes(app: FastAPI) -> None:
