@@ -16,7 +16,8 @@ from app.execution.broker_base import OrderRequest, OrderSide, OrderStatus, Orde
 
 logger = logging.getLogger(__name__)
 _dhan_chain_cache: dict[str, tuple[float, dict]] = {}
-_DHAN_CHAIN_CACHE_SECONDS = 15.0
+_dhan_chain_locks: dict[str, asyncio.Lock] = {}
+_DHAN_CHAIN_CACHE_SECONDS = 60.0
 
 STRATEGIES = {
     "BULL_CALL_SPREAD": {
@@ -127,15 +128,17 @@ async def _levels(symbol: str) -> tuple[float, float, float, str, list[OptionsCh
         dhan_client = getattr(broker, "client", None) or getattr(broker, "_client", None)
         if dhan_client is not None and hasattr(dhan_client, "get_dhan_option_chain"):
             try:
-                cached = _dhan_chain_cache.get(symbol)
-                if cached and time.monotonic() - cached[0] < _DHAN_CHAIN_CACHE_SECONDS:
-                    response = cached[1]
-                else:
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(dhan_client.get_dhan_option_chain, symbol),
-                        timeout=45,
-                    )
-                    _dhan_chain_cache[symbol] = (time.monotonic(), response)
+                lock = _dhan_chain_locks.setdefault(symbol, asyncio.Lock())
+                async with lock:
+                    cached = _dhan_chain_cache.get(symbol)
+                    if cached and time.monotonic() - cached[0] < _DHAN_CHAIN_CACHE_SECONDS:
+                        response = cached[1]
+                    else:
+                        response = await asyncio.wait_for(
+                            asyncio.to_thread(dhan_client.get_dhan_option_chain, symbol),
+                            timeout=45,
+                        )
+                        _dhan_chain_cache[symbol] = (time.monotonic(), response)
                 data = response.get("data") or {}
                 oc = data.get("oc") or {}
                 chain = []
