@@ -131,6 +131,19 @@ def _build_preview(body: dict, chain: list[OptionsChainRow], spot: float, suppor
     atm = _round_strike(spot, interval)
     strikes = {"atm": atm, "support": _round_strike(support, interval), "resistance": _round_strike(resistance, interval), "max_pain": _round_strike(float(max_pain or spot), interval),
                "protective_low": _round_strike(support - width, interval, "down"), "protective_high": _round_strike(resistance + width, interval, "up")}
+    buy_strike = body.get("buy_strike")
+    sell_strike = body.get("sell_strike")
+    if buy_strike not in (None, ""):
+        strikes["atm"] = _round_strike(float(buy_strike), interval)
+    if sell_strike not in (None, ""):
+        if strategy in {"BULL_CALL_SPREAD", "BEAR_PUT_SPREAD"}:
+            strikes["resistance" if strategy == "BULL_CALL_SPREAD" else "support"] = _round_strike(float(sell_strike), interval)
+        elif strategy == "BULL_PUT_SPREAD":
+            strikes["protective_low"] = _round_strike(float(sell_strike), interval)
+        elif strategy == "BEAR_CALL_SPREAD":
+            strikes["protective_high"] = _round_strike(float(sell_strike), interval)
+        elif strategy == "MAXPAIN_ROLL":
+            strikes["max_pain"] = _round_strike(float(sell_strike), interval)
     rows = {round(float(r["strike_price"] if isinstance(r, dict) else r.strike_price), 2): r for r in chain}
     symbol_expiry = datetime.strptime(expiry, "%Y-%m-%d").strftime("%d%b%y").upper() if "-" in expiry else expiry
     legs = []
