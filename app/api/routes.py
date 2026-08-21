@@ -602,6 +602,14 @@ except Exception as _ma_err:  # pragma: no cover
     logger.warning("multi_account routes not registered: %s", _ma_err)
 
 
+# ── OI-level defined-risk strategy builder ──────────────────────────────
+try:
+    from app.oi_strategies.routes import register_routes as _register_oi_routes
+    _register_oi_routes(app)
+except Exception as _oi_err:  # pragma: no cover
+    logger.warning("OI strategy routes not registered: %s", _oi_err)
+
+
 # ── Market Overview ───────────────────────────────────────────────────────
 
 @app.get("/api/market/snapshot", response_model=MarketSnapshot)
