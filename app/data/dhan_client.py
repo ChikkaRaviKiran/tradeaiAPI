@@ -257,9 +257,9 @@ class DhanClient:
             raise RuntimeError("No Dhan security IDs available for margin calculation")
         return self._data_api_post("margincalculator/multi", {
             "includePosition": True,
-            "includeOrders": True,
+            "includeOrder": True,
             "dhanClientId": self.client_id,
-            "scripts": scripts,
+            "scripList": scripts,
         })
 
     # ── Orders ───────────────────────────────────────────────────────
