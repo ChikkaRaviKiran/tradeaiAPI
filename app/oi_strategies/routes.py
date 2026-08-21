@@ -101,7 +101,7 @@ def _build_preview(body: dict, chain: list[OptionsChainRow], spot: float, suppor
     atm = _round_strike(spot, interval)
     strikes = {"atm": atm, "support": _round_strike(support, interval), "resistance": _round_strike(resistance, interval),
                "protective_low": _round_strike(support - width, interval, "down"), "protective_high": _round_strike(resistance + width, interval, "up")}
-    rows = {round(float(r.strike_price), 2): r for r in chain}
+    rows = {round(float(r["strike_price"] if isinstance(r, dict) else r.strike_price), 2): r for r in chain}
     symbol_expiry = datetime.strptime(expiry, "%Y-%m-%d").strftime("%d%b%y").upper() if "-" in expiry else expiry
     legs = []
     for side, option_type, key in STRATEGIES[strategy]["legs"]:
