@@ -40,6 +40,11 @@ STRATEGIES = {
         "legs": [("SELL", "CE", "resistance"), ("BUY", "CE", "protective_high")], "kind": "credit",
         "explanation": "Use when resistance is expected to hold. Profit is limited to the credit; the long call protects the upside.",
     },
+    "MAXPAIN_ROLL": {
+        "label": "MaxPain Roll", "belief": "Price gravitates toward max pain", "level": "max_pain",
+        "legs": [("SELL", "CE", "max_pain"), ("SELL", "PE", "max_pain")], "kind": "straddle",
+        "explanation": "Use when NIFTY is expected to remain near max pain. Both options are sold at max pain; loss is unlimited without protective hedges.",
+    },
 }
 
 
@@ -59,11 +64,14 @@ def _metrics(strategy: str, legs: list[dict], spot: float, lot_size: int, lots: 
     net = sum((1 if l["side"] == "BUY" else -1) * float(l.get("premium") or 0) for l in legs)
     debit = max(net, 0.0)
     credit = max(-net, 0.0)
-    if spec["kind"] == "debit":
+    if spec["kind"] == "straddle":
+        max_profit_unit, max_loss_unit = credit, None
+    elif spec["kind"] == "debit":
         max_loss_unit, max_profit_unit = debit, max(0.0, width - debit)
     else:
         max_profit_unit, max_loss_unit = credit, max(0.0, width - credit)
     breakevens = []
+    if strategy == "MAXPAIN_ROLL": breakevens = [legs[0]["strike"] - credit, legs[0]["strike"] + credit]
     if strategy == "BULL_CALL_SPREAD": breakevens = [legs[0]["strike"] + debit]
     if strategy == "BEAR_PUT_SPREAD": breakevens = [legs[0]["strike"] - debit]
     if strategy == "BULL_PUT_SPREAD": breakevens = [legs[0]["strike"] - credit]
@@ -71,11 +79,11 @@ def _metrics(strategy: str, legs: list[dict], spot: float, lot_size: int, lots: 
     return {
         "width": width, "net_premium_per_unit": round(net, 2),
         "max_profit_per_lot": round(max_profit_unit * lot_size, 2),
-        "max_loss_per_lot": round(max_loss_unit * lot_size, 2),
-        "margin_required_per_lot": round(max_loss_unit * lot_size, 2),
+        "max_loss_per_lot": "Unlimited" if max_loss_unit is None else round(max_loss_unit * lot_size, 2),
+        "margin_required_per_lot": "Broker margin required" if max_loss_unit is None else round(max_loss_unit * lot_size, 2),
         "max_profit": round(max_profit_unit * lot_size * lots, 2),
-        "max_loss": round(max_loss_unit * lot_size * lots, 2),
-        "margin_required": round(max_loss_unit * lot_size * lots, 2),
+        "max_loss": "Unlimited" if max_loss_unit is None else round(max_loss_unit * lot_size * lots, 2),
+        "margin_required": "Broker margin required" if max_loss_unit is None else round(max_loss_unit * lot_size * lots, 2),
         "breakevens": [round(x, 2) for x in breakevens],
         "net_premium_total": round(net * lot_size * lots, 2),
         "pricing_note": "Estimated from live option premiums; broker margin is authoritative before execution.",
@@ -99,7 +107,7 @@ def _build_preview(body: dict, chain: list[OptionsChainRow], spot: float, suppor
     lots = max(1, int(body.get("lots") or 1))
     width = max(interval, float(body.get("wing_width") or interval * 4))
     atm = _round_strike(spot, interval)
-    strikes = {"atm": atm, "support": _round_strike(support, interval), "resistance": _round_strike(resistance, interval),
+    strikes = {"atm": atm, "support": _round_strike(support, interval), "resistance": _round_strike(resistance, interval), "max_pain": _round_strike(float(max_pain or spot), interval),
                "protective_low": _round_strike(support - width, interval, "down"), "protective_high": _round_strike(resistance + width, interval, "up")}
     rows = {round(float(r["strike_price"] if isinstance(r, dict) else r.strike_price), 2): r for r in chain}
     symbol_expiry = datetime.strptime(expiry, "%Y-%m-%d").strftime("%d%b%y").upper() if "-" in expiry else expiry
