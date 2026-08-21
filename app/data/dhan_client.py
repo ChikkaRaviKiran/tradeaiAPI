@@ -201,7 +201,9 @@ class DhanClient:
         )
         response.raise_for_status()
         data = response.json()
-        if not isinstance(data, dict) or str(data.get("status", "")).lower() not in {"success", "ok"}:
+        valid_status = str(data.get("status", "")).lower() in {"success", "ok"}
+        valid_margin = isinstance(data, dict) and (data.get("totalMargin") is not None or data.get("total_margin") is not None)
+        if not isinstance(data, dict) or (not valid_status and not valid_margin):
             raise RuntimeError(str(data))
         return data
 
