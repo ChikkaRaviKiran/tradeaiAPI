@@ -169,7 +169,7 @@ def register_routes(app: FastAPI) -> None:
         return {"symbol": symbol, "spot": spot, "support": support, "resistance": resistance,
                 "max_pain": max_pain, "expiry": expiry,
                 "lot_size": get_instrument(symbol).lot_size, "strike_interval": get_instrument(symbol).strike_interval,
-                "chain_strikes": [r.strike_price for r in chain]}
+                "chain_strikes": [r["strike_price"] if isinstance(r, dict) else r.strike_price for r in chain]}
 
     @app.post("/api/oi-strategies/preview")
     async def preview(body: dict):
