@@ -182,6 +182,66 @@ class DhanClient:
             logger.exception("Dhan get_fund_limits failed")
         return {}
 
+    # ── Market data ─────────────────────────────────────────────────
+
+    def _data_api_post(self, path: str, payload: dict) -> dict:
+        """Call a Dhan Data API endpoint using this account's credentials."""
+        headers = {
+            "Content-Type": "application/json",
+            "access-token": self.access_token,
+            "client-id": self.client_id,
+        }
+        proxies = {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
+        response = requests.post(
+            f"https://api.dhan.co/v2/{path.lstrip('/')}",
+            json=payload,
+            headers=headers,
+            proxies=proxies,
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or str(data.get("status", "")).lower() not in {"success", "ok"}:
+            raise RuntimeError(str(data))
+        return data
+
+    def resolve_underlying_security_id(self, underlying: str) -> Optional[str]:
+        """Resolve an index security ID from Dhan's scrip master."""
+        target = (underlying or "").upper().strip()
+        known = {"NIFTY": "13", "SENSEX": "51"}
+        for row in self._load_scrip_master():
+            symbol = self._row_get(row, "SM_SYMBOL_NAME", "SYMBOL_NAME", "UNDERLYING_SYMBOL").upper()
+            instrument = self._row_get(row, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "INSTRUMENT_TYPE").upper()
+            if symbol == target and instrument in {"INDEX", ""}:
+                security_id = self._row_get(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID")
+                if security_id:
+                    return security_id
+        return known.get(target)
+
+    def get_option_expiry_list(self, underlying_scrip: str, underlying_segment: str = "IDX_I") -> list[str]:
+        data = self._data_api_post("optionchain/expirylist", {
+            "UnderlyingScrip": int(underlying_scrip),
+            "UnderlyingSeg": underlying_segment,
+        })
+        return [str(x) for x in (data.get("data") or [])]
+
+    def get_dhan_option_chain(self, underlying: str, expiry: Optional[str] = None) -> dict:
+        """Return Dhan's full live option-chain response for an index."""
+        security_id = self.resolve_underlying_security_id(underlying)
+        if not security_id:
+            raise RuntimeError(f"Dhan underlying security ID not found for {underlying}")
+        expiries = self.get_option_expiry_list(security_id)
+        selected_expiry = expiry if expiry in expiries else (expiries[0] if expiries else "")
+        if not selected_expiry:
+            raise RuntimeError(f"Dhan returned no active expiry for {underlying}")
+        response = self._data_api_post("optionchain", {
+            "UnderlyingScrip": int(security_id),
+            "UnderlyingSeg": "IDX_I",
+            "Expiry": selected_expiry,
+        })
+        response["expiry"] = selected_expiry
+        return response
+
     # ── Orders ───────────────────────────────────────────────────────
 
     def place_order(

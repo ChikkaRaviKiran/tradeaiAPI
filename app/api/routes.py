@@ -133,6 +133,8 @@ async def _list_all_active_brokers() -> list[dict]:
                     "mpin": r.mpin,
                     "totp_secret": r.totp_secret,
                     "access_token": r.access_token,
+                    "is_data_feed": r.is_data_feed,
+                    "is_primary": r.is_primary,
                     "refresh_token": r.refresh_token,
                     "proxy_url": r.proxy_url,
                     "updated_at": r.updated_at.isoformat() if r.updated_at else "",
@@ -156,6 +158,8 @@ async def _list_all_active_brokers() -> list[dict]:
             "account_id": int(row.get("id") or 0),
             "account_name": str(row.get("name") or f"account-{row.get('id')}"),
             "broker_type": (row.get("broker") or "").lower(),
+            "is_data_feed": bool(row.get("is_data_feed")),
+            "is_primary": bool(row.get("is_primary")),
         })
 
     if not out:
