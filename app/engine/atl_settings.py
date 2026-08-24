@@ -224,7 +224,7 @@ def _load_instance_from_db_sync(instance_id: int) -> dict[str, Any] | None:
                         "adjustment_points, rolling_points, sl_type, "
                         "sl_lower, sl_upper, first_straddle_sl_pct, "
                         "reform_straddle_sl_pct, hedge_mode, hedge_premium, "
-                        "hedge_otm_points, hedge_lots, is_active "
+                        "hedge_otm_points, hedge_lots, is_active, live_execution "
                         "FROM strategy_instances WHERE id = :iid"
                     ),
                     {"iid": int(instance_id)},
@@ -273,6 +273,7 @@ def _load_instance_from_db_sync(instance_id: int) -> dict[str, Any] | None:
             "hedge_premium": row["hedge_premium"] or 3,
             "hedge_otm_points": row["hedge_otm_points"] or 500,
             "hedge_lots": row["hedge_lots"],
+            "live_execution": bool(row["live_execution"]),
             "execution_account": account_label,
             "_source": "db",
             "_instance_id": row["id"],

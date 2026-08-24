@@ -366,13 +366,18 @@ class ATLStraddleScanner:
 
     def _is_live(self) -> bool:
         """True only when global mode is LIVE AND the strategy's execution
-        account is set to a real broker (anything other than 'Paper').
+        switch is enabled AND the execution account is set to a real broker
+        (anything other than 'Paper').
 
         Per-strategy 'Paper' account simulates even when global is LIVE.
         Global 'paper_trading=True' acts as a kill-switch — every strategy
         runs in simulation regardless of its execution_account.
         """
         if bool(getattr(settings, "paper_trading", True)):
+            return False
+        # StrategyInstance.live_execution is the UI's per-strategy safety
+        # switch. Keep the legacy JSON path compatible when the key is absent.
+        if "live_execution" in self._settings and not bool(self._settings["live_execution"]):
             return False
         account = str(self._settings.get("execution_account", "Primary")).strip().lower()
         return account not in ("", "paper")
@@ -482,6 +487,7 @@ class ATLStraddleScanner:
             "enabled": bool(self._settings.get("enabled", False)),
             "live_mode": self._is_live(),
             "global_live": not bool(getattr(settings, "paper_trading", True)),
+            "live_execution": self._settings.get("live_execution"),
             "execution_account": self._settings.get("execution_account", "Primary"),
             "broker_ready": self.broker is not None,
             "broker_name": broker_name,
