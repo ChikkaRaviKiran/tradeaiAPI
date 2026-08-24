@@ -486,6 +486,13 @@ async def lifespan(app: FastAPI):
         state = get_state()
         state["orchestrator"] = orchestrator
         state["eval_scheduler"] = orchestrator.eval_scheduler
+        # Populate account-bound strategy scanners before the orchestrator's
+        # slower evaluation/bootstrap work, so scheduled entries are not
+        # missed while the engine is warming up.
+        try:
+            await orchestrator.strategy_registry.sync_from_db()
+        except Exception:
+            logger.exception("[Registry] startup sync failed")
         await orchestrator.start()
 
     orchestrator_task = asyncio.create_task(_run_orchestrator())
