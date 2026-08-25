@@ -118,7 +118,10 @@ class StrategyInstanceRegistry:
             iid = r["id"]
             broker_name = r["broker_name"]
             account_id = r["account_id"]
-            new_binding = (account_id, broker_name or "")
+            # account_rev must be part of the key: without it a same-account
+            # credential change (daily Dhan token) never triggers a rebind and
+            # the scanner keeps placing orders with the expired token.
+            new_binding = (account_id, broker_name or "", r.get("account_rev") or "")
 
             existing = self._scanners.get(iid)
             if existing is None:
@@ -142,8 +145,8 @@ class StrategyInstanceRegistry:
                     self._binding[iid] = new_binding
                     updated += 1
                     logger.info(
-                        "[Registry] Rebound scanner %s to account_id=%s broker=%s",
-                        iid, account_id, broker_name,
+                        "[Registry] Rebound scanner %s to account_id=%s broker=%s rev=%s",
+                        iid, account_id, broker_name, new_binding[2],
                     )
                 except Exception:
                     logger.exception("[Registry] Failed rebinding scanner %s", iid)
@@ -297,6 +300,7 @@ async def _fetch_active_instances() -> list[dict] | None:
 
             acct_ids = [r.account_id for r in rows if r.account_id is not None]
             broker_by_id: dict[int, str] = {}
+            rev_by_id: dict[int, str] = {}
             if acct_ids:
                 accts = (
                     await s.execute(
@@ -304,12 +308,16 @@ async def _fetch_active_instances() -> list[dict] | None:
                     )
                 ).scalars().all()
                 broker_by_id = {a.id: a.broker for a in accts}
+                # Credential revision marker: bumped by BrokerAccount.onupdate
+                # whenever the account is saved, including a token rotation.
+                rev_by_id = {a.id: str(a.updated_at or "") for a in accts}
 
             return [
                 {
                     "id": r.id,
                     "account_id": r.account_id,
                     "broker_name": broker_by_id.get(r.account_id) if r.account_id is not None else None,
+                    "account_rev": rev_by_id.get(r.account_id, "") if r.account_id is not None else "",
                 }
                 for r in rows
             ]

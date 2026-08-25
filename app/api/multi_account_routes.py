@@ -222,6 +222,26 @@ def _validate_strategy_type(v: Any) -> str:
     return t
 
 
+def _validate_access_token(broker: str, token: str) -> str:
+    """Reject a token that cannot possibly authenticate.
+
+    Dhan/Kite tokens are JWTs. A mis-paste is otherwise stored happily and
+    only surfaces at 09:30 as a broker rejection with no order placed.
+    """
+    if not token or (broker or "").lower() not in ("dhan", "kite"):
+        return token
+    if any(c.isspace() for c in token) or not token.startswith("eyJ") or token.count(".") != 2:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "That does not look like a valid access token. Expected a JWT "
+                "(starts with 'eyJ', three dot-separated parts, no spaces). "
+                "Copy the token only — not surrounding text."
+            ),
+        )
+    return token
+
+
 # ── FastAPI wiring ───────────────────────────────────────────────────────
 
 def register_multi_account_routes(app: FastAPI) -> None:
@@ -259,7 +279,7 @@ def register_multi_account_routes(app: FastAPI) -> None:
             password=_clean_str(body.get("password")),
             mpin=_clean_str(body.get("mpin")),
             totp_secret=_clean_str(body.get("totp_secret")),
-            access_token=_clean_str(body.get("access_token")) or None,
+            access_token=_validate_access_token(broker, _clean_str(body.get("access_token"))) or None,
             refresh_token=_clean_str(body.get("refresh_token")) or None,
             login_method=_clean_str(body.get("login_method"), "manual") or "manual",
             paper_trading=bool(body.get("paper_trading", False)),
@@ -332,7 +352,10 @@ def register_multi_account_routes(app: FastAPI) -> None:
                           "proxy_url", "proxy_ip", "proxy_instance_name",
                           "login_method"):
                     if k in body:
-                        setattr(row, k, _clean_str(body.get(k)))
+                        val = _clean_str(body.get(k))
+                        if k == "access_token":
+                            val = _validate_access_token(row.broker, val)
+                        setattr(row, k, val)
                 for k in ("paper_trading", "is_active", "is_data_feed", "is_primary"):
                     if k in body:
                         setattr(row, k, bool(body.get(k)))
