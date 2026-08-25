@@ -571,13 +571,19 @@ class ATLStraddleScanner:
             return
 
         # Keep a fresh max-pain snapshot for MAXPAIN strike mode.
-        mp = getattr(options_metrics, "max_pain", None) if options_metrics is not None else None
-        try:
-            self._last_max_pain = float(mp) if mp is not None else None
-            if self._last_max_pain is not None and self._last_max_pain <= 0:
-                self._last_max_pain = None
-        except Exception:
-            self._last_max_pain = None
+        # Every scanner is ticked for every active instrument, so this must be
+        # gated on the configured index — otherwise a SENSEX tick overwrites a
+        # NIFTY strategy's max pain (76200 vs 24150) and re-anchoring breaks.
+        # A tick without options metrics also must not clear a good value; the
+        # chain refreshes on a slower cadence than the analysis loop.
+        if instrument.symbol == self._settings.get("index", "NIFTY"):
+            mp = getattr(options_metrics, "max_pain", None) if options_metrics is not None else None
+            if mp is not None:
+                try:
+                    mp_val = float(mp)
+                    self._last_max_pain = mp_val if mp_val > 0 else None
+                except (TypeError, ValueError):
+                    self._last_max_pain = None
 
         now = datetime.now(IST)
         today = now.strftime("%Y-%m-%d")
