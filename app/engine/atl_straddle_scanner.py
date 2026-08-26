@@ -849,7 +849,18 @@ class ATLStraddleScanner:
             return
 
         spot = float(df_today.iloc[-1]["close"])
-        interval = max(1, int(self._settings.get("strike_interval", 50)))
+        configured_interval = max(1, int(self._settings.get("strike_interval", 50)))
+        exchange_interval = max(1, int(round(getattr(instrument, "strike_interval", configured_interval))))
+        # Safety rail: for listed options the strike step is exchange-defined.
+        # If UI/DB carries a stale value (e.g. NIFTY 50 leaked into SENSEX),
+        # use the instrument's real interval so strike selection/order legs
+        # cannot drift to wrong contracts.
+        if configured_interval != exchange_interval:
+            self._record_diag(
+                "strike_interval_override",
+                f"Using {exchange_interval} (instrument) instead of configured {configured_interval} for {instrument.symbol}",
+            )
+        interval = exchange_interval
         offset = max(0, int(self._settings.get("offset_points", 500)))
         strike_mode = self._strike_mode()
         rolling = max(1, int(self._settings.get("rolling_points", 300)))

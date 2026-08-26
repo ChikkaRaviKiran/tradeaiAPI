@@ -76,6 +76,16 @@ _VALID_TRADING_DAYS = {
     "Daily", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
 }
 
+_INDEX_STRIKE_INTERVAL_DEFAULTS: dict[str, int] = {
+    "NIFTY": 50,
+    "BANKNIFTY": 100,
+    "SENSEX": 100,
+}
+
+
+def _default_strike_interval_for_index(index_symbol: str) -> int:
+    return int(_INDEX_STRIKE_INTERVAL_DEFAULTS.get(str(index_symbol).upper(), 50))
+
 
 def _compute_proxy_status(a: BrokerAccount) -> str:
     """Match OptionSelling's proxy_status contract (active/provisioning/not_needed/none).
@@ -609,6 +619,13 @@ def register_multi_account_routes(app: FastAPI) -> None:
                 # Merge existing → payload → normalized
                 merged = _instance_to_dict(row)
                 merged.update({k: v for k, v in body.items() if k not in {"id", "created_at", "updated_at", "account_name"}})
+                # If user switched index but did not explicitly provide
+                # strike_interval, reset to the exchange step for that index.
+                # Without this, a NIFTY interval (50) can leak into SENSEX
+                # rows and produce wrong max-pain anchor offsets/orders.
+                if "index" in body and "strike_interval" not in body:
+                    target_idx = _clean_str(body.get("index"), merged.get("index", "NIFTY")).upper()
+                    merged["strike_interval"] = _default_strike_interval_for_index(target_idx)
                 clean = _normalize_instance_payload(merged)
                 if clean["account_id"] is not None:
                     if await s.get(BrokerAccount, clean["account_id"]) is None:
@@ -684,6 +701,8 @@ def _normalize_instance_payload(body: dict) -> dict[str, Any]:
     if day not in _VALID_TRADING_DAYS:
         day = "Daily"
 
+    strike_interval_default = _default_strike_interval_for_index(idx)
+
     strike_mode = _clean_str(body.get("strike_mode"), "ATM").upper()
     # Strategy-type canonical strike-mode mapping:
     # - ATM_STRADDLE  -> ATM
@@ -729,7 +748,7 @@ def _normalize_instance_payload(body: dict) -> dict[str, Any]:
         "entry_time": _clean_time(body.get("entry_time"), "09:20"),
         "exit_time": _clean_time(body.get("exit_time"), "15:15"),
         "lots": _clean_int(body.get("lots"), 1, lo=1, hi=1000),
-        "strike_interval": _clean_int(body.get("strike_interval"), 50, lo=1, hi=10000),
+        "strike_interval": _clean_int(body.get("strike_interval"), strike_interval_default, lo=1, hi=10000),
         "strike_mode": strike_mode,
         "otm_strikes": _clean_int(body.get("otm_strikes"), 0, lo=0, hi=50),
         "static_legs": bool(body.get("static_legs", False)),
