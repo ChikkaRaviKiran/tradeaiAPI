@@ -535,22 +535,26 @@ class AngelOneClient:
                 token_map[t] = pe_info
             strike_tokens[strike] = entry
 
-        # Phase 2: Batch getMarketData(FULL) — max 50 tokens per call
-        all_tokens = list(token_map.keys())
+        # Phase 2: Batch getMarketData(FULL) by derivative segment. SENSEX
+        # options are BFO instruments; requesting their tokens under NFO
+        # produces empty OI and makes max pain collapse to the first strike.
+        tokens_by_exchange: dict[str, list[str]] = {}
+        for token, symbol_info in token_map.items():
+            exchange = str(symbol_info.get("exch_seg") or self.nfo_exchange).upper()
+            tokens_by_exchange.setdefault(exchange, []).append(token)
         quotes: dict[str, dict] = {}  # token -> market data
         batch_size = 50
-        for i in range(0, len(all_tokens), batch_size):
-            batch = all_tokens[i : i + batch_size]
-            try:
-                data = self._smart_api.getMarketData(
-                    "FULL", {self.nfo_exchange: batch}
-                )
-                if data and data.get("status") and data.get("data"):
-                    for item in data["data"].get("fetched", []):
-                        quotes[str(item.get("symbolToken", ""))] = item
-            except Exception as e:
-                logger.warning("Batch market data failed: %s", e)
-            time.sleep(0.3)  # Rate limiting between batches
+        for exchange, tokens in tokens_by_exchange.items():
+            for i in range(0, len(tokens), batch_size):
+                batch = tokens[i : i + batch_size]
+                try:
+                    data = self._smart_api.getMarketData("FULL", {exchange: batch})
+                    if data and data.get("status") and data.get("data"):
+                        for item in data["data"].get("fetched", []):
+                            quotes[str(item.get("symbolToken", ""))] = item
+                except Exception as e:
+                    logger.warning("Batch market data failed for %s: %s", exchange, e)
+                time.sleep(0.3)  # Rate limiting between batches
 
         # Phase 3: Build rows
         for strike in strikes:
