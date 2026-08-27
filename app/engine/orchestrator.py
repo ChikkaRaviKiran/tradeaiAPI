@@ -40,6 +40,7 @@ from app.core.models import (
     MarketRegime,
     MarketSnapshot,
     OptionsMetrics,
+    OptionsChainRow,
     StrategySignal,
     TechnicalIndicators,
     TradeStatus,
@@ -3083,6 +3084,29 @@ class Orchestrator:
         expiry: str,
     ) -> OptionsMetrics:
         """Fetch options chain and compute metrics for an instrument."""
+        dhan_client = await self._get_dhan_data_feed_client()
+        if dhan_client is not None:
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(dhan_client.get_dhan_option_chain, instrument.symbol),
+                    timeout=45,
+                )
+                chain = self._dhan_chain_rows(response)
+                if not chain:
+                    raise ValueError("Dhan returned an empty options chain")
+                self._last_option_chain[instrument.symbol] = chain
+                metrics = self.feature_engine.compute_options_metrics(chain, spot_price)
+                logger.info(
+                    "[%s] Dhan options: PCR=%s MaxPain=%s",
+                    instrument.symbol,
+                    f"{metrics.pcr:.2f}" if metrics.pcr is not None else "N/A",
+                    f"{metrics.max_pain:.0f}" if metrics.max_pain is not None else "N/A",
+                )
+                return metrics
+            except Exception:
+                logger.exception("[%s] Dhan option-chain refresh failed; retaining prior metrics", instrument.symbol)
+                return self._options_metrics.get(instrument.symbol, OptionsMetrics())
+
         try:
             chain = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -3110,6 +3134,62 @@ class Orchestrator:
         except Exception:
             logger.exception("[%s] Error updating options chain", instrument.symbol)
             return self._options_metrics.get(instrument.symbol, OptionsMetrics())
+
+    @staticmethod
+    def _dhan_chain_rows(response: dict) -> list[OptionsChainRow]:
+        """Convert Dhan's complete expiry chain into the shared metrics model."""
+        option_chain = (response.get("data") or {}).get("oc") or {}
+        rows: list[OptionsChainRow] = []
+        for strike_text, contracts in option_chain.items():
+            try:
+                strike = float(strike_text)
+            except (TypeError, ValueError):
+                continue
+            ce = contracts.get("ce") or {}
+            pe = contracts.get("pe") or {}
+            rows.append(OptionsChainRow(
+                strike_price=strike,
+                call_ltp=ce.get("last_price"),
+                put_ltp=pe.get("last_price"),
+                call_oi=int(ce.get("oi") or 0),
+                put_oi=int(pe.get("oi") or 0),
+                call_volume=int(ce.get("volume") or 0),
+                put_volume=int(pe.get("volume") or 0),
+            ))
+        return rows
+
+    async def _get_dhan_data_feed_client(self):
+        """Return the configured active Dhan data-feed client, if any."""
+        try:
+            from sqlalchemy import select
+            from app.db.account_models import BrokerAccount
+            from app.db.models import AsyncSessionLocal
+            from app.execution.broker_factory import build_broker_from_row
+
+            async with AsyncSessionLocal() as session:
+                account = (await session.execute(
+                    select(BrokerAccount).where(
+                        BrokerAccount.is_active.is_(True),
+                        BrokerAccount.is_data_feed.is_(True),
+                        BrokerAccount.broker == "dhan",
+                    )
+                )).scalar_one_or_none()
+                if account is None:
+                    return None
+                row = {
+                    "id": account.id,
+                    "name": account.name,
+                    "broker": account.broker,
+                    "client_id": account.client_id,
+                    "access_token": account.access_token,
+                    "proxy_url": account.proxy_url,
+                    "updated_at": account.updated_at.isoformat() if account.updated_at else "",
+                }
+            broker = build_broker_from_row(row)
+            return getattr(broker, "client", None) if broker is not None else None
+        except Exception:
+            logger.exception("Could not resolve configured Dhan data-feed account")
+            return None
 
     async def _check_trade_exits_for(
         self,
