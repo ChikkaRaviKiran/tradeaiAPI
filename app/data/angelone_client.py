@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import math
 from datetime import datetime, timedelta
 from typing import Optional, TYPE_CHECKING
 
@@ -507,10 +508,13 @@ class AngelOneClient:
         if spot_price is None:
             return rows
 
-        # Build strikes around current price (±1000 range)
+        # Max pain needs OI from a broad strike universe. A fixed ±1000-point
+        # window truncates SENSEX materially; its apparent max-pain can then
+        # land on the sampled boundary instead of the true minimum.
         step = int(strike_interval)
         base = int(round(spot_price / strike_interval) * strike_interval)
-        strikes = list(range(base - 1000, base + 1000 + step, step))
+        range_points = max(1000, int(math.ceil((float(spot_price) * 0.05) / step)) * step)
+        strikes = list(range(base - range_points, base + range_points + step, step))
 
         # Phase 1: Search all symbol tokens (uses instrument master — no API calls)
         token_map: dict[str, dict] = {}  # token -> symbol_info
