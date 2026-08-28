@@ -131,6 +131,7 @@ class ATLLeg:
     symboltoken: str = ""
     exchange: str = "NFO"
     premium: float = 0.0
+    exit_order_id: str = ""
 
 
 @dataclass

@@ -430,6 +430,13 @@ class ResearchStraddleScanner:
         if resp.status in {OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.COMPLETE}:
             if resp.filled_price > 0:
                 leg.premium = resp.filled_price
+            if reason.startswith("exit_") and resp.status in {OrderStatus.OPEN, OrderStatus.PENDING}:
+                leg.exit_order_id = resp.order_id
+                self._record_event(
+                    instrument.symbol, "exit_pending",
+                    f"{side} {leg.symbol} qty={qty} id={resp.order_id} ({reason})",
+                )
+                return False
             self._record_event(instrument.symbol, "order",
                                f"{side} {leg.symbol} qty={qty} id={resp.order_id} ({reason})")
             return True
@@ -509,26 +516,68 @@ class ResearchStraddleScanner:
     async def _exit_legs(self, instrument: InstrumentConfig, st: _IndexState, reason: str) -> bool:
         """Exit order tier (reverse of entry):
           1. BUY-back shorts first — removes the risky leg.
-          2. Then SELL hedges — recovers any remaining hedge value."""
+          2. Then SELL hedges — recovers any remaining hedge value.
+
+        A rejected close remains in state and is retried by the next scanner
+        cycle. Pending market orders are polled instead of being submitted
+        again, preventing duplicate square-off orders.
+        """
         if not st.entered:
             return True
         lots = self._lots_for(instrument.symbol)
-        ce_ok = pe_ok = True
-        if st.ce is not None:
-            ce_ok = await self._place_leg_order(instrument, st.ce, "BUY", lots, f"exit_{reason}")
-        if st.pe is not None:
-            pe_ok = await self._place_leg_order(instrument, st.pe, "BUY", lots, f"exit_{reason}")
-        hce_ok = hpe_ok = True
-        if st.hedge_ce is not None:
-            hce_ok = await self._place_leg_order(instrument, st.hedge_ce, "SELL", lots, f"exit_hedge_{reason}")
-        if st.hedge_pe is not None:
-            hpe_ok = await self._place_leg_order(instrument, st.hedge_pe, "SELL", lots, f"exit_hedge_{reason}")
-        st.entered = False
-        st.done_for_day = True
-        st.phase = "DONE"
-        self._record_event(instrument.symbol, "exit",
+
+        async def close_leg(leg: ATLLeg, side: str, exit_reason: str) -> bool:
+            if leg.exit_order_id:
+                broker = self._resolve_broker()
+                if broker is None:
+                    return False
+                try:
+                    status = await asyncio.to_thread(broker.get_order_status, leg.exit_order_id)
+                except Exception:
+                    logger.exception("Research exit status check failed: %s", leg.exit_order_id)
+                    return False
+                if status.status == OrderStatus.COMPLETE:
+                    self._record_event(instrument.symbol, "exit_filled",
+                                       f"{side} {leg.symbol} id={leg.exit_order_id}")
+                    return True
+                if status.status in {OrderStatus.REJECTED, OrderStatus.CANCELLED}:
+                    self._record_event(instrument.symbol, "exit_retry",
+                                       f"{side} {leg.symbol} id={leg.exit_order_id} {status.status.value}")
+                    leg.exit_order_id = ""
+                return False
+            return await self._place_leg_order(instrument, leg, side, lots, exit_reason)
+
+        ce_ok = st.ce is None or await close_leg(st.ce, "BUY", f"exit_{reason}")
+        if ce_ok:
+            st.ce = None
+        pe_ok = st.pe is None or await close_leg(st.pe, "BUY", f"exit_{reason}")
+        if pe_ok:
+            st.pe = None
+
+        # Do not remove the protective hedges while either short remains open.
+        hce_ok = hpe_ok = st.ce is None and st.pe is None
+        if hce_ok and st.hedge_ce is not None:
+            hce_ok = await close_leg(st.hedge_ce, "SELL", f"exit_hedge_{reason}")
+            if hce_ok:
+                st.hedge_ce = None
+        if hpe_ok and st.hedge_pe is not None:
+            hpe_ok = await close_leg(st.hedge_pe, "SELL", f"exit_hedge_{reason}")
+            if hpe_ok:
+                st.hedge_pe = None
+
+        completed = all(leg is None for leg in (st.ce, st.pe, st.hedge_ce, st.hedge_pe))
+        if completed:
+            st.entered = False
+            st.done_for_day = True
+            st.phase = "DONE"
+            self._record_event(instrument.symbol, "exit",
+                               f"{st.strat} exit reason={reason} complete")
+            return True
+
+        st.phase = "EXIT_RETRY"
+        self._record_event(instrument.symbol, "exit_retry",
                            f"{st.strat} exit reason={reason} short_ok=({ce_ok},{pe_ok}) hedge_ok=({hce_ok},{hpe_ok})")
-        return ce_ok and pe_ok and hce_ok and hpe_ok
+        return False
 
     # ── indicator gates ───────────────────────────────────────────
     def _evaluate_entry_gate(self, kind: str, strat: str, df_today: pd.DataFrame,
