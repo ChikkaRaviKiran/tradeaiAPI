@@ -386,15 +386,15 @@ def evaluate_exit(kind, strat_dir, e_min, x_baseline, credit, leg_keys, bars, sy
                   mins, spot, vwap_, rsi_, rv5):
     """Walk minute-by-minute from e_min+1 to EOD_MIN; return (exit_min, reason).
     'kind' selects the trigger menu; X0 returns the baseline minute.
-    Hard SL of 100 % credit is always active.
+    The hard ₹ SL is always active, including for X0 fixed-time exits.
     """
-    if kind == "X0":
-        return x_baseline, "fixed"
     rsi_peak = -1; rsi_trough = 101
     base_rv = None
     rv_seen = []
     rs_per_pt = LOT_SIZE[sym] * LOTS
     last_minute = min(EOD_MIN, max(mins)) if mins else EOD_MIN
+    if kind == "X0":
+        last_minute = min(last_minute, x_baseline)
     for m in range(e_min+1, last_minute+1):
         # ---- Hard ₹ SL check (always on): WORST-case cost (HIGH of short legs).
         worst_cost = leg_cost_worst(bars, leg_keys, m, slack=2)
@@ -425,6 +425,8 @@ def evaluate_exit(kind, strat_dir, e_min, x_baseline, credit, leg_keys, bars, sy
                 base_rv = mean(rv_seen)
                 if base_rv and v > 2.0 * base_rv and len(rv_seen) > 30:
                     return m, "vol_pop"
+    if kind == "X0":
+        return last_minute, "fixed"
     return last_minute, "eod"
 
 # --------------------------------------------------- strategy → leg builder --
