@@ -77,6 +77,11 @@ class KillSwitchState:
     # in the next /positions snapshot). Prevents the next watchdog tick
     # from firing a duplicate squareoff that would flip the net position.
     pending_exit_qty: dict[str, int] = field(default_factory=dict)
+    # IST timestamp each entry in ``pending_exit_qty`` was recorded. Used
+    # to expire the dedup guard after a short grace period so a rejected
+    # / partially-filled force-close order gets retried instead of being
+    # silently ignored forever (see 2026-08-28 stuck-kill-switch incident).
+    pending_exit_at: dict[str, datetime] = field(default_factory=dict)
     # IST timestamp of the most recent force-close pass. Used as a safety
     # cooldown so we never spam squareoffs faster than fills can reflect.
     last_force_close_at: Optional[datetime] = None
@@ -152,6 +157,7 @@ def _snapshot(st: KillSwitchState) -> KillSwitchState:
         state_date=st.state_date,
         net_qty_by_security=dict(st.net_qty_by_security),
         pending_exit_qty=dict(st.pending_exit_qty),
+        pending_exit_at=dict(st.pending_exit_at),
         last_force_close_at=st.last_force_close_at,
     )
 
@@ -231,6 +237,7 @@ def reset_kill_switch(
         # cleanly fire fresh force-close orders on any positions that
         # have since been re-opened.
         st.pending_exit_qty = {}
+        st.pending_exit_at = {}
         st.last_force_close_at = None
         if was_locked:
             logger.warning("Kill switch RESET account_id=%s (%s)", st.account_id, reason)
@@ -347,6 +354,22 @@ def _compute_pnl_and_qty(positions: list[dict]) -> tuple[float, dict[str, int], 
     return total, by_sec, open_positions
 
 
+def _freeze_qty_for_symbol(trading_symbol: str) -> int:
+    """Return the exchange per-order freeze qty for a position's trading
+    symbol, or 0 if the underlying can't be identified.
+
+    Reuses the same table :py:mod:`dhan_broker` uses for live entries so
+    a force-close squareoff never exceeds the exchange's iceberg limit.
+    """
+    from app.execution.dhan_broker import _FREEZE_QTY_BY_UNDERLYING
+
+    sym = (trading_symbol or "").upper().strip()
+    for underlying, qty in _FREEZE_QTY_BY_UNDERLYING.items():
+        if sym.startswith(underlying):
+            return qty
+    return 0
+
+
 async def _force_close_all(
     dhan_client,
     positions: list[dict],
@@ -355,9 +378,22 @@ async def _force_close_all(
     """MARKET-squareoff every open position of one account. Returns the
     number of squareoff orders attempted. Each call is wrapped so one
     failure doesn't stop the rest.
+
+    Large positions are sliced to the exchange's per-order freeze qty
+    (same table/logic as live entries) so a single oversized MARKET
+    order can't silently under-fill (Dhan/NSE "iceberg" behaviour drops
+    the qty above the freeze limit instead of rejecting outright).
     """
+    from app.execution.dhan_broker import _split_quantity
+
     closed = 0
     now = datetime.now(_IST)
+    # How long a "pending" force-close is trusted before we retry it
+    # anyway. Must be long enough to let one poll cycle's fill reflect,
+    # but short enough that a rejected/partially-filled order (e.g. from
+    # a freeze-qty violation) doesn't stay stuck for the rest of the day.
+    retry_grace_seconds = max(10.0, float(settings.account_kill_switch_poll_seconds) * 3)
+
     for p in positions:
         try:
             sec_id = str(p.get("securityId") or p.get("security_id") or "")
@@ -368,40 +404,92 @@ async def _force_close_all(
                 continue
 
             # Skip positions that already have a pending squareoff with
-            # the same sign — the previous tick's exit is still settling.
+            # the same sign AND that squareoff was issued recently — the
+            # previous tick's exit is likely still settling. Once the
+            # grace period elapses we retry regardless, so a rejected or
+            # partially-filled order can never block force-close forever.
             with _state_lock:
                 pending = int(st.pending_exit_qty.get(sec_id, 0))
-            if pending != 0 and ((pending > 0) == (net_qty > 0)):
+                pending_at = st.pending_exit_at.get(sec_id)
+            if (
+                pending != 0
+                and ((pending > 0) == (net_qty > 0))
+                and pending_at is not None
+                and (now - pending_at).total_seconds() < retry_grace_seconds
+            ):
                 logger.info(
                     "KILL SWITCH skip duplicate force-close: account_id=%s security_id=%s "
-                    "net_qty=%d pending_exit=%d",
-                    st.account_id, sec_id, net_qty, pending,
+                    "net_qty=%d pending_exit=%d age=%.1fs",
+                    st.account_id, sec_id, net_qty, pending, (now - pending_at).total_seconds(),
                 )
                 continue
 
             side = "SELL" if net_qty > 0 else "BUY"
-            qty = abs(net_qty)
-            logger.warning(
-                "KILL SWITCH FORCE-CLOSE account_id=%s: security_id=%s qty=%d side=%s seg=%s",
-                st.account_id, sec_id, qty, side, seg,
-            )
-            resp = await asyncio.to_thread(
-                dhan_client.place_order,
-                security_id=sec_id,
-                exchange_segment=seg,
-                transaction_type=side,
-                quantity=qty,
-                order_type="MARKET",
-                product_type=product,
-                price=0.0,
-                trigger_price=0.0,
-            )
-            logger.info("KILL SWITCH force-close response: %s", resp)
-            # Mark the in-flight exit so we don't duplicate next tick.
+            total_qty = abs(net_qty)
+            trading_symbol = str(p.get("tradingSymbol") or p.get("trading_symbol") or "")
+            freeze_qty = _freeze_qty_for_symbol(trading_symbol)
+            lot_size = 0
+            if freeze_qty and total_qty > freeze_qty:
+                try:
+                    lot_size = await asyncio.to_thread(
+                        dhan_client.get_lot_size_for_security_id, sec_id
+                    )
+                except Exception:
+                    logger.debug(
+                        "Kill switch: lot-size lookup failed for security_id=%s", sec_id,
+                        exc_info=True,
+                    )
+            slice_qtys = _split_quantity(total_qty, freeze_qty, lot_size or total_qty)
+            if len(slice_qtys) > 1:
+                logger.warning(
+                    "KILL SWITCH FORCE-CLOSE SLICING account_id=%s security_id=%s "
+                    "total_qty=%d freeze_qty=%d lot_size=%d → %d slices %s",
+                    st.account_id, sec_id, total_qty, freeze_qty, lot_size, len(slice_qtys), slice_qtys,
+                )
+
+            filled_qty = 0
+            for idx, slice_qty in enumerate(slice_qtys):
+                logger.warning(
+                    "KILL SWITCH FORCE-CLOSE account_id=%s: security_id=%s qty=%d "
+                    "side=%s seg=%s slice=%d/%d",
+                    st.account_id, sec_id, slice_qty, side, seg, idx + 1, len(slice_qtys),
+                )
+                resp = await asyncio.to_thread(
+                    dhan_client.place_order,
+                    security_id=sec_id,
+                    exchange_segment=seg,
+                    transaction_type=side,
+                    quantity=slice_qty,
+                    order_type="MARKET",
+                    product_type=product,
+                    price=0.0,
+                    trigger_price=0.0,
+                )
+                logger.info("KILL SWITCH force-close response: %s", resp)
+                if not isinstance(resp, dict) or resp.get("status") != "success":
+                    logger.error(
+                        "KILL SWITCH FORCE-CLOSE ORDER REJECTED account_id=%s security_id=%s "
+                        "slice=%d/%d qty=%d resp=%s — will retry next poll",
+                        st.account_id, sec_id, idx + 1, len(slice_qtys), slice_qty, resp,
+                    )
+                    break
+                filled_qty += slice_qty
+
+            # Record whatever we actually managed to place this pass so
+            # the dedup guard reflects reality — not the originally
+            # requested (possibly larger) qty. A rejected first slice
+            # leaves nothing pending, so the very next poll retries
+            # immediately instead of waiting out the grace period.
             with _state_lock:
-                st.pending_exit_qty[sec_id] = net_qty
+                if filled_qty > 0:
+                    st.pending_exit_qty[sec_id] = filled_qty if net_qty > 0 else -filled_qty
+                    st.pending_exit_at[sec_id] = now
+                else:
+                    st.pending_exit_qty.pop(sec_id, None)
+                    st.pending_exit_at.pop(sec_id, None)
                 st.last_force_close_at = now
-            closed += 1
+            if filled_qty > 0:
+                closed += 1
         except Exception:
             logger.exception(
                 "Kill switch force-close failed account_id=%s position=%s",
@@ -485,6 +573,9 @@ async def _watchdog_poll_one(target: dict) -> None:
                         continue
                     cleaned[sid] = cur if abs(cur) < abs(pending_qty) else pending_qty
                 st.pending_exit_qty = cleaned
+                st.pending_exit_at = {
+                    sid: ts for sid, ts in st.pending_exit_at.items() if sid in cleaned
+                }
             already_locked = st.locked
             should_trip = (
                 st.enabled

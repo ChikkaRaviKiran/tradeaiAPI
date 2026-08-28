@@ -482,6 +482,27 @@ class DhanClient:
         sec_id = self._row_get(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID")
         return sec_id or None
 
+    def get_lot_size_for_security_id(self, security_id: str) -> int:
+        """Return the exchange-published lot size for a known ``securityId``.
+
+        Used by the kill-switch force-close path, which only has the
+        broker's positions payload (securityId, no structured
+        underlying/expiry/strike) to work with.
+        """
+        target = str(security_id or "").strip()
+        if not target:
+            return 0
+        for row in self._load_scrip_master():
+            sec_id = self._row_get(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID")
+            if sec_id == target:
+                raw = self._row_get(row, "SEM_LOT_UNITS", "LOT_SIZE", "LOT_UNITS")
+                try:
+                    ls = int(float(raw)) if raw else 0
+                    return ls if ls > 0 else 0
+                except (ValueError, TypeError):
+                    return 0
+        return 0
+
     def resolve_option_lot_size(
         self,
         underlying: str,
