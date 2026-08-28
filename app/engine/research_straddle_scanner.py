@@ -98,6 +98,7 @@ class _IndexState:
     done_for_day: bool = False
     halted: bool = False
     halt_reason: str = ""
+    exit_reason: str = ""
     entry_time_str: str = ""
     exit_time_str: str = ""
     strat: str = ""
@@ -150,6 +151,7 @@ class ResearchStraddleScanner:
             st.done_for_day = False
             st.halted = False
             st.halt_reason = ""
+            st.exit_reason = ""
             st.entry_time_str = ""
             st.exit_time_str = ""
             st.strat = ""
@@ -524,6 +526,7 @@ class ResearchStraddleScanner:
         """
         if not st.entered:
             return True
+        st.exit_reason = reason
         lots = self._lots_for(instrument.symbol)
 
         async def close_leg(leg: ATLLeg, side: str, exit_reason: str) -> bool:
@@ -570,6 +573,7 @@ class ResearchStraddleScanner:
             st.entered = False
             st.done_for_day = True
             st.phase = "DONE"
+            st.exit_reason = ""
             self._record_event(instrument.symbol, "exit",
                                f"{st.strat} exit reason={reason} complete")
             return True
@@ -703,15 +707,20 @@ class ResearchStraddleScanner:
                     st.done_for_day = False
                     st.phase = "IDLE"
 
-        if not self._settings.get("enabled", False):
-            return
-
         sym = instrument.symbol.upper()
         if sym not in self._states:
             return
 
         st = self._states[sym]
         if st.halted or st.entry_in_progress:
+            return
+
+        # A triggered exit takes priority until every remaining leg is closed.
+        if st.entered and st.phase == "EXIT_RETRY":
+            await self._exit_legs(instrument, st, reason=st.exit_reason or "retry")
+            return
+
+        if not self._settings.get("enabled", False):
             return
 
         # Determine today's cell from schedule (mode-filtered)
