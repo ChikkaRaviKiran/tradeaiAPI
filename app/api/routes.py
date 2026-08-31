@@ -429,6 +429,14 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     await init_db()
 
+    # Market Story (positioning): standalone SQLite store for option-chain
+    # snapshots (isolated, read-only subsystem — never places orders).
+    try:
+        from app.positioning import storage as _positioning_storage
+        _positioning_storage.init_db()
+    except Exception as _pos_e:
+        logger.warning("positioning storage init failed: %s", _pos_e)
+
     # Pattern Engine: seed defaults + start nightly scheduler (isolated subsystem)
     import os
     if os.environ.get("PATTERN_ENGINE_SCHEDULER", "1") != "0":
@@ -471,6 +479,17 @@ async def lifespan(app: FastAPI):
             _el_start()
         except Exception as _el_e:
             logger.warning("expiry_levels startup hook failed: %s", _el_e)
+
+    # Market Story: option-chain snapshot collector on the 5-minute candle
+    # grid, 09:15-15:30 IST (isolated, read-only subsystem — never places
+    # orders). Server-side so the series is recorded whether or not anyone has
+    # the page open.
+    if os.environ.get("POSITIONING_SCHEDULER", "1") != "0":
+        try:
+            from app.positioning.scheduler import start_scheduler as _ps_start
+            _ps_start()
+        except Exception as _ps_e:
+            logger.warning("positioning collector startup hook failed: %s", _ps_e)
 
     if os.environ.get("SKIP_ORCHESTRATOR") == "1":
         logger.info("SKIP_ORCHESTRATOR=1 — skipping orchestrator (backtest-only mode)")
@@ -619,6 +638,14 @@ try:
     _register_oi_routes(app)
 except Exception as _oi_err:  # pragma: no cover
     logger.warning("OI strategy routes not registered: %s", _oi_err)
+
+
+# ── Market Story / positioning routes (isolated, read-only subsystem) ────
+try:
+    from app.positioning.api import router as _positioning_router
+    app.include_router(_positioning_router)
+except Exception as _pos_err:  # pragma: no cover
+    logger.warning("positioning routes not registered: %s", _pos_err)
 
 
 # ── Market Overview ───────────────────────────────────────────────────────

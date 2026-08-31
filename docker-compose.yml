@@ -43,6 +43,16 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/tradeai
       REDIS_URL: redis://redis:6379/0
       TZ: Asia/Kolkata
+      # Market Story: keep the option-chain snapshot store on a named volume,
+      # otherwise every rebuild throws away the recorded sessions.
+      POSITIONING_DB_PATH: /data/positioning/positioning.db
+      # Optional local LLM for the "rewrite in plain English" button. Inside a
+      # container "localhost" is the container, so point at the host.
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - positioning_data:/data/positioning
     depends_on:
       postgres:
         condition: service_healthy
@@ -63,3 +73,4 @@ services:
 
 volumes:
   pgdata:
+  positioning_data:
