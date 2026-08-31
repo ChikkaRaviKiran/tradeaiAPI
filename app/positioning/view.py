@@ -34,12 +34,25 @@ Three properties make it conservative on purpose:
 
 WHAT IT IS NOT
 --------------
-Not a forecast. The weights were chosen, not measured, exactly like the
-thresholds in the agent, and this repository has already measured that price
-behaviour at call-OI resistance carried no information at all. The label
-describes the balance of option positioning right now. `counterpoints` is
-mandatory rather than decorative for that reason: a conclusion printed without
-its opposing evidence is an opinion with a number stapled to it.
+Not a forecast, and no longer only on principle. The weights were chosen, not
+measured, exactly like the thresholds in the agent - and in August 2026 the
+label itself was finally tested forward over 203 NIFTY sessions rebuilt from
+per-minute `option_candles` (research/oi_lag_study.py, oi_horizon_sweep.py):
+
+    horizon   graded   accuracy   95% CI          p
+    15 min      4295      50.5%   [49.0, 52.0]   0.49
+    30 min      4530      49.2%   [47.8, 50.7]   0.28
+    60 min      4302      50.9%   [49.4, 52.4]   0.23
+
+Fifteen cells across three horizons and five move-size thresholds, none
+significant, and no gradient with conviction - "Strongly" scored 51.5% against
+"Slightly" at 49.9%. That is a well-powered null, not a small sample shrugging.
+The reporting grid costs a median of five minutes of latency, and there is no
+case for recovering it: a faster coin flip is still a coin flip.
+
+`counterpoints` is mandatory rather than decorative for that reason: a
+conclusion printed without its opposing evidence is an opinion with a number
+stapled to it.
 """
 
 from __future__ import annotations
@@ -184,7 +197,12 @@ WATCH_VERB: dict[tuple[str, str], str] = {
 }
 
 DISCLAIMER = ("This direction view is derived only from option positioning. "
-              "It is an observation of participant positioning, not a prediction.")
+              "It is an observation of participant positioning, not a "
+              "prediction - and it has now been measured as one: across 203 "
+              "NIFTY sessions the label called the next 15, 30 and 60 minutes "
+              "at 49-51%, indistinguishable from a coin flip at every move "
+              "size tested. Read it as a description of what writers are "
+              "doing, never as a forecast.")
 
 
 # --- small helpers ----------------------------------------------------------
