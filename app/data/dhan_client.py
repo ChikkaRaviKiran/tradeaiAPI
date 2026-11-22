@@ -125,22 +125,16 @@ class DhanClient:
         # login uses its dedicated Lightsail IP (matches the OptionSelling
         # multi-account isolation pattern).
         if self.proxy_url:
-            try:
-                self._install_proxy_on_sdk_session(self.proxy_url)
-                logger.info(
-                    "DhanClient[%s] routing via proxy %s",
-                    self.client_id, _mask_dhan_proxy(self.proxy_url),
-                )
-            except Exception:
-                logger.exception("DhanClient: failed to install proxy on SDK session (proceeding without proxy)")
+            self._install_proxy_on_sdk_session(self.proxy_url)
+            logger.info(
+                "DhanClient[%s] routing via proxy %s",
+                self.client_id, _mask_dhan_proxy(self.proxy_url),
+            )
         self._instrument_cache: list[dict] = []
         self._instrument_cache_date: Optional[date] = None
 
     def _install_proxy_on_sdk_session(self, proxy_url: str) -> None:
-        """Best-effort: locate the internal requests.Session on the dhanhq SDK
-        instance and attach a proxies dict. Structure varies across SDK
-        versions so we probe common attribute paths.
-        """
+        """Install the proxy on the SDK transport, or fail closed."""
         proxies = {"http": proxy_url, "https": proxy_url}
         candidates: list = []
         for obj in (self._dhan, getattr(self._dhan, "dhan_context", None),
@@ -149,7 +143,7 @@ class DhanClient:
                 continue
             candidates.append(obj)
             # SDKs commonly hold the session on one of these attributes
-            for attr in ("session", "_session", "http_session", "_http", "api", "_api"):
+            for attr in ("dhan_http", "session", "_session", "http_session", "_http", "api", "_api"):
                 child = getattr(obj, attr, None)
                 if child is not None:
                     candidates.append(child)
@@ -158,17 +152,10 @@ class DhanClient:
             if sess is None:
                 sess = getattr(c, "_session", None)
             if sess is not None and hasattr(sess, "proxies"):
-                try:
-                    sess.proxies.update(proxies)
-                except Exception:
-                    try:
-                        sess.proxies = proxies
-                    except Exception:
-                        continue
-        # Absolute fallback: process-wide env vars scoped to this call site.
-        # We deliberately do NOT set os.environ here — that would leak to
-        # every other broker's requests. The SDK-session patching above is
-        # the isolated per-account path.
+                sess.proxies.update(proxies)
+                sess.trust_env = False
+                return
+        raise RuntimeError("Dhan SDK HTTP session not found; refusing direct connection")
 
     # ── Profile / health ─────────────────────────────────────────────
 

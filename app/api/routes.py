@@ -2452,7 +2452,7 @@ async def test_dhan_connection():
     try:
         from app.data.dhan_client import DhanClient
 
-        client = DhanClient(client_id, access_token)
+        client = DhanClient(client_id, access_token, proxy_url=creds.get("proxy_url") or "")
         # Hit the SDK directly so we can see the raw status / remarks /
         # errorCode envelope. The DhanClient.get_fund_limits() wrapper
         # collapses failures into an empty dict, which used to hide
@@ -2599,7 +2599,7 @@ async def refresh_dhan_instruments():
     try:
         from app.data.dhan_client import DhanClient
 
-        client = DhanClient(client_id, access_token)
+        client = DhanClient(client_id, access_token, proxy_url=creds.get("proxy_url") or "")
         n = await asyncio.to_thread(client.refresh_scrip_master, True)
         return {"ok": True, "instruments_loaded": n}
     except Exception as exc:

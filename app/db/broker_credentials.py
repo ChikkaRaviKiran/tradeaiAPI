@@ -165,7 +165,7 @@ def get_dhan_credentials(*, fresh: bool = False) -> Dict[str, str]:
             row = conn.execute(
                 text(
                     """
-                    SELECT client_id, access_token
+                    SELECT client_id, access_token, proxy_url
                       FROM broker_accounts
                      WHERE LOWER(broker) = 'dhan'
                        AND is_active = TRUE
@@ -179,7 +179,11 @@ def get_dhan_credentials(*, fresh: bool = False) -> Dict[str, str]:
                 )
             ).fetchone()
         if row and row[0] and row[1]:
-            return {"client_id": str(row[0]), "access_token": str(row[1])}
+            return {
+                "client_id": str(row[0]),
+                "access_token": str(row[1]),
+                "proxy_url": str(row[2] or ""),
+            }
     except Exception:
         # Table might not exist yet (fresh install) — silently fall through
         logger.debug(
@@ -191,7 +195,8 @@ def get_dhan_credentials(*, fresh: bool = False) -> Dict[str, str]:
     creds = get_credentials("dhan", fresh=fresh)
     client_id = creds.get("client_id") or settings.dhan_client_id or ""
     access_token = creds.get("access_token") or settings.dhan_access_token or ""
-    return {"client_id": client_id, "access_token": access_token}
+    proxy_url = creds.get("proxy_url") or ""
+    return {"client_id": client_id, "access_token": access_token, "proxy_url": proxy_url}
 
 
 def set_dhan_credentials(*, client_id: Optional[str] = None,

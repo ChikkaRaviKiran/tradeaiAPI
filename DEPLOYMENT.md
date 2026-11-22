@@ -46,6 +46,25 @@ GitHub Push (frontend) → Build frontend image → Push to GHCR → SSH restart
 - **Two GitHub Repos**: `tradeai-engine` (backend) and `tradeai-dashboard` (frontend)
 - **SSH Key Pair**: For EC2 access and GitHub Actions deployment
 
+### Broker proxy provisioning
+
+Set `AWS_REGION` to an AWS region (not an availability zone) and
+`MAIN_SERVER_IP` to the backend server's public outbound IPv4 address.
+The Lightsail IAM policy needs `GetBundles`, `GetInstance`, `GetInstances`,
+`CreateInstances`, `TagResource`, `PutInstancePublicPorts`, `DeleteInstance`,
+`GetStaticIp`, `AllocateStaticIp`, `AttachStaticIp`, `DetachStaticIp`, and
+`ReleaseStaticIp`, with the `lightsail:` prefix.
+`lightsail:GetInstancePortStates` is also needed to independently inspect
+the instance firewall.
+
+Provisioning uses an active IPv4 Nano bundle costing at most $5/month and
+creates a static IPv4 address. It only reports the account proxy active after
+the SOCKS5 connection returns that static IP. A failed or interrupted attempt
+can be retried for the same account; review AWS resources and charges if it
+fails. Static IPs that are allocated but unattached may incur charges.
+Whitelist the verified static IP with the broker and test the connection before
+enabling live execution. A successful proxy check does not verify order fills.
+
 ---
 
 ## Step 1: Push Code to GitHub

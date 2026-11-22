@@ -28,6 +28,7 @@ import pytz
 from sqlalchemy import text, delete
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 from app.core.instruments import InstrumentConfig, get_instrument
@@ -207,7 +208,12 @@ class StrategyEvaluator:
         self.lookback_days = lookback_days
         self.feature_engine = FeatureEngine()
         self.regime_detector = RegimeDetector()
-        self._engine = create_async_engine(settings.database_url, echo=False)
+        # Evaluation reads run in temporary event loops in a worker thread;
+        # report writes run in the application loop. Connections cannot be
+        # pooled across those loops.
+        self._engine = create_async_engine(
+            settings.database_url, echo=False, poolclass=NullPool,
+        )
         self._session_factory = sessionmaker(
             self._engine, class_=AsyncSession, expire_on_commit=False
         )

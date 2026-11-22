@@ -118,6 +118,7 @@ class DhanBroker(BaseBroker):
         # detect token rotations (UI save / .env edit) and rebuild lazily
         # instead of relying on every caller to invoke reload_credentials().
         self._client_token: str = ""
+        self._client_proxy: str = ""
         # ``True`` when this broker owns a per-account injected client and
         # must NOT auto-refresh from the shared credentials cache.
         self._account_scoped: bool = client is not None
@@ -142,6 +143,7 @@ class DhanBroker(BaseBroker):
         creds = get_dhan_credentials(fresh=fresh) if _supports_fresh_kw() else get_dhan_credentials()
         client_id = creds.get("client_id") or ""
         access_token = creds.get("access_token") or ""
+        proxy_url = creds.get("proxy_url") or ""
         if not client_id or not access_token:
             logger.warning(
                 "DhanBroker: client_id / access_token not configured "
@@ -150,14 +152,17 @@ class DhanBroker(BaseBroker):
             self._client = None
             self._client_id = ""
             self._client_token = ""
+            self._client_proxy = ""
             return
         try:
             self._client = DhanClient(
                 client_id=client_id,
                 access_token=access_token,
+                proxy_url=proxy_url,
             )
             self._client_id = client_id
             self._client_token = access_token
+            self._client_proxy = proxy_url
             logger.info(
                 "DhanBroker: client (re)built for client_id=%s token_tail=...%s",
                 (client_id[:4] + "***") if client_id else "***",
@@ -168,6 +173,7 @@ class DhanBroker(BaseBroker):
             self._client = None
             self._client_id = ""
             self._client_token = ""
+            self._client_proxy = ""
 
     def _ensure_fresh_client(self) -> None:
         """Self-heal: if the access_token in the DB differs from the one the
@@ -192,13 +198,17 @@ class DhanBroker(BaseBroker):
             creds = get_dhan_credentials()
             db_client_id = creds.get("client_id") or ""
             db_token = creds.get("access_token") or ""
+            db_proxy = creds.get("proxy_url") or ""
         except Exception:
             logger.debug("DhanBroker: credential refresh check failed", exc_info=True)
             return
 
         if not db_client_id or not db_token:
             return
-        if db_token == self._client_token and db_client_id == self._client_id and self._client is not None:
+        if (db_token == self._client_token
+                and db_client_id == self._client_id
+                and db_proxy == self._client_proxy
+                and self._client is not None):
             return
 
         logger.info(

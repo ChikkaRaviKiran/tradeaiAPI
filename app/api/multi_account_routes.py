@@ -26,8 +26,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 from datetime import datetime
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import select
@@ -41,6 +43,8 @@ from app.db.account_models import (
 from app.db.models import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
+_proxy_tasks: dict[int, asyncio.Task] = {}
+_proxy_start_lock = asyncio.Lock()
 
 
 def _invalidate_settings_cache_safe() -> None:
@@ -92,10 +96,12 @@ def _compute_proxy_status(a: BrokerAccount) -> str:
     Dhan doesn't strictly require a proxy — but we still allow one, so we
     never return 'not_needed' here; we simply say 'none' when no proxy is set.
     """
+    if a.id in _proxy_tasks:
+        return "provisioning"
     if a.proxy_ip:
         return "active"
-    if a.proxy_instance_name:
-        return "provisioning"
+    if a.proxy_instance_name and a.proxy_instance_name.startswith("failed:"):
+        return "failed"
     return "none"
 
 
@@ -320,14 +326,7 @@ def register_multi_account_routes(app: FastAPI) -> None:
         try:
             from app.core.config import settings as _s
             if _s.aws_access_key_id and _s.aws_secret_access_key and not row.proxy_url:
-                # Mark as provisioning immediately so proxy_status='provisioning'
-                # shows up in the UI before AWS finishes.
-                async with AsyncSessionLocal() as s2:
-                    async with s2.begin():
-                        r2 = await s2.get(BrokerAccount, new_id)
-                        if r2 is not None and not r2.proxy_instance_name:
-                            r2.proxy_instance_name = f"tradeai-proxy-{new_id}"
-                asyncio.create_task(_provision_proxy_background(new_id))
+                await _start_proxy_provisioning(new_id)
                 result["proxy_provisioning"] = True
                 result["proxy_status"] = "provisioning"
         except Exception:
@@ -381,6 +380,8 @@ def register_multi_account_routes(app: FastAPI) -> None:
 
     @app.delete("/api/accounts/{account_id}")
     async def delete_account(account_id: int) -> dict[str, Any]:
+        if account_id in _proxy_tasks:
+            raise HTTPException(status_code=409, detail="Proxy provisioning is in progress")
         async with AsyncSessionLocal() as s:
             async with s.begin():
                 row = await s.get(BrokerAccount, account_id)
@@ -503,47 +504,23 @@ def register_multi_account_routes(app: FastAPI) -> None:
 
     @app.post("/api/proxy/provision/{account_id}")
     async def provision_proxy(account_id: int) -> dict[str, Any]:
-        """(Re)provision the Lightsail proxy for an account and persist it.
-        Blocks until AWS reports the IP so the caller sees it immediately.
-        """
+        """Start proxy provisioning in the background."""
         from app.core.config import settings as _s
         if not _s.aws_access_key_id:
             return {"status": "error", "message": "AWS not configured"}
         try:
-            from app.infra.proxy_manager import proxy_manager
-            result = await asyncio.to_thread(proxy_manager.create_proxy, account_id)
-            proxy_url = result.get("proxy_url", "")
-            proxy_ip = result.get("public_ip", "")
-            proxy_instance_name = result.get("instance_name", "")
-            broker = ""
-            async with AsyncSessionLocal() as s:
-                async with s.begin():
-                    row = await s.get(BrokerAccount, account_id)
-                    if row is not None:
-                        row.proxy_url = proxy_url
-                        row.proxy_ip = proxy_ip
-                        row.proxy_instance_name = proxy_instance_name
-                        broker = row.broker or ""
-            _invalidate_broker_cache_safe(account_id)
-            whitelist_target = (
-                "Kite Connect developer console" if broker == "kite"
-                else "SmartAPI portal" if broker == "angel"
-                else "broker console"
-            )
-            return {
-                "status": "ok",
-                "proxy_ip": proxy_ip,
-                "message": (
-                    f"Proxy provisioned — whitelist IP {proxy_ip} in {whitelist_target}"
-                    + (" and re-do OAuth login" if broker == "kite" else "")
-                ),
-            }
+            await _start_proxy_provisioning(account_id)
+            return {"status": "ok", "message": "Proxy provisioning started. The IP will appear after connectivity is verified."}
+        except HTTPException:
+            raise
         except Exception:
             logger.exception("Failed to provision proxy")
             return {"status": "error", "message": "Failed to provision proxy"}
 
     @app.delete("/api/proxy/{account_id}")
     async def delete_proxy_endpoint(account_id: int) -> dict[str, Any]:
+        if account_id in _proxy_tasks:
+            raise HTTPException(status_code=409, detail="Proxy provisioning is in progress")
         from app.core.config import settings as _s
         if not _s.aws_access_key_id:
             return {"status": "error", "message": "AWS not configured"}
@@ -781,7 +758,33 @@ def _require_aws_configured() -> None:
         raise RuntimeError("AWS credentials not configured")
 
 
-async def _provision_proxy_background(account_id: int) -> None:
+async def _start_proxy_provisioning(account_id: int) -> None:
+    async with _proxy_start_lock:
+        if account_id in _proxy_tasks:
+            raise HTTPException(status_code=409, detail="Proxy provisioning is already in progress")
+        async with AsyncSessionLocal() as s:
+            async with s.begin():
+                row = await s.get(BrokerAccount, account_id)
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Account not found")
+                if row.proxy_ip:
+                    raise HTTPException(status_code=409, detail="Account already has a proxy")
+                existing = urlparse(row.proxy_url or "")
+                if existing.hostname == "127.0.0.1" and existing.port == 9 and existing.username and existing.password:
+                    user, password = existing.username, existing.password
+                else:
+                    user, password = "proxy", secrets.token_urlsafe(24)
+                # Persist credentials before creating an instance so a failed
+                # provision can be resumed without losing the proxy password.
+                row.proxy_url = f"socks5h://{user}:{password}@127.0.0.1:9"
+                row.proxy_ip = ""
+                row.proxy_instance_name = f"tradeai-proxy-{account_id}"
+        _invalidate_broker_cache_safe(account_id)
+        task = asyncio.create_task(_provision_proxy_background(account_id, user, password))
+        _proxy_tasks[account_id] = task
+
+
+async def _provision_proxy_background(account_id: int, user: str, password: str) -> None:
     """Provision a Lightsail SOCKS5 proxy for the given account and persist
     the resulting proxy_url / proxy_ip / proxy_instance_name back onto the
     BrokerAccount row. Safe to call from asyncio.create_task — catches
@@ -790,7 +793,7 @@ async def _provision_proxy_background(account_id: int) -> None:
     try:
         from app.infra.proxy_manager import proxy_manager
         logger.info("[Proxy] Provisioning proxy for account %s ...", account_id)
-        info = await asyncio.to_thread(proxy_manager.create_proxy, account_id)
+        info = await asyncio.to_thread(proxy_manager.create_proxy, account_id, user, password)
         proxy_url = info.get("proxy_url") or ""
         public_ip = info.get("public_ip") or ""
         name = info.get("instance_name") or ""
@@ -810,6 +813,13 @@ async def _provision_proxy_background(account_id: int) -> None:
         logger.info("[Proxy] Account %s provisioned -> ip=%s", account_id, public_ip)
     except Exception:
         logger.exception("[Proxy] Provisioning failed for account %s", account_id)
+        async with AsyncSessionLocal() as s:
+            async with s.begin():
+                row = await s.get(BrokerAccount, account_id)
+                if row is not None:
+                    row.proxy_instance_name = f"failed:tradeai-proxy-{account_id}"
+    finally:
+        _proxy_tasks.pop(account_id, None)
 
 
 async def _probe_broker_account(creds: dict) -> tuple[str, str]:
@@ -1010,10 +1020,11 @@ async def _probe_kite() -> tuple[str, str]:
 
 async def _probe_dhan() -> tuple[str, str]:
     """Verify Dhan access token via a light fund-limit call."""
-    from app.core.config import settings
+    from app.db.broker_credentials import get_dhan_credentials
 
-    client_id = getattr(settings, "dhan_client_id", "") or ""
-    access_token = getattr(settings, "dhan_access_token", "") or ""
+    creds = get_dhan_credentials()
+    client_id = creds.get("client_id") or ""
+    access_token = creds.get("access_token") or ""
     if not client_id:
         return "disconnected", "DHAN_CLIENT_ID not configured"
     if not access_token:
@@ -1021,9 +1032,12 @@ async def _probe_dhan() -> tuple[str, str]:
 
     try:
         from app.data.dhan_client import DhanClient
-        client = DhanClient(client_id=client_id, access_token=access_token)
+        client = DhanClient(
+            client_id=client_id, access_token=access_token,
+            proxy_url=creds.get("proxy_url") or "",
+        )
         # Try the lightest probe available on this client class.
-        for method_name in ("get_fund_limit", "get_profile", "get_positions"):
+        for method_name in ("get_fund_limits", "get_profile", "get_positions"):
             fn = getattr(client, method_name, None)
             if fn is None:
                 continue
