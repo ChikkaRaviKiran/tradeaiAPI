@@ -191,9 +191,9 @@ def _fetch_account_row_sync(account_id: int) -> Optional[dict]:
         try:
             from sqlalchemy import select
             from app.db.account_models import BrokerAccount
-            from app.db.models import AsyncSessionLocal
+            from app.db.models import ShortLivedAsyncSessionLocal
 
-            async with AsyncSessionLocal() as s:
+            async with ShortLivedAsyncSessionLocal() as s:
                 row = (
                     await s.execute(
                         select(BrokerAccount).where(BrokerAccount.id == account_id)
@@ -217,25 +217,16 @@ def _fetch_account_row_sync(account_id: int) -> Optional[dict]:
                     "updated_at": row.updated_at.isoformat() if row.updated_at else "",
                 }
         except Exception:
-            logger.debug("_fetch_account_row_sync failed", exc_info=True)
+            logger.warning("_fetch_account_row_sync failed", exc_info=True)
             return None
 
-    def _run_in_thread() -> Optional[dict]:
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(_fetch())
-        finally:
-            loop.close()
-
     try:
-        # Try synchronously first (no running loop → fine)
-        return asyncio.run(_fetch())
+        asyncio.get_running_loop()
     except RuntimeError:
-        # A loop is already running in this thread — fall back to a
-        # background thread with its own loop.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_run_in_thread)
-            return fut.result(timeout=15)
+        return asyncio.run(_fetch())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(lambda: asyncio.run(_fetch()))
+        return fut.result(timeout=15)
 
 
 async def _fetch_account_row_async(account_id: int) -> Optional[dict]:

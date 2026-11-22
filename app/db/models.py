@@ -19,6 +19,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 
@@ -384,6 +385,13 @@ def _build_engine():
 
 async_engine = _build_engine()
 AsyncSessionLocal = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+
+# Synchronous callers run their queries in short-lived event loops.  Do not
+# return their connections to the main loop's pool or reuse them across loops.
+_short_lived_engine = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+ShortLivedAsyncSessionLocal = async_sessionmaker(
+    _short_lived_engine, class_=AsyncSession, expire_on_commit=False
+)
 
 
 def create_new_async_session_factory():

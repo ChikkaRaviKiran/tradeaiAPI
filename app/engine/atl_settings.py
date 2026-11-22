@@ -324,9 +324,9 @@ def _load_from_db_sync() -> dict[str, Any] | None:
         async def _q() -> dict[str, Any] | None:
             from sqlalchemy import select
             from app.db.account_models import BrokerAccount, StrategyInstance
-            from app.db.models import AsyncSessionLocal
+            from app.db.models import ShortLivedAsyncSessionLocal
 
-            async with AsyncSessionLocal() as s:
+            async with ShortLivedAsyncSessionLocal() as s:
                 row = (
                     await s.execute(
                         select(StrategyInstance)
@@ -389,7 +389,7 @@ def _load_from_db_sync() -> dict[str, Any] | None:
             fut = ex.submit(_runner)
             return fut.result(timeout=5)
     except Exception:
-        logger.debug("DB-backed ATL settings unavailable; falling back", exc_info=True)
+        logger.warning("DB-backed ATL settings unavailable; falling back", exc_info=True)
         return None
 
 
@@ -563,9 +563,9 @@ def _mirror_to_db_sync(payload: dict[str, Any]) -> None:
     async def _u() -> None:
         from sqlalchemy import select
         from app.db.account_models import StrategyInstance
-        from app.db.models import AsyncSessionLocal
+        from app.db.models import ShortLivedAsyncSessionLocal
 
-        async with AsyncSessionLocal() as s:
+        async with ShortLivedAsyncSessionLocal() as s:
             async with s.begin():
                 row = (
                     await s.execute(
@@ -609,12 +609,11 @@ def _mirror_to_db_sync(payload: dict[str, Any]) -> None:
 
     try:
         asyncio.get_running_loop()
-        import concurrent.futures
-
-        def _runner() -> None:
-            asyncio.run(_u())
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            ex.submit(_runner).result(timeout=5)
     except RuntimeError:
         asyncio.run(_u())
+        return
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        ex.submit(lambda: asyncio.run(_u())).result(timeout=5)
