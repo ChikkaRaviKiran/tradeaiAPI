@@ -531,11 +531,11 @@ class Orchestrator:
     async def stop(self, reason: str = "manual") -> None:
         """Gracefully stop orchestrator background activity.
 
-        Also flips global paper mode as a hard guard against late/queued
-        background tasks attempting live orders during shutdown.
+        Preserve the user's current live/paper mode. The system should not
+        silently force itself back to paper during shutdown; that prevents
+        queued live orders from respecting the operator's active config.
         """
         self.running = False
-        settings.paper_trading = True
         try:
             if getattr(self.client, "ws", None):
                 self.client.ws.disconnect()

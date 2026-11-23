@@ -396,6 +396,18 @@ class ATLStraddleScanner:
     def _round_to_interval(self, value: float, interval: int) -> float:
         return round(float(value) / max(1, int(interval))) * max(1, int(interval))
 
+    def _effective_strike_interval(self, instrument: InstrumentConfig) -> int:
+        configured = int(self._settings.get("strike_interval", 50))
+        exchange = max(1, int(round(instrument.strike_interval)))
+        # A coarser grid is valid if every point on it is also on the exchange grid.
+        if configured > 0 and configured % exchange == 0:
+            return configured
+        self._record_diag(
+            "strike_interval_override",
+            f"Using {exchange} (instrument) instead of configured {configured} for {instrument.symbol}",
+        )
+        return exchange
+
     def _anchor_strike(self, spot: float, interval: int, strict: bool = False) -> Optional[float]:
         """Resolve the strike anchor for this cycle.
 
@@ -850,20 +862,12 @@ class ATLStraddleScanner:
             return
 
         spot = float(df_today.iloc[-1]["close"])
-        configured_interval = max(1, int(self._settings.get("strike_interval", 50)))
-        exchange_interval = max(1, int(round(getattr(instrument, "strike_interval", configured_interval))))
-        # Safety rail: for listed options the strike step is exchange-defined.
-        # If UI/DB carries a stale value (e.g. NIFTY 50 leaked into SENSEX),
-        # use the instrument's real interval so strike selection/order legs
-        # cannot drift to wrong contracts.
-        if configured_interval != exchange_interval:
-            self._record_diag(
-                "strike_interval_override",
-                f"Using {exchange_interval} (instrument) instead of configured {configured_interval} for {instrument.symbol}",
-            )
-        interval = exchange_interval
+        interval = self._effective_strike_interval(instrument)
         offset = max(0, int(self._settings.get("offset_points", 500)))
         strike_mode = self._strike_mode()
+        otm_steps = max(0, int(self._settings.get("otm_strikes", 0)))
+        if strike_mode in {"STRANGLE", "MAXPAIN"} and otm_steps > 0:
+            offset = otm_steps * interval
         rolling = max(1, int(self._settings.get("rolling_points", 300)))
         # ATM-straddle adjustment trigger:
         #   adjustment_points > 0  → legacy fixed-distance rule (when
@@ -1506,7 +1510,7 @@ class ATLStraddleScanner:
         if self._state.hedge_ce and self._state.hedge_pe:
             return
 
-        interval = max(1, int(self._settings.get("strike_interval", 50)))
+        interval = self._effective_strike_interval(instrument)
         if hedge_mode == "otm_points":
             otm_points = max(1, int(self._settings.get("hedge_otm_points", 500) or 500))
             ce_strike = round((ref_strike + otm_points) / interval) * interval

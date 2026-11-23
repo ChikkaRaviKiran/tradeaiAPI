@@ -70,6 +70,51 @@ def _invalidate_broker_cache_safe(account_id: Optional[int] = None) -> None:
         logger.debug("invalidate_account_cache failed (non-fatal)", exc_info=True)
 
 
+def _reload_dhan_clients_if_needed(row: Optional[BrokerAccount] = None) -> None:
+    """Hot-reload active Dhan clients after a UI credential save.
+
+    The multi-account Settings UI writes to the ``broker_accounts`` table, but
+    the live order engine may already have a cached Dhan client in memory. If we
+    don't invalidate the credential cache and rebuild the in-process client, the
+    strategy keeps using the stale token until the next restart.
+    """
+    if row is None or (row.broker or "").lower() != "dhan":
+        return
+    try:
+        from app.db.broker_credentials import invalidate
+        invalidate("dhan")
+    except Exception:
+        logger.debug("invalidate('dhan') failed (non-fatal)", exc_info=True)
+
+    try:
+        from app.api import routes as api_routes
+        orch = getattr(api_routes._state, "get", lambda *args, **kwargs: {})("orchestrator")
+        if orch is None:
+            return
+        seen: set[int] = set()
+        arms = [
+            orch,
+            getattr(orch, "move_detection_scanner", None),
+            getattr(orch, "move_detection_scanner_bull", None),
+            getattr(orch, "pdh_pdl_scanner", None),
+            getattr(orch, "atl_straddle_scanner", None),
+        ]
+        for holder in arms:
+            if holder is None:
+                continue
+            broker = getattr(holder, "broker", None)
+            if broker is None or id(broker) in seen:
+                continue
+            seen.add(id(broker))
+            if hasattr(broker, "reload_credentials"):
+                try:
+                    broker.reload_credentials()
+                except Exception:
+                    logger.exception("Failed to reload Dhan client from %s", type(holder).__name__)
+    except Exception:
+        logger.debug("Dhan hot-reload after account update failed (non-fatal)", exc_info=True)
+
+
 # ── Serialisation helpers ────────────────────────────────────────────────
 
 _VALID_STRIKE_MODES = {"ATM", "STRANGLE", "ITM", "MAXPAIN"}
@@ -316,6 +361,7 @@ def register_multi_account_routes(app: FastAPI) -> None:
                     await _clear_other_data_feeds(s, keep_id=row.id)
             await s.refresh(row)
             _invalidate_broker_cache_safe(row.id)
+            _reload_dhan_clients_if_needed(row)
             new_id = row.id
             result = _account_to_dict(row)
 
@@ -376,6 +422,7 @@ def register_multi_account_routes(app: FastAPI) -> None:
                     await _clear_other_data_feeds(s, keep_id=row.id)
             await s.refresh(row)
             _invalidate_broker_cache_safe(row.id)
+            _reload_dhan_clients_if_needed(row)
             return _account_to_dict(row)
 
     @app.delete("/api/accounts/{account_id}")

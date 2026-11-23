@@ -19,7 +19,9 @@ from __future__ import annotations
 import csv
 import io
 import logging
-from datetime import datetime, date
+import threading
+import time
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 import pytz
@@ -49,6 +51,20 @@ EXCHANGE_BSE_EQ = "BSE_EQ"
 # Dhan publishes the scrip master daily. The "detailed" CSV contains
 # expiry/strike/option_type fields needed for option resolution.
 SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+
+# Process-wide scrip master cache. The CSV is ~240k rows (~15s to download
+# and parse) and identical for every account, so all DhanClient instances
+# share one copy plus an O(1) option-contract index. A background thread
+# prewarms it at startup and each morning so the first order of the day
+# does not pay the download + linear-scan cost at entry time.
+_SCRIP_LOCK = threading.Lock()
+_SCRIP_ROWS: list[dict] = []
+_SCRIP_DATE: Optional[date] = None
+_INDEX_LOCK = threading.Lock()
+_OPTION_INDEX: dict[tuple, dict] = {}
+_OPTION_INDEX_ROWS: Optional[list] = None
+_PREWARM_LOCK = threading.Lock()
+_PREWARM_STARTED = False
 SCRIP_MASTER_CACHE_SECONDS = 12 * 3600
 
 # Map our generic exchange tokens → Dhan exchange-segment values
@@ -107,6 +123,11 @@ class DhanClient:
         self.client_id = client_id
         self.access_token = access_token
         self.proxy_url = (proxy_url or "").strip()
+        # socks5h resolves DNS on the proxy, which then reaches api.dhan.co
+        # over IPv6 — Dhan's static-IP whitelist is IPv4, so orders get
+        # DH-905 "Invalid IP". socks5 resolves locally (IPv4) instead.
+        if self.proxy_url.lower().startswith("socks5h://"):
+            self.proxy_url = "socks5://" + self.proxy_url[len("socks5h://"):]
         # Populated by wrapper methods on API-level failure so callers can
         # distinguish "no data" from "auth expired". Cleared at the start of
         # every wrapped call. Shape: {"code": "DH-901", "message": "..."}.
@@ -132,6 +153,7 @@ class DhanClient:
             )
         self._instrument_cache: list[dict] = []
         self._instrument_cache_date: Optional[date] = None
+        _ensure_scrip_prewarm(self)
 
     def _install_proxy_on_sdk_session(self, proxy_url: str) -> None:
         """Install the proxy on the SDK transport, or fail closed."""
@@ -426,21 +448,87 @@ class DhanClient:
     # ── Instrument master ────────────────────────────────────────────
 
     def _load_scrip_master(self, force: bool = False) -> list[dict]:
+        global _SCRIP_ROWS, _SCRIP_DATE
         today = datetime.now(_IST).date()
-        if not force and self._instrument_cache and self._instrument_cache_date == today:
-            return self._instrument_cache
+        if not force and _SCRIP_ROWS and _SCRIP_DATE == today:
+            return _SCRIP_ROWS
+        with _SCRIP_LOCK:
+            if not force and _SCRIP_ROWS and _SCRIP_DATE == today:
+                return _SCRIP_ROWS
+            try:
+                r = requests.get(SCRIP_MASTER_URL, timeout=60)
+                r.raise_for_status()
+                reader = csv.DictReader(io.StringIO(r.text))
+                rows = [row for row in reader]
+                _SCRIP_ROWS = rows
+                _SCRIP_DATE = today
+                self._instrument_cache = rows
+                self._instrument_cache_date = today
+                logger.info("Dhan scrip master loaded: %d rows", len(rows))
+                return rows
+            except Exception:
+                logger.exception("Dhan scrip master download failed")
+                return _SCRIP_ROWS  # may be empty or yesterday's copy
+
+    def _option_row_key(self, row: dict) -> Optional[tuple]:
+        """Index key mirroring the exact-underlying match in _find_option_row."""
+        instr = self._row_get(row, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "INSTRUMENT_TYPE")
+        if instr.upper() not in {"OPTIDX", "OPTSTK", "OPTFUT"}:
+            return None
+        seg = self._row_get(row, "SEM_EXM_EXCH_ID", "EXCH_ID", "exchange_segment")
+        segment = self._row_get(row, "SEM_SEGMENT", "SEGMENT")
+        if seg == "NSE" and segment in {"D", "E"}:
+            row_segment = "NSE_FNO"
+        elif seg == "BSE" and segment in {"D", "E"}:
+            row_segment = "BSE_FNO"
+        else:
+            return None
+        under = self._row_get(
+            row, "SM_SYMBOL_NAME", "UNDERLYING_SYMBOL",
+            "SYMBOL_NAME", "DISPLAY_NAME",
+        ).upper()
+        if not under:
+            return None
+        opt = self._row_get(row, "SEM_OPTION_TYPE", "OPTION_TYPE").upper()
         try:
-            r = requests.get(SCRIP_MASTER_URL, timeout=60)
-            r.raise_for_status()
-            reader = csv.DictReader(io.StringIO(r.text))
-            rows = [row for row in reader]
-            self._instrument_cache = rows
-            self._instrument_cache_date = today
-            logger.info("Dhan scrip master loaded: %d rows", len(rows))
-            return rows
+            strike = float(self._row_get(row, "SEM_STRIKE_PRICE", "STRIKE_PRICE") or 0)
+        except ValueError:
+            return None
+        exp_str = self._row_get(row, "SEM_EXPIRY_DATE", "SM_EXPIRY_DATE", "EXPIRY_DATE")
+        if not exp_str:
+            return None
+        expiry = self._parse_expiry(exp_str)
+        if not expiry:
+            return None
+        return (row_segment, under, opt, strike, expiry)
+
+    def _get_option_index(self) -> dict:
+        global _OPTION_INDEX, _OPTION_INDEX_ROWS
+        rows = self._load_scrip_master()
+        if rows and _OPTION_INDEX_ROWS is rows:
+            return _OPTION_INDEX
+        with _INDEX_LOCK:
+            if rows and _OPTION_INDEX_ROWS is rows:
+                return _OPTION_INDEX
+            started = time.monotonic()
+            idx: dict[tuple, dict] = {}
+            for row in rows:
+                key = self._option_row_key(row)
+                if key is not None and key not in idx:
+                    idx[key] = row
+            _OPTION_INDEX = idx
+            _OPTION_INDEX_ROWS = rows
+            logger.info(
+                "Dhan option index built: %d contracts in %.1fs",
+                len(idx), time.monotonic() - started,
+            )
+            return idx
+
+    def prewarm_scrip_master(self) -> None:
+        try:
+            self._get_option_index()
         except Exception:
-            logger.exception("Dhan scrip master download failed")
-            return self._instrument_cache  # may be empty
+            logger.exception("Dhan scrip master prewarm failed")
 
     def refresh_scrip_master(self, force: bool = True) -> int:
         rows = self._load_scrip_master(force=force)
@@ -538,6 +626,16 @@ class DhanClient:
         target_strike = float(strike)
         target_opt = option_type.upper()
         target_under = underlying.upper()
+
+        try:
+            hit = self._get_option_index().get(
+                (target_segment, target_under, target_opt, target_strike, expiry)
+            )
+        except Exception:
+            hit = None
+            logger.debug("Dhan option index lookup failed", exc_info=True)
+        if hit is not None:
+            return hit
 
         for row in self._load_scrip_master():
             seg = self._row_get(row, "SEM_EXM_EXCH_ID", "EXCH_ID", "exchange_segment")
@@ -669,3 +767,24 @@ class DhanClient:
                 except (ValueError, TypeError):
                     continue
         return None
+
+
+def _ensure_scrip_prewarm(client: "DhanClient") -> None:
+    """Start one daemon thread that keeps the shared scrip master + option
+    index warm: immediately, then every day at 08:45 IST before market open."""
+    global _PREWARM_STARTED
+    with _PREWARM_LOCK:
+        if _PREWARM_STARTED:
+            return
+        _PREWARM_STARTED = True
+
+    def _loop() -> None:
+        while True:
+            client.prewarm_scrip_master()
+            now = datetime.now(_IST)
+            nxt = now.replace(hour=8, minute=45, second=0, microsecond=0)
+            if nxt <= now:
+                nxt += timedelta(days=1)
+            time.sleep(max(60.0, (nxt - now).total_seconds()))
+
+    threading.Thread(target=_loop, name="dhan-scrip-prewarm", daemon=True).start()

@@ -92,7 +92,7 @@ class Settings(BaseSettings):
 
     # System
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
-    paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
+    paper_trading: bool = Field(default=False, alias="PAPER_TRADING")
     min_margin_required: float = Field(default=5000, alias="MIN_MARGIN_REQUIRED")
     # Order execution behavior:
     # False = return immediately after broker accepts order (faster).
@@ -230,7 +230,9 @@ class Settings(BaseSettings):
     )
 
     # Active trading account: "angel" | "kite" | "dhan"
-    trading_account: str = Field(default="angel", alias="TRADING_ACCOUNT")
+    # Default to Dhan so the live execution path is active as soon as the
+    # account credentials are configured in .env / DB.
+    trading_account: str = Field(default="dhan", alias="TRADING_ACCOUNT")
 
     # ── Account-level daily-loss kill switch ───────────────────────
     # When enabled, a background watchdog polls broker positions every
