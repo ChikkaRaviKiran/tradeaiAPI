@@ -63,14 +63,6 @@ Strategies only fire in compatible regimes.
 
 ---
 
-## Options strategy strike rounding
-
-The **Strike Interval** on a strategy instance controls strike rounding. It can
-equal the instrument's strike spacing or be a larger whole multiple of it.
-For example, NIFTY supports rounding in 100-point steps on its 50-point grid.
-If the setting is incompatible with the instrument, the scanner uses the
-instrument's spacing and records a diagnostic.
-
 ## 9-Factor Signal Scoring (Max 100)
 
 | Factor | Max Pts | Source |

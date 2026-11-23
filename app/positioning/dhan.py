@@ -22,16 +22,16 @@ class DhanError(RuntimeError):
 
 def _token() -> str:
     load_dotenv()
-    # The Settings UI persists the current paired client ID and token in the
-    # broker credential store. Prefer it to the container environment, whose
-    # captured value can be stale after a token rotation.
-    try:
-        from app.db.broker_credentials import get_dhan_credentials
-        token = (get_dhan_credentials(fresh=True).get("access_token") or "").strip()
-    except Exception:
-        token = ""
+    token = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
     if not token:
-        token = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
+        # Resolve through the platform's own credential chain (broker_accounts
+        # table -> legacy broker_credentials -> settings) so a token rotated in
+        # the Settings UI is picked up here too, instead of going stale.
+        try:
+            from app.db.broker_credentials import get_dhan_credentials
+            token = (get_dhan_credentials().get("access_token") or "").strip()
+        except Exception:
+            token = ""
     if not token:
         try:
             from app.core.config import settings

@@ -66,13 +66,13 @@ def _client() -> str:
     global _client_id
     if _client_id is None:
         load_dotenv()
-        try:
-            from app.db.broker_credentials import get_dhan_credentials
-            env = (get_dhan_credentials(fresh=True).get("client_id") or "").strip()
-        except Exception:
-            env = ""
+        env = os.environ.get("DHAN_CLIENT_ID", "").strip()
         if not env:
-            env = os.environ.get("DHAN_CLIENT_ID", "").strip()
+            try:
+                from app.db.broker_credentials import get_dhan_credentials
+                env = (get_dhan_credentials().get("client_id") or "").strip()
+            except Exception:
+                env = ""
         if not env:
             try:
                 from app.core.config import settings
