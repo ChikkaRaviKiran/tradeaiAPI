@@ -608,7 +608,7 @@ class ATLStraddleScanner:
             entry_in_future = False
             try:
                 eh, em = [int(x) for x in str(self._settings.get("entry_time", "09:20")).split(":")]
-                entry_dt = datetime(now.year, now.month, now.day, eh, em, tzinfo=IST)
+                entry_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
                 entry_in_future = now < entry_dt
             except Exception:
                 entry_in_future = False
@@ -901,7 +901,7 @@ class ATLStraddleScanner:
                 # Precise wake-up: if entry_time is within the next loop tick,
                 # sleep exactly until then so the order fires within ~1s of
                 # the configured time instead of waiting for the next 10s tick.
-                entry_dt_local = datetime(now.year, now.month, now.day, entry_h, entry_m, tzinfo=IST)
+                entry_dt_local = now.replace(hour=entry_h, minute=entry_m, second=0, microsecond=0)
                 wait_s = (entry_dt_local - now).total_seconds()
                 if 0 < wait_s <= 12.0:
                     self._record_diag(
@@ -921,7 +921,9 @@ class ATLStraddleScanner:
             # 'Place Now' may enter outside the window.
             if not self._force_entry:
                 grace_min = max(0, int(self._settings.get("late_entry_grace_minutes", 5) or 0))
-                entry_dt_local = datetime(now.year, now.month, now.day, entry_h, entry_m, tzinfo=IST)
+                # now.replace keeps the correct +05:30 offset; datetime(..., tzinfo=pytz_zone)
+                # would use LMT (+05:53) and shift the window 23 minutes early.
+                entry_dt_local = now.replace(hour=entry_h, minute=entry_m, second=0, microsecond=0)
                 if (now - entry_dt_local).total_seconds() > grace_min * 60:
                     self._complete_for_day(
                         f"Missed entry window {entry_h:02d}:{entry_m:02d} (+{grace_min}m) at "
