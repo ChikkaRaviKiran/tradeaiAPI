@@ -70,6 +70,22 @@ def _invalidate_broker_cache_safe(account_id: Optional[int] = None) -> None:
         logger.debug("invalidate_account_cache failed (non-fatal)", exc_info=True)
 
 
+async def _sync_strategy_registry_now() -> None:
+    """Load strategy/account changes into the running engine immediately
+    instead of waiting for the periodic sync. Best-effort — never raises.
+    """
+    try:
+        from app.api import routes as api_routes
+        orch = api_routes._state.get("orchestrator")
+        registry = getattr(orch, "strategy_registry", None)
+        if registry is None:
+            return
+        await registry.sync_from_db()
+        await orch._ensure_registry_indices_active()
+    except Exception:
+        logger.exception("[Registry] immediate sync after save failed")
+
+
 def _reload_dhan_clients_if_needed(row: Optional[BrokerAccount] = None) -> None:
     """Hot-reload active Dhan clients after a UI credential save.
 
@@ -423,7 +439,9 @@ def register_multi_account_routes(app: FastAPI) -> None:
             await s.refresh(row)
             _invalidate_broker_cache_safe(row.id)
             _reload_dhan_clients_if_needed(row)
-            return _account_to_dict(row)
+            result = _account_to_dict(row)
+        await _sync_strategy_registry_now()
+        return result
 
     @app.delete("/api/accounts/{account_id}")
     async def delete_account(account_id: int) -> dict[str, Any]:
@@ -452,6 +470,7 @@ def register_multi_account_routes(app: FastAPI) -> None:
                 await s.delete(row)
             _invalidate_broker_cache_safe(account_id)
             _invalidate_settings_cache_safe()
+            await _sync_strategy_registry_now()
             # Best-effort delete of the Lightsail proxy instance.
             try:
                 from app.core.config import settings as _s
@@ -627,7 +646,9 @@ def register_multi_account_routes(app: FastAPI) -> None:
                 await s.flush()
             await s.refresh(row)
             _invalidate_settings_cache_safe()
-            return _instance_to_dict(row)
+            result = _instance_to_dict(row)
+        await _sync_strategy_registry_now()
+        return result
 
     @app.put("/api/strategy-instances/{instance_id}")
     async def update_strategy_instance(instance_id: int, body: dict) -> dict[str, Any]:
@@ -659,7 +680,9 @@ def register_multi_account_routes(app: FastAPI) -> None:
                     setattr(row, k, v)
             await s.refresh(row)
             _invalidate_settings_cache_safe()
-            return _instance_to_dict(row)
+            result = _instance_to_dict(row)
+        await _sync_strategy_registry_now()
+        return result
 
     @app.delete("/api/strategy-instances/{instance_id}")
     async def delete_strategy_instance(instance_id: int) -> dict[str, Any]:
@@ -670,6 +693,7 @@ def register_multi_account_routes(app: FastAPI) -> None:
                     raise HTTPException(status_code=404, detail="Strategy instance not found")
                 await s.delete(row)
         _invalidate_settings_cache_safe()
+        await _sync_strategy_registry_now()
         return {"ok": True, "id": instance_id}
 
     @app.post("/api/strategy-instances/{instance_id}/toggle")
@@ -683,7 +707,9 @@ def register_multi_account_routes(app: FastAPI) -> None:
                 row.is_active = bool(want) if want is not None else (not row.is_active)
             await s.refresh(row)
             _invalidate_settings_cache_safe()
-            return _instance_to_dict(row)
+            result = _instance_to_dict(row)
+        await _sync_strategy_registry_now()
+        return result
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────

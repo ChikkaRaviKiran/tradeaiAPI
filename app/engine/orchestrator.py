@@ -547,6 +547,10 @@ class Orchestrator:
     def _reset_for_new_day(self) -> None:
         """Reset daily state for a fresh trading day."""
         self._cycle_count = 0
+        # Must reset together with _cycle_count: a stale value from the
+        # previous day blocks registry syncs until today's cycle catches up,
+        # so strategies created/edited today were not loaded for hours.
+        self._registry_last_sync_cycle = {}
         self._global_last_fetched = None
         self.global_bias = GlobalBias.UNAVAILABLE
         self.global_indices = []

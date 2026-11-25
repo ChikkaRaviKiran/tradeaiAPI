@@ -916,6 +916,18 @@ class ATLStraddleScanner:
                         f"Waiting for entry time {entry_h:02d}:{entry_m:02d} (now {now.strftime('%H:%M:%S')})",
                     )
                     return
+            # Never chase a missed entry time (late engine start, restart,
+            # strategy saved/re-armed after its entry time). Only an explicit
+            # 'Place Now' may enter outside the window.
+            if not self._force_entry:
+                grace_min = max(0, int(self._settings.get("late_entry_grace_minutes", 5) or 0))
+                entry_dt_local = datetime(now.year, now.month, now.day, entry_h, entry_m, tzinfo=IST)
+                if (now - entry_dt_local).total_seconds() > grace_min * 60:
+                    self._complete_for_day(
+                        f"Missed entry window {entry_h:02d}:{entry_m:02d} (+{grace_min}m) at "
+                        f"{now.strftime('%H:%M:%S')}; no entry today. Use 'Place Now' to enter manually."
+                    )
+                    return
             if self._force_entry:
                 self._record_event(
                     "force_entry",

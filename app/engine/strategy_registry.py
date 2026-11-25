@@ -65,6 +65,9 @@ class StrategyInstanceRegistry:
         self._scanners: dict[int, ATLStraddleScanner] = {}
         # instance_id -> (account_id, broker_name) — cached to detect changes.
         self._binding: dict[int, tuple[Optional[int], str]] = {}
+        # Serialises syncs from the engine loop and from API save handlers
+        # so the same instance is never spawned twice concurrently.
+        self._sync_lock = asyncio.Lock()
 
     @property
     def scanners(self) -> dict[int, ATLStraddleScanner]:
@@ -90,6 +93,10 @@ class StrategyInstanceRegistry:
         error — silently deleted per-instance state files and any
         legs those scanners were tracking mid-day.
         """
+        async with self._sync_lock:
+            return await self._sync_from_db_locked()
+
+    async def _sync_from_db_locked(self) -> tuple[int, int, int]:
         rows = await _fetch_active_instances()
         if rows is None:
             logger.warning(
