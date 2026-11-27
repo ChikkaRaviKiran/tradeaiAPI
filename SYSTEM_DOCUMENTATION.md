@@ -48,6 +48,16 @@ Strategies only fire in compatible regimes.
 
 ## 8 Trading Strategies
 
+### ATM/ATL strike interval
+
+The strategy's **Strike Interval** controls its strike-selection grid for entry
+and reform/rolling. Larger multiples of the exchange strike step are supported:
+for example, NIFTY interval 100 selects 100-point strikes even though the exchange
+lists strikes every 50 points. An interval that is not a multiple of the exchange
+step falls back to the instrument's exchange step and logs an override diagnostic.
+Static legs remain held until exit; changing the interval does not immediately
+replace an existing position.
+
 | # | Strategy | Core Concept | Key Book |
 |---|----------|-------------|----------|
 | 1 | **ORB** | Breakout above/below 09:15-09:30 range | Crabel, Fisher |

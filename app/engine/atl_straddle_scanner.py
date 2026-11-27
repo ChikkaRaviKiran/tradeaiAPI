@@ -852,16 +852,17 @@ class ATLStraddleScanner:
         spot = float(df_today.iloc[-1]["close"])
         configured_interval = max(1, int(self._settings.get("strike_interval", 50)))
         exchange_interval = max(1, int(round(getattr(instrument, "strike_interval", configured_interval))))
-        # Safety rail: for listed options the strike step is exchange-defined.
-        # If UI/DB carries a stale value (e.g. NIFTY 50 leaked into SENSEX),
-        # use the instrument's real interval so strike selection/order legs
-        # cannot drift to wrong contracts.
-        if configured_interval != exchange_interval:
+        # A coarser strategy grid is valid when it is a multiple of the
+        # exchange step (e.g. NIFTY 100 on its listed 50-point grid).
+        # Retain the safety rail for stale or unsupported intervals.
+        interval = configured_interval
+        if configured_interval % exchange_interval != 0:
             self._record_diag(
                 "strike_interval_override",
-                f"Using {exchange_interval} (instrument) instead of configured {configured_interval} for {instrument.symbol}",
+                f"Using {exchange_interval} (instrument) instead of configured {configured_interval} for {instrument.symbol}: "
+                "configured interval is not a multiple of the exchange strike step",
             )
-        interval = exchange_interval
+            interval = exchange_interval
         offset = max(0, int(self._settings.get("offset_points", 500)))
         strike_mode = self._strike_mode()
         rolling = max(1, int(self._settings.get("rolling_points", 300)))
